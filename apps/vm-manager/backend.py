@@ -1,0 +1,1696 @@
+"""
+EthOS — VM Manager (Virtual Machine Manager)
+Create and manage virtual machines using QEMU/KVM.
+Supports booting ISO, IMG, QCOW2 and VDI images.
+"""
+
+import os
+import json
+import re
+import signal
+import subprocess
+import sys
+import time
+import threading
+from functools import wraps
+from flask import Blueprint, request, jsonify, send_from_directory, abort
+from blueprints.admin_required import admin_required
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+from host import host_run, check_dep, ensure_dep, get_data_disk as _get_data_disk, app_path as _app_path
+from utils import register_pkg_routes, require_tools, check_tool
+
+vm_bp = Blueprint('vm_mgr', __name__, url_prefix='/api/vm')
+
+# ─── Paths ───────────────────────────────────────────────────
+
+_DEFAULT_VM_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'vms')
+
+
+def _vm_root():
+    """Directory where VM configs and disks are stored."""
+    dd = _get_data_disk()
+    if dd:
+        p = os.path.join(dd, 'vms')
+    else:
+        p = os.path.abspath(_DEFAULT_VM_DIR)
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def _iso_root():
+    """Directory where ISO/IMG files are stored."""
+    p = os.path.join(_vm_root(), '_images')
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+# ─── State ───────────────────────────────────────────────────
+
+_STATE_FILE = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'vm_state.json')
+_running_vms = {}  # vm_id -> { 'proc': Popen, 'pid': int, 'started': float, 'vnc_port': int }
+
+
+def _load_vms():
+    """Load VM definitions from the state file."""
+    try:
+        with open(_STATE_FILE, 'r') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_vms(vms):
+    """Save VM definitions to the state file."""
+    os.makedirs(os.path.dirname(os.path.abspath(_STATE_FILE)), exist_ok=True)
+    with open(_STATE_FILE, 'w') as f:
+        json.dump(vms, f, indent=2)
+
+
+def _default_network(os_type='linux'):
+    """Return sensible default network config based on OS type."""
+    pf = []
+    if os_type == 'linux':
+        pf.append({'proto': 'tcp', 'host': 0, 'guest': 22, 'label': 'SSH'})
+    elif os_type == 'windows':
+        pf.append({'proto': 'tcp', 'host': 0, 'guest': 3389, 'label': 'RDP'})
+    return {'net_type': 'user', 'port_forwards': pf}
+
+
+def _validate_port_forwards(forwards):
+    """Validate and sanitize a list of port forward rules."""
+    clean = []
+    for rule in (forwards or []):
+        proto = str(rule.get('proto', 'tcp')).lower()
+        if proto not in ('tcp', 'udp'):
+            proto = 'tcp'
+        host = int(rule.get('host', 0))
+        guest = int(rule.get('guest', 0))
+        if guest < 1 or guest > 65535:
+            continue
+        if host < 0 or host > 65535:
+            host = 0
+        label = str(rule.get('label', ''))[:32]
+        clean.append({'proto': proto, 'host': host, 'guest': guest, 'label': label})
+    return clean
+
+
+def _build_net_opts(vm):
+    """Build QEMU -netdev options string from VM network config.
+    Returns (netdev_args_list, tap_device_or_None).
+    """
+    net = vm.get('network') or _default_network(vm.get('os_type', 'linux'))
+    net_type = net.get('net_type', 'user')
+
+    if net_type == 'none':
+        return None, None
+
+    if net_type == 'bridge':
+        bridge = net.get('bridge', 'br0')
+        tap = _create_tap(bridge)
+        if not tap:
+            # Fallback to user mode if bridge setup fails
+            log.warning("Bridge setup failed, falling back to user mode")
+            net_type = 'user'
+        else:
+            return ['-netdev', f'tap,id=net0,ifname={tap},script=no,downscript=no',
+                    '-device', 'virtio-net-pci,netdev=net0'], tap
+
+    # User-mode NAT — check port availability first
+    opts = 'user,id=net0'
+    for rule in net.get('port_forwards', []):
+        proto = rule.get('proto', 'tcp')
+        host = rule.get('host', 0)
+        guest = rule.get('guest', 0)
+        if guest and host:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(('', int(host)))
+                s.close()
+            except OSError:
+                raise RuntimeError(
+                    f'Port {host} jest zajęty (inny proces go używa). '
+                    f'Zmień port hosta w ustawieniach sieci VM lub zwolnij port.')
+            opts += f',hostfwd={proto}::{host}-:{guest}'
+    return ['-netdev', opts, '-device', 'virtio-net-pci,netdev=net0'], None
+
+
+# ─── Bridge Networking ────────────────────────────────────────
+
+_BRIDGE_NAME = 'br0'
+
+log = __import__('logging').getLogger('vm-manager')
+
+
+def _get_primary_iface():
+    """Detect the primary ethernet interface (carries default route)."""
+    try:
+        r = subprocess.run(
+            "ip -4 route show default | awk '{print $5}' | head -1",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        iface = r.stdout.strip()
+        if iface and not iface.startswith(('br', 'docker', 'veth', 'virbr')):
+            return iface
+        # If default route is already on a bridge, check for slave interfaces
+        if iface and iface.startswith('br'):
+            return iface  # bridge itself is fine
+    except Exception:
+        pass
+    return None
+
+
+def _bridge_exists(br='br0'):
+    """Check if a bridge interface exists."""
+    try:
+        r = subprocess.run(
+            f'ip link show {br} type bridge',
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _bridge_status():
+    """Return bridge status info for the API."""
+    br = _BRIDGE_NAME
+    exists = _bridge_exists(br)
+    primary = _get_primary_iface()
+    br_ip = None
+    if exists:
+        try:
+            r = subprocess.run(
+                f"ip -4 -o addr show {br} scope global | awk '{{print $4}}' | cut -d/ -f1 | head -1",
+                shell=True, capture_output=True, text=True, timeout=5
+            )
+            br_ip = r.stdout.strip() or None
+        except Exception:
+            pass
+    return {
+        'bridge': br,
+        'exists': exists,
+        'bridge_ip': br_ip,
+        'primary_iface': primary,
+        'ready': exists and br_ip is not None,
+    }
+
+
+def _setup_bridge():
+    """Create br0 bridge and slave the primary ethernet interface to it via nmcli.
+
+    Cleans up duplicate/stale br0 and br0-port connections before creating fresh ones.
+    Properly disconnects the existing ethernet connection so eth0 can join the bridge.
+    """
+    br = _BRIDGE_NAME
+
+    # Already working?
+    st = _bridge_status()
+    if st['ready']:
+        return True, 'Bridge already configured'
+
+    primary = _get_primary_iface()
+    if not primary:
+        return False, 'No primary ethernet interface found'
+    if primary.startswith('br'):
+        return True, f'Already using bridge {primary}'
+
+    try:
+        def nmcli(cmd):
+            return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+
+        # 1. Remove all stale br0 and br0-port connections to avoid duplicates
+        show = nmcli('nmcli -t -f NAME,UUID connection show')
+        for line in show.stdout.splitlines():
+            parts = line.split(':')
+            if len(parts) >= 2:
+                name, uuid = parts[0], parts[1]
+                if name in (br, f'{br}-port'):
+                    nmcli(f'nmcli connection delete {uuid}')
+
+        # 2. Get MAC of primary interface so bridge gets same DHCP lease
+        mac_r = subprocess.run(
+            f"ip link show {primary} | grep -o 'link/ether [^ ]*' | awk '{{print $2}}'",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        primary_mac = mac_r.stdout.strip()
+
+        # 2. Create the bridge connection, cloning MAC so DHCP assigns the same IP
+        mac_opt = f' 802-3-ethernet.cloned-mac-address {primary_mac}' if primary_mac else ''
+        r = nmcli(f'nmcli connection add type bridge con-name {br} ifname {br} stp no autoconnect yes{mac_opt}')
+        if r.returncode != 0:
+            return False, f'create bridge: {r.stderr.strip()}'
+
+        # 3. Create the bridge-slave for the primary ethernet interface
+        r = nmcli(f'nmcli connection add type ethernet con-name {br}-port ifname {primary} master {br} slave-type bridge autoconnect yes')
+        if r.returncode != 0:
+            return False, f'create bridge-port: {r.stderr.strip()}'
+
+        # 4. Find and disconnect the existing non-slave connection on primary iface
+        show = nmcli('nmcli -t -f NAME,UUID,DEVICE connection show --active')
+        for line in show.stdout.splitlines():
+            parts = line.split(':')
+            if len(parts) >= 3 and parts[2] == primary:
+                nmcli(f'nmcli connection down {parts[1]}')
+
+        # 5. Activate the slave so eth0 joins the bridge
+        nmcli(f'nmcli connection up {br}-port')
+
+        # 6. Bring up the bridge
+        nmcli(f'nmcli connection up {br}')
+
+        # Wait for bridge to get IP via DHCP
+        for _ in range(15):
+            time.sleep(1)
+            st = _bridge_status()
+            if st['ready']:
+                return True, f'Bridge {br} active with IP {st["bridge_ip"]}'
+        return False, 'Bridge created but did not get an IP (DHCP timeout — check router/DHCP)'
+    except Exception as e:
+        return False, str(e)
+
+
+def _create_tap(bridge='br0'):
+    """Create a TAP device and attach to bridge. Returns tap name or None."""
+    if not _bridge_exists(bridge):
+        ok, msg = _setup_bridge()
+        if not ok:
+            log.error("Cannot setup bridge: %s", msg)
+            return None
+
+    # Find next available tap name
+    for i in range(100):
+        tap = f'vmtap{i}'
+        r = subprocess.run(
+            f'ip link show {tap}', shell=True, capture_output=True, text=True, timeout=5
+        )
+        if r.returncode != 0:
+            break
+    else:
+        return None
+
+    try:
+        cmds = [
+            f'ip tuntap add dev {tap} mode tap',
+            f'ip link set {tap} master {bridge}',
+            f'ip link set {tap} up',
+        ]
+        for cmd in cmds:
+            r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                log.error("TAP setup failed: %s → %s", cmd, r.stderr.strip())
+                subprocess.run(f'ip link del {tap} 2>/dev/null', shell=True, timeout=5)
+                return None
+        return tap
+    except Exception as e:
+        log.error("TAP creation error: %s", e)
+        return None
+
+
+def _destroy_tap(tap):
+    """Remove a TAP device."""
+    if tap:
+        try:
+            subprocess.run(f'ip link del {tap}', shell=True, capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+
+# ─── Helpers ─────────────────────────────────────────────────
+
+def _allowed_image_roots():
+    roots = [
+        os.path.realpath(_iso_root()),
+        os.path.realpath(_vm_root()),
+    ]
+    builder_images = _app_path('installer/images')
+    if builder_images:
+        roots.append(os.path.realpath(builder_images))
+    return [r.rstrip(os.sep) for r in roots if r]
+
+
+def _is_allowed_image_path(path):
+    """Check if a path stays within permitted VM image directories."""
+    real = os.path.realpath(path or '')
+    return any(real == root or real.startswith(root + os.sep) for root in _allowed_image_roots())
+
+
+def _qemu_available():
+    return check_dep('qemu-system-x86_64')
+
+
+def _arm_qemu_available():
+    """Check if qemu-system-aarch64 is available for ARM emulation."""
+    try:
+        r = host_run('which qemu-system-aarch64', timeout=5)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _is_arm_image(boot_image, vm_name=''):
+    """Detect if an image is ARM-based (rpi, arm, aarch64) by filename."""
+    check = (os.path.basename(boot_image or '') + ' ' + vm_name).lower()
+    return any(tag in check for tag in ('rpi', 'raspberry', 'arm64', 'aarch64', 'armhf', '-arm'))
+
+
+def _is_rpi_image(boot_image, vm_name=''):
+    """Detect if an image is specifically a Raspberry Pi image (needs -machine raspi3b)."""
+    check = (os.path.basename(boot_image or '') + ' ' + vm_name).lower()
+    return any(tag in check for tag in ('rpi', 'raspberry', 'raspios', 'raspi'))
+
+
+def _raspi_machine_available():
+    """Check if QEMU supports the raspi3b machine type."""
+    try:
+        r = host_run('qemu-system-aarch64 -machine help 2>/dev/null | grep -q raspi3b && echo yes', timeout=5)
+        return r.stdout.strip() == 'yes'
+    except Exception:
+        return False
+
+
+def _kvm_available():
+    """Check if KVM hardware acceleration is available."""
+    try:
+        r = host_run('test -e /dev/kvm && echo yes || echo no', timeout=5)
+        return r.stdout.strip() == 'yes'
+    except Exception:
+        return False
+
+
+def _require_qemu(f):
+    """Decorator: return 503 if QEMU is not installed."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not _qemu_available():
+            return jsonify({'error': 'QEMU is not installed. Install the VM Manager package.'}), 503
+        return f(*args, **kwargs)
+    return decorated
+
+
+def _next_vnc_port():
+    """Find the next available VNC display number (port = 5900 + display)."""
+    used = {v.get('vnc_port', 0) for v in _running_vms.values()}
+    for display in range(1, 100):
+        port = 5900 + display
+        if port not in used:
+            return display, port
+    return 99, 5999
+
+
+def _next_ws_port():
+    """Find the next available WebSocket port for noVNC (6080+)."""
+    used = {v.get('ws_port', 0) for v in _running_vms.values()}
+    for p in range(6080, 6180):
+        if p not in used:
+            return p
+    return 6179
+
+
+_NOVNC_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'novnc')
+_WEBSOCKIFY_BIN = os.path.join(os.path.dirname(__file__), '..', '..', 'venv', 'bin', 'websockify')
+
+
+def _start_websockify(vnc_port, ws_port):
+    """Start websockify to proxy WebSocket→VNC for noVNC browser client."""
+    novnc_dir = os.path.abspath(_NOVNC_DIR)
+    ws_bin = os.path.abspath(_WEBSOCKIFY_BIN)
+    if not os.path.isfile(ws_bin):
+        return None
+    try:
+        proc = subprocess.Popen(
+            [ws_bin, '--web', novnc_dir, str(ws_port), f'localhost:{vnc_port}'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        time.sleep(1.0)
+        if proc.poll() is not None:
+            out = proc.stderr.read().decode('utf-8', errors='replace')[:300]
+            log.error("websockify exited early: %s", out)
+            return None
+        return proc
+    except Exception:
+        return None
+
+
+def _stop_websockify(info):
+    """Stop the websockify process associated with a VM."""
+    ws_proc = info.get('ws_proc')
+    if ws_proc:
+        try:
+            ws_proc.terminate()
+            try:
+                ws_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                ws_proc.kill()
+        except Exception:
+            pass
+
+
+def _sanitize_name(name):
+    """Sanitize a VM name for use as a directory name."""
+    name = re.sub(r'[^\w\s\-.]', '', name).strip()
+    return name[:64] if name else 'unnamed-vm'
+
+
+def _vm_dir(vm_id):
+    """Get the directory for a specific VM."""
+    return os.path.join(_vm_root(), vm_id)
+
+
+def _human_size(size_bytes):
+    """Format bytes to human-readable string."""
+    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
+        if abs(size_bytes) < 1024.0:
+            return f'{size_bytes:.1f} {unit}'
+        size_bytes /= 1024.0
+    return f'{size_bytes:.1f} PB'
+
+
+def _check_vm_process(vm_id):
+    """Check if a VM process is still running. Clean up if dead."""
+    info = _running_vms.get(vm_id)
+    if not info:
+        return False
+    proc = info.get('proc')
+    if proc and proc.poll() is None:
+        return True
+    # Process is dead, clean up websockify too
+    _stop_websockify(info)
+    _running_vms.pop(vm_id, None)
+    return False
+
+
+# ═══════════════════════════════════════════════════════════
+#  STATUS / CAPABILITIES
+# ═══════════════════════════════════════════════════════════
+
+@vm_bp.route('/status')
+@admin_required
+def vm_status():
+    """Check QEMU/KVM availability and capabilities."""
+    qemu_ok = _qemu_available()
+    kvm_ok = _kvm_available() if qemu_ok else False
+    return jsonify({
+        'available': qemu_ok,
+        'kvm': kvm_ok,
+        'arm': _arm_qemu_available(),
+        'message': None if qemu_ok else 'QEMU is not installed.',
+    })
+
+
+# ═══════════════════════════════════════════════════════════
+#  VM CRUD
+# ═══════════════════════════════════════════════════════════
+
+@vm_bp.route('/machines')
+@admin_required
+@_require_qemu
+def list_vms():
+    """List all virtual machines with their status."""
+    vms = _load_vms()
+    result = []
+    for vm_id, vm in vms.items():
+        is_running = _check_vm_process(vm_id)
+        info = _running_vms.get(vm_id, {})
+        result.append({
+            'id': vm_id,
+            'name': vm.get('name', vm_id),
+            'cpu': vm.get('cpu', 1),
+            'ram': vm.get('ram', 1024),
+            'disk_size': vm.get('disk_size', '10G'),
+            'os_type': vm.get('os_type', 'linux'),
+            'boot_image': vm.get('boot_image', ''),
+            'status': 'running' if is_running else 'stopped',
+            'vnc_port': info.get('vnc_port') if is_running else None,
+            'vnc_display': info.get('vnc_display') if is_running else None,
+            'ws_port': info.get('ws_port') if is_running else None,
+            'pid': info.get('pid') if is_running else None,
+            'started': info.get('started') if is_running else None,
+            'created': vm.get('created', ''),
+            'description': vm.get('description', ''),
+            'disk_file': vm.get('disk_file', ''),
+            'network': vm.get('network') or _default_network(vm.get('os_type', 'linux')),
+            'arch': 'raspi' if _is_rpi_image(vm.get('boot_image', ''), vm.get('name', ''))
+                    else 'aarch64' if _is_arm_image(vm.get('boot_image', ''), vm.get('name', ''))
+                    else 'x86_64',
+        })
+    return jsonify(result)
+
+
+@vm_bp.route('/machines', methods=['POST'])
+@admin_required
+@_require_qemu
+def create_vm():
+    """Create a new virtual machine."""
+    err = require_tools('qemu-img')
+    if err:
+        return err
+    data = request.get_json(force=True) if request.data else {}
+    name = data.get('name', '').strip()
+    if not name:
+        return jsonify({'error': 'VM name is required'}), 400
+
+    cpu = int(data.get('cpu', 2))
+    ram = int(data.get('ram', 1024))  # MB
+    disk_size = data.get('disk_size', '20G')
+    os_type = data.get('os_type', 'linux')  # linux, windows, other
+    boot_image = data.get('boot_image', '')  # ISO/IMG file to boot from
+    description = data.get('description', '')
+    disk_format = data.get('disk_format', 'qcow2')  # qcow2, raw
+
+    # Network configuration
+    network = data.get('network')
+    if network is None:
+        network = _default_network(os_type)
+
+    # Validate
+    if cpu < 1 or cpu > 32:
+        return jsonify({'error': 'CPU: 1-32 rdzeni'}), 400
+    if ram < 256 or ram > 65536:
+        return jsonify({'error': 'RAM: 256 MB - 64 GB'}), 400
+    if not re.match(r'^\d+[GMK]?$', disk_size):
+        return jsonify({'error': 'Invalid disk size (e.g. 20G, 512M)'}), 400
+    if boot_image:
+        boot_image_real = os.path.realpath(boot_image)
+        if not _is_allowed_image_path(boot_image_real):
+            return jsonify({'error': 'Image path not allowed'}), 403
+        boot_image = boot_image_real
+
+    vm_id = _sanitize_name(name).lower().replace(' ', '-')
+    vm_id = re.sub(r'-+', '-', vm_id)
+    ts = str(int(time.time()))[-6:]
+    vm_id = f'{vm_id}-{ts}'
+
+    vm_path = _vm_dir(vm_id)
+    os.makedirs(vm_path, exist_ok=True)
+
+    # Create virtual disk
+    disk_file = os.path.join(vm_path, f'disk.{disk_format}')
+    try:
+        r = host_run(
+            f'qemu-img create -f {disk_format} "{disk_file}" {disk_size}',
+            timeout=60
+        )
+        if r.returncode != 0:
+            return jsonify({'error': f'Disk creation error: {r.stderr}'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    # Save VM definition
+    vms = _load_vms()
+    vms[vm_id] = {
+        'name': name,
+        'cpu': cpu,
+        'ram': ram,
+        'disk_size': disk_size,
+        'disk_format': disk_format,
+        'disk_file': disk_file,
+        'os_type': os_type,
+        'boot_image': boot_image,
+        'description': description,
+        'network': network,
+        'created': time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    _save_vms(vms)
+
+    return jsonify({'status': 'ok', 'id': vm_id, 'name': name})
+
+
+@vm_bp.route('/machines/<vm_id>', methods=['PUT'])
+@admin_required
+@_require_qemu
+def update_vm(vm_id):
+    """Update VM configuration (only when VM is stopped)."""
+    if _check_vm_process(vm_id):
+        return jsonify({'error': 'Stop VM before editing configuration'}), 409
+
+    vms = _load_vms()
+    if vm_id not in vms:
+        return jsonify({'error': 'VM not found'}), 404
+
+    data = request.get_json(force=True) if request.data else {}
+    vm = vms[vm_id]
+
+    if 'name' in data:
+        vm['name'] = data['name'].strip()
+    if 'cpu' in data:
+        vm['cpu'] = max(1, min(32, int(data['cpu'])))
+    if 'ram' in data:
+        vm['ram'] = max(256, min(65536, int(data['ram'])))
+    if 'os_type' in data:
+        vm['os_type'] = data['os_type']
+    if 'boot_image' in data:
+        new_boot = data.get('boot_image', '')
+        if new_boot:
+            real_boot = os.path.realpath(new_boot)
+            if not _is_allowed_image_path(real_boot):
+                return jsonify({'error': 'Image path not allowed'}), 403
+            new_boot = real_boot
+        vm['boot_image'] = new_boot
+    if 'description' in data:
+        vm['description'] = data['description']
+    if 'network' in data:
+        net = data['network']
+        net_type = net.get('net_type', 'user') if isinstance(net, dict) else 'user'
+        if net_type not in ('user', 'none', 'bridge'):
+            net_type = 'user'
+        pf = _validate_port_forwards(net.get('port_forwards', []) if isinstance(net, dict) else [])
+        net_cfg = {'net_type': net_type, 'port_forwards': pf}
+        if net_type == 'bridge':
+            net_cfg['bridge'] = net.get('bridge', _BRIDGE_NAME) if isinstance(net, dict) else _BRIDGE_NAME
+        vm['network'] = net_cfg
+
+    _save_vms(vms)
+    return jsonify({'ok': True})
+
+
+@vm_bp.route('/machines/<vm_id>/network', methods=['PUT'])
+@admin_required
+@_require_qemu
+def update_vm_network(vm_id):
+    """Update VM network configuration (only when stopped)."""
+    if _check_vm_process(vm_id):
+        return jsonify({'error': 'Stop VM before changing network configuration'}), 409
+
+    vms = _load_vms()
+    if vm_id not in vms:
+        return jsonify({'error': 'VM not found'}), 404
+
+    data = request.get_json(force=True) if request.data else {}
+    net_type = data.get('net_type', 'user')
+    if net_type not in ('user', 'none', 'bridge'):
+        return jsonify({'error': 'net_type must be "user", "bridge", or "none"'}), 400
+    pf = _validate_port_forwards(data.get('port_forwards', []))
+    net_cfg = {'net_type': net_type, 'port_forwards': pf}
+    if net_type == 'bridge':
+        net_cfg['bridge'] = data.get('bridge', _BRIDGE_NAME)
+    vms[vm_id]['network'] = net_cfg
+    _save_vms(vms)
+    return jsonify({'ok': True})
+
+
+@vm_bp.route('/bridge', methods=['GET'])
+@admin_required
+@_require_qemu
+def bridge_info():
+    """Return bridge networking status."""
+    return jsonify(_bridge_status())
+
+
+@vm_bp.route('/bridge/setup', methods=['POST'])
+@admin_required
+@_require_qemu
+def bridge_setup():
+    """Set up bridge networking (creates br0 from primary ethernet)."""
+    ok, msg = _setup_bridge()
+    if ok:
+        return jsonify({'ok': True, 'message': msg, **_bridge_status()})
+    return jsonify({'error': msg}), 500
+
+
+def _teardown_bridge():
+    """Remove br0 bridge and restore direct ethernet connection via nmcli."""
+    br = _BRIDGE_NAME
+    try:
+        def nmcli(cmd):
+            return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+
+        # Find the slave interface before destroying the bridge
+        r = subprocess.run(
+            f"ip link show master {br} | grep -oP '^\\d+: \\K[^@:]+'",
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        slave = r.stdout.strip() or None
+
+        # Delete br0 and br0-port nmcli connections
+        show = nmcli('nmcli -t -f NAME,UUID connection show')
+        for line in show.stdout.splitlines():
+            parts = line.split(':')
+            if len(parts) >= 2 and parts[0] in (br, f'{br}-port'):
+                nmcli(f'nmcli connection delete {parts[1]}')
+
+        # Restore a plain DHCP connection on the slave interface
+        if slave:
+            nmcli(f'nmcli connection add type ethernet con-name {slave} ifname {slave} autoconnect yes ipv4.method auto')
+            nmcli(f'nmcli connection up {slave}')
+
+        # Wait for IP on restored interface
+        for _ in range(15):
+            time.sleep(1)
+            r = subprocess.run(
+                f"ip -4 -o addr show {slave} scope global | awk '{{print $4}}' | cut -d/ -f1 | head -1",
+                shell=True, capture_output=True, text=True, timeout=5
+            )
+            ip = r.stdout.strip()
+            if ip:
+                return True, f'Bridge removed, {slave} restored with IP {ip}'
+        return True, f'Bridge removed, {slave} restored (waiting for DHCP)'
+    except Exception as e:
+        return False, str(e)
+
+
+@vm_bp.route('/bridge/teardown', methods=['POST'])
+@admin_required
+@_require_qemu
+def bridge_teardown():
+    """Remove br0 bridge and restore direct ethernet connection."""
+    ok, msg = _teardown_bridge()
+    if ok:
+        return jsonify({'ok': True, 'message': msg, **_bridge_status()})
+    return jsonify({'error': msg}), 500
+
+
+@vm_bp.route('/machines/<vm_id>', methods=['DELETE'])
+@admin_required
+@_require_qemu
+def delete_vm(vm_id):
+    """Delete a virtual machine and its disk files."""
+    if _check_vm_process(vm_id):
+        return jsonify({'error': 'Stop VM before deletion'}), 409
+
+    vms = _load_vms()
+    if vm_id not in vms:
+        return jsonify({'error': 'VM not found'}), 404
+
+    # Remove VM directory
+    vm_path = _vm_dir(vm_id)
+    if os.path.isdir(vm_path):
+        import shutil
+        shutil.rmtree(vm_path, ignore_errors=True)
+
+    del vms[vm_id]
+    _save_vms(vms)
+    return jsonify({'status': 'ok'})
+
+
+# ─── noVNC static proxy (same-origin for iframe) ─────────
+
+@vm_bp.route('/novnc/<path:filename>')
+def novnc_static(filename):
+    """Serve noVNC files through Flask so the console iframe stays same-origin.
+    No auth required — these are static open-source UI files, not data."""
+    novnc_dir = os.path.abspath(_NOVNC_DIR)
+    if not os.path.isdir(novnc_dir):
+        abort(404)
+    return send_from_directory(novnc_dir, filename)
+
+
+# ═══════════════════════════════════════════════════════════
+#  VM POWER CONTROL
+# ═══════════════════════════════════════════════════════════
+
+@vm_bp.route('/machines/<vm_id>/start', methods=['POST'])
+@admin_required
+@_require_qemu
+def start_vm(vm_id):
+    """Start a virtual machine."""
+    if _check_vm_process(vm_id):
+        return jsonify({'error': 'VM already running'}), 409
+
+    vms = _load_vms()
+    vm = vms.get(vm_id)
+    if not vm:
+        return jsonify({'error': 'VM not found'}), 404
+
+    vnc_display, vnc_port = _next_vnc_port()
+    kvm = _kvm_available()
+
+    boot_image = vm.get('boot_image', '')
+    boot_image_real = os.path.realpath(boot_image) if boot_image else ''
+    if boot_image and not _is_allowed_image_path(boot_image_real):
+        return jsonify({'error': 'Image path not allowed'}), 403
+    boot_image = boot_image_real
+
+    is_arm = _is_arm_image(boot_image, vm.get('name', ''))
+    is_rpi = _is_rpi_image(boot_image, vm.get('name', ''))
+
+    # Validate that the required QEMU system binary is available
+    if is_arm or is_rpi:
+        err = require_tools('qemu-system-aarch64')
+    else:
+        err = require_tools('qemu-system-x86_64')
+    if err:
+        return err
+
+    # ── Raspberry Pi VM (raspi3b machine) ─────────────────────
+    tap_dev = None  # Track TAP device for cleanup on stop
+    if is_rpi:
+        if not _arm_qemu_available():
+            return jsonify({'error': 'qemu-system-aarch64 is not installed. Install: apt install qemu-system-arm'}), 503
+        if not _raspi_machine_available():
+            return jsonify({'error': 'QEMU does not support raspi3b machine. Update QEMU to version >= 8.0'}), 503
+
+        # The boot image (RPi OS .img) is the main SD card — must be writable.
+        # We work on a copy so the original stays intact.
+        if boot_image and os.path.exists(boot_image):
+            vm_path = _vm_dir(vm_id)
+            sd_copy = os.path.join(vm_path, 'sd-card.img')
+            if not os.path.exists(sd_copy):
+                import shutil
+                _logger.info('Copying RPi image as SD card: %s → %s', boot_image, sd_copy)
+                shutil.copy2(boot_image, sd_copy)
+        else:
+            return jsonify({'error': 'No RPi boot image (.img)'}), 400
+
+        # ── Extract kernel + DTB from boot partition ──
+        # QEMU raspi3b does NOT emulate GPU firmware (bootcode.bin/start.elf),
+        # so we must extract and pass kernel + DTB explicitly.
+        kernel_path = os.path.join(vm_path, 'kernel8.img')
+        dtb_path = os.path.join(vm_path, 'bcm2710-rpi-3-b-plus.dtb')
+
+        if not os.path.exists(kernel_path) or not os.path.exists(dtb_path):
+            _logger.info('Extracting kernel + DTB from RPi image boot partition...')
+            extract_script = (
+                f'LOOP=$(losetup --find --show --partscan "{sd_copy}") && '
+                f'BOOT_PART="${{LOOP}}p1" && '
+                f'MNT=$(mktemp -d) && '
+                f'mount -o ro "$BOOT_PART" "$MNT" && '
+                f'cp "$MNT/kernel8.img" "{kernel_path}" 2>/dev/null || '
+                f'  cp "$MNT/kernel_2712.img" "{kernel_path}" 2>/dev/null || '
+                f'  cp "$MNT/kernel8.img" "{kernel_path}" && '
+                f'DTB=$(ls "$MNT"/bcm2710-rpi-3-b*.dtb 2>/dev/null | head -1) && '
+                f'[ -n "$DTB" ] && cp "$DTB" "{dtb_path}" && '
+                f'umount "$MNT" && losetup -d "$LOOP" && rm -rf "$MNT" && echo OK'
+            )
+            r = host_run(extract_script, timeout=30)
+            if 'OK' not in r.stdout:
+                return jsonify({'error': f'Failed to extract kernel/DTB from RPi image: {r.stderr[-200:]}'}), 500
+
+        if not os.path.exists(kernel_path):
+            return jsonify({'error': 'No kernel8.img in RPi image'}), 400
+        if not os.path.exists(dtb_path):
+            return jsonify({'error': 'No DTB file (bcm2710-rpi-3-b*.dtb) in RPi image'}), 400
+
+        cmd = ['qemu-system-aarch64']
+        cmd += ['-machine', 'raspi3b']
+        # raspi3b: fixed 1 GB RAM — QEMU ignores -m for this machine
+
+        # Kernel + DTB (required — raspi3b has no GPU firmware emulation)
+        cmd += ['-kernel', kernel_path]
+        cmd += ['-dtb', dtb_path]
+        cmd += ['-append', 'console=ttyAMA0,115200 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait']
+
+        # SD card — main boot drive (RPi boots from SD)
+        cmd += ['-drive', f'file={sd_copy},format=raw,if=sd']
+
+        # Additional data disk (qcow2) — attach via USB mass-storage
+        # NOTE: raspi3b USB emulation is limited; this may not work
+        disk_file = vm.get('disk_file', '')
+        if disk_file and os.path.exists(disk_file):
+            disk_format = vm.get('disk_format', 'qcow2')
+            cmd += ['-drive', f'file={disk_file},format={disk_format},if=none,id=usbdisk']
+            cmd += ['-device', 'usb-storage,drive=usbdisk']
+
+        # Serial console (more reliable than VNC for raspi3b)
+        cmd += ['-serial', f'mon:tcp:127.0.0.1:{vnc_port},server=on,wait=off']
+
+        # VNC display (raspi3b framebuffer — may show nothing until kernel draws to fb)
+        cmd += ['-vnc', f':{vnc_display}']
+
+        # Network — no USB-net for raspi3b (DWC2 emulation is limited)
+        # User can SSH via port-forwarded serial or VNC
+        cmd += ['-monitor', 'none']
+
+    # ── Generic ARM (aarch64) VM ──────────────────────────────
+    elif is_arm:
+        if not _arm_qemu_available():
+            return jsonify({'error': 'qemu-system-aarch64 is not installed. Install: apt install qemu-system-arm qemu-efi-aarch64'}), 503
+
+        cmd = ['qemu-system-aarch64']
+        cmd += ['-machine', 'virt']
+        cmd += ['-cpu', 'cortex-a72']
+        cmd += ['-smp', str(vm.get('cpu', 2))]
+        cmd += ['-m', str(vm.get('ram', 1024))]
+
+        # UEFI firmware for aarch64
+        aavmf_paths = [
+            '/usr/share/AAVMF/AAVMF_CODE.fd',
+            '/usr/share/qemu-efi-aarch64/QEMU_EFI.fd',
+        ]
+        for fw in aavmf_paths:
+            if os.path.exists(fw):
+                cmd += ['-bios', fw]
+                break
+
+        # Disk
+        disk_file = vm.get('disk_file', '')
+        if disk_file and os.path.exists(disk_file):
+            disk_format = vm.get('disk_format', 'qcow2')
+            cmd += ['-drive', f'file={disk_file},format={disk_format},if=virtio']
+
+        # Boot image — mount as second drive for generic ARM
+        if boot_image and os.path.exists(boot_image):
+            ext = os.path.splitext(boot_image)[1].lower()
+            fmt = 'raw' if ext in ('.img', '.raw') else 'qcow2'
+            cmd += ['-drive', f'file={boot_image},format={fmt},if=virtio']
+
+        # Network — configurable per-VM
+        try:
+            net_args, tap_dev = _build_net_opts(vm)
+        except RuntimeError as e:
+            return jsonify({'error': str(e)}), 409
+        if net_args:
+            cmd += net_args
+
+        # VNC and display
+        cmd += ['-vnc', f':{vnc_display}']
+        cmd += ['-device', 'virtio-gpu-pci']
+        cmd += ['-device', 'usb-ehci', '-device', 'usb-tablet']
+        cmd += ['-monitor', 'none']
+
+    # ── x86_64 VM ─────────────────────────────────────────────
+    else:
+
+        # Build QEMU command
+        cmd = ['qemu-system-x86_64']
+
+        # KVM acceleration
+        if kvm:
+            cmd += ['-enable-kvm']
+
+        # Machine type
+        cmd += ['-machine', 'q35']
+
+        # CPU
+        cpu_model = 'host' if kvm else 'qemu64'
+        cmd += ['-cpu', cpu_model, '-smp', str(vm.get('cpu', 2))]
+
+        # RAM
+        cmd += ['-m', str(vm.get('ram', 1024))]
+
+        # Boot image (ISO/IMG) — must be resolved before disk so we can
+        # set boot priority when a disk image is used as installer media.
+        has_disk_boot_image = False
+        if boot_image and os.path.exists(boot_image):
+            ext = os.path.splitext(boot_image)[1].lower()
+            if ext in ('.iso',):
+                pass  # handled below after disk
+            else:
+                has_disk_boot_image = True
+                fmt_map = {
+                    '.img': 'raw', '.raw': 'raw',
+                    '.qcow2': 'qcow2', '.vdi': 'vdi', '.vmdk': 'vmdk',
+                }
+                img_fmt = fmt_map.get(ext, 'raw')
+                # Boot image as primary drive (bootindex=0) — acts like a USB installer
+                # snapshot=on: temp CoW overlay so guest can write without modifying the original
+                cmd += ['-drive', f'file={boot_image},format={img_fmt},if=none,id=bootimg,snapshot=on']
+                cmd += ['-device', 'virtio-blk-pci,drive=bootimg,bootindex=0']
+
+        # Disk — the VM's own virtual hard drive (install target)
+        disk_file = vm.get('disk_file', '')
+        if disk_file and os.path.exists(disk_file):
+            disk_format = vm.get('disk_format', 'qcow2')
+            if has_disk_boot_image:
+                # Lower boot priority so the boot image is tried first
+                cmd += ['-drive', f'file={disk_file},format={disk_format},if=none,id=maindisk']
+                cmd += ['-device', 'virtio-blk-pci,drive=maindisk,bootindex=1']
+            else:
+                # Sole disk — explicit bootindex so UEFI/BIOS picks it up
+                cmd += ['-drive', f'file={disk_file},format={disk_format},if=none,id=maindisk']
+                cmd += ['-device', 'virtio-blk-pci,drive=maindisk,bootindex=0']
+
+        # ISO boot image (CD-ROM)
+        if boot_image and os.path.exists(boot_image):
+            ext = os.path.splitext(boot_image)[1].lower()
+            if ext in ('.iso',):
+                cmd += ['-cdrom', boot_image]
+                cmd += ['-boot', 'd']
+
+        # Network — configurable per-VM
+        try:
+            net_args, tap_dev = _build_net_opts(vm)
+        except RuntimeError as e:
+            return jsonify({'error': str(e)}), 409
+        if net_args:
+            cmd += net_args
+
+        # VNC display (for remote access through browser)
+        cmd += ['-vnc', f':{vnc_display}']
+
+        # UEFI firmware — auto-detect GPT/EFI disks, also honor explicit os_type
+        ovmf_paths = [
+            '/usr/share/OVMF/OVMF_CODE.fd',
+            '/usr/share/ovmf/OVMF.fd',
+            '/usr/share/qemu/OVMF.fd',
+        ]
+        need_uefi = vm.get('os_type') in ('windows', 'uefi')
+        if not need_uefi:
+            # Auto-detect: check if any disk has GPT (EFI) partition table
+            for check_disk in [boot_image, disk_file]:
+                if check_disk and os.path.exists(check_disk):
+                    try:
+                        r = subprocess.run(
+                            ['fdisk', '-l', check_disk],
+                            capture_output=True, timeout=5)
+                        if b'Disklabel type: gpt' in r.stdout:
+                            need_uefi = True
+                            break
+                    except Exception:
+                        pass
+        if need_uefi:
+            for ovmf in ovmf_paths:
+                if os.path.exists(ovmf):
+                    cmd += ['-bios', ovmf]
+                    break
+
+        # USB tablet for better mouse tracking in VNC
+        cmd += ['-device', 'usb-ehci', '-device', 'usb-tablet']
+
+        # VGA adapter — virtio-gpu for best performance in VNC/noVNC
+        cmd += ['-vga', 'virtio']
+
+        # Daemonize — no, we manage the process ourselves
+        cmd += ['-monitor', 'none']
+
+    try:
+        # Use real subprocess.Popen (not gevent patched one for better control)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,  # Detach from our process group
+        )
+
+        # Wait briefly to check if QEMU started OK
+        time.sleep(1)
+        if proc.poll() is not None:
+            stderr = proc.stderr.read().decode('utf-8', errors='replace')
+            _destroy_tap(tap_dev)
+            return jsonify({'error': f'QEMU failed to start: {stderr[:500]}'}), 500
+
+        _running_vms[vm_id] = {
+            'proc': proc,
+            'pid': proc.pid,
+            'started': time.time(),
+            'vnc_port': vnc_port,
+            'vnc_display': vnc_display,
+            'ws_proc': None,
+            'ws_port': None,
+            'tap_dev': tap_dev,
+        }
+
+        # Start websockify for browser-based console (noVNC)
+        ws_port = _next_ws_port()
+        ws_proc = _start_websockify(vnc_port, ws_port)
+        if ws_proc:
+            _running_vms[vm_id]['ws_proc'] = ws_proc
+            _running_vms[vm_id]['ws_port'] = ws_port
+
+        return jsonify({
+            'ok': True,
+            'pid': proc.pid,
+            'vnc_port': vnc_port,
+            'vnc_display': vnc_display,
+            'ws_port': _running_vms[vm_id].get('ws_port'),
+            'kvm': kvm,
+            'message': f'VM started (VNC: :{vnc_display})',
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@vm_bp.route('/machines/<vm_id>/stop', methods=['POST'])
+@admin_required
+@_require_qemu
+def stop_vm(vm_id):
+    """Stop (gracefully or forcefully) a virtual machine."""
+    if not _check_vm_process(vm_id):
+        return jsonify({'error': 'VM not running'}), 409
+
+    data = request.get_json(force=True) if request.data else {}
+    force = data.get('force', False)
+
+    info = _running_vms.get(vm_id)
+    if not info:
+        return jsonify({'error': 'VM not found'}), 404
+
+    proc = info['proc']
+    try:
+        if force:
+            proc.kill()
+        else:
+            proc.terminate()
+            # Wait up to 10s for graceful shutdown
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    except Exception:
+        pass
+
+    _stop_websockify(info)
+    _destroy_tap(info.get('tap_dev'))
+    _running_vms.pop(vm_id, None)
+    return jsonify({'status': 'ok'})
+
+
+@vm_bp.route('/machines/<vm_id>/restart', methods=['POST'])
+@admin_required
+@_require_qemu
+def restart_vm(vm_id):
+    """Restart a VM by stopping and starting it."""
+    # Stop
+    if _check_vm_process(vm_id):
+        info = _running_vms.get(vm_id)
+        if info:
+            proc = info['proc']
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            _stop_websockify(info)
+            _destroy_tap(info.get('tap_dev'))
+        _running_vms.pop(vm_id, None)
+        time.sleep(1)
+
+    # Start — delegate to start_vm logic
+    return start_vm(vm_id)
+
+
+# ═══════════════════════════════════════════════════════════
+#  ISO / IMAGE MANAGEMENT
+# ═══════════════════════════════════════════════════════════
+
+@vm_bp.route('/images')
+@admin_required
+@_require_qemu
+def list_images():
+    """List available ISO/IMG/QCOW2 images for booting VMs."""
+    iso_dir = _iso_root()
+    images = []
+    valid_exts = {'.iso', '.img', '.raw', '.qcow2', '.vdi', '.vmdk'}
+
+    for entry in sorted(os.listdir(iso_dir)):
+        fpath = os.path.join(iso_dir, entry)
+        if not os.path.isfile(fpath):
+            continue
+        ext = os.path.splitext(entry)[1].lower()
+        if ext not in valid_exts:
+            continue
+        stat = os.stat(fpath)
+        images.append({
+            'name': entry,
+            'path': fpath,
+            'size': stat.st_size,
+            'size_human': _human_size(stat.st_size),
+            'type': ext.lstrip('.').upper(),
+            'modified': time.strftime('%Y-%m-%d %H:%M', time.localtime(stat.st_mtime)),
+        })
+    return jsonify(images)
+
+
+@vm_bp.route('/builder-images')
+@admin_required
+def list_builder_images():
+    """List images built by the EthOS Builder (installer/images/)."""
+    images_dir = _app_path('installer/images')
+    if not os.path.isdir(images_dir):
+        return jsonify([])
+    valid_exts = {'.iso', '.img', '.raw', '.qcow2'}
+    result = []
+    for entry in sorted(os.listdir(images_dir)):
+        fpath = os.path.join(images_dir, entry)
+        if not os.path.isfile(fpath):
+            continue
+        ext = os.path.splitext(entry)[1].lower()
+        if ext not in valid_exts:
+            continue
+        stat = os.stat(fpath)
+        result.append({
+            'name': entry,
+            'path': fpath,
+            'size': stat.st_size,
+            'size_human': _human_size(stat.st_size),
+            'type': ext.lstrip('.').upper(),
+            'modified': time.strftime('%Y-%m-%d %H:%M', time.localtime(stat.st_mtime)),
+        })
+    return jsonify(result)
+
+
+@vm_bp.route('/builder-images/copy', methods=['POST'])
+@admin_required
+@_require_qemu
+def copy_builder_image():
+    """Copy a builder image into the VM images directory."""
+    import shutil as _shutil
+    data = request.get_json(force=True) if request.data else {}
+    src = data.get('path', '')
+    if not src or not os.path.isfile(src):
+        return jsonify({'error': 'Source file not found'}), 404
+    # Security: only allow files from the builder images directory
+    images_dir = os.path.realpath(_app_path('installer/images'))
+    real_src = os.path.realpath(src)
+    if not real_src.startswith(images_dir + '/'):
+        return jsonify({'error': 'Path not allowed'}), 403
+    dest = os.path.join(_iso_root(), os.path.basename(src))
+    if os.path.exists(dest):
+        return jsonify({'error': f'File "{os.path.basename(src)}" already exists in VM images'}), 409
+    try:
+        _shutil.copy2(real_src, dest)
+        return jsonify({'status': 'ok', 'name': os.path.basename(src)})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@vm_bp.route('/images', methods=['POST'])
+@admin_required
+@_require_qemu
+def upload_image():
+    """Upload an ISO/IMG/QCOW2 image."""
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file'}), 400
+
+    f = request.files['file']
+    if not f.filename:
+        return jsonify({'error': 'No filename provided'}), 400
+
+    valid_exts = {'.iso', '.img', '.raw', '.qcow2', '.vdi', '.vmdk'}
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in valid_exts:
+        return jsonify({'error': f'Unsupported format: {ext}. Allowed: {", ".join(valid_exts)}'}), 400
+
+    safe_name = re.sub(r'[^\w\s\-.]', '', f.filename)
+    dest = os.path.join(_iso_root(), safe_name)
+
+    f.save(dest)
+    return jsonify({'ok': True, 'name': safe_name, 'path': dest})
+
+
+@vm_bp.route('/images/<path:filename>', methods=['DELETE'])
+@admin_required
+@_require_qemu
+def delete_image(filename):
+    """Delete an image file."""
+    fpath = os.path.join(_iso_root(), os.path.basename(filename))
+    if not os.path.isfile(fpath):
+        return jsonify({'error': 'File not found'}), 404
+
+    # Check if any VM uses this image
+    vms = _load_vms()
+    for vm_id, vm in vms.items():
+        if vm.get('boot_image') == fpath:
+            return jsonify({'error': f'Image in use by VM "{vm.get("name", vm_id)}"'}), 409
+
+    os.remove(fpath)
+    return jsonify({'ok': True})
+
+
+@vm_bp.route('/import-disk', methods=['POST'])
+@admin_required
+@_require_qemu
+def import_disk():
+    """Create a VM from an uploaded or server-path disk image.
+
+    Accepts multipart/form-data (file upload) or JSON with src_path.
+    Converts vmdk/vdi/raw/img → qcow2 via qemu-img convert.
+    """
+    import shutil
+
+    err = require_tools('qemu-img')
+    if err:
+        return err
+
+    is_upload = 'file' in request.files
+
+    if is_upload:
+        f      = request.files['file']
+        name   = (request.form.get('name') or '').strip()
+        cpu    = int(request.form.get('cpu', 2))
+        ram    = int(request.form.get('ram', 2048))
+        os_type= request.form.get('os_type', 'linux')
+        desc   = request.form.get('description', '')
+        do_convert = request.form.get('convert', 'true') == 'true'
+    else:
+        data   = request.get_json(force=True) if request.data else {}
+        name   = (data.get('name') or '').strip()
+        cpu    = int(data.get('cpu', 2))
+        ram    = int(data.get('ram', 2048))
+        os_type= data.get('os_type', 'linux')
+        desc   = data.get('description', '')
+        do_convert = data.get('convert', True)
+        src_path   = (data.get('src_path') or '').strip()
+
+    if not name:
+        return jsonify({'error': 'Podaj nazwę VM'}), 400
+
+    # Build VM id/dir
+    vm_id  = re.sub(r'-+', '-', _sanitize_name(name).lower().replace(' ', '-'))
+    vm_id  = f'{vm_id}-{str(int(time.time()))[-6:]}'
+    vm_path = _vm_dir(vm_id)
+    os.makedirs(vm_path, exist_ok=True)
+
+    try:
+        if is_upload:
+            fname = f.filename or 'disk'
+            ext   = os.path.splitext(fname)[1].lower()
+            valid = {'.qcow2', '.raw', '.vmdk', '.vdi', '.img', '.vhd', '.vhdx'}
+            if ext not in valid:
+                shutil.rmtree(vm_path, ignore_errors=True)
+                return jsonify({'error': f'Nieobsługiwany format: {ext}. Dozwolone: {", ".join(sorted(valid))}'}), 400
+            tmp = os.path.join(vm_path, f'import_tmp{ext}')
+            f.save(tmp)
+            src_path = tmp
+        else:
+            if not src_path:
+                shutil.rmtree(vm_path, ignore_errors=True)
+                return jsonify({'error': 'src_path wymagany'}), 400
+            real = os.path.realpath(src_path)
+            allowed_roots = _allowed_image_roots() + [os.path.realpath(_iso_root())]
+            if not any(real.startswith(r + '/') or real == r for r in allowed_roots):
+                shutil.rmtree(vm_path, ignore_errors=True)
+                return jsonify({'error': 'Ścieżka niedozwolona'}), 403
+            src_path = real
+
+        ext = os.path.splitext(src_path)[1].lower()
+
+        if do_convert and ext != '.qcow2':
+            disk_file   = os.path.join(vm_path, 'disk.qcow2')
+            disk_format = 'qcow2'
+            r = host_run(f'qemu-img convert -O qcow2 "{src_path}" "{disk_file}"', timeout=7200)
+            if r.returncode != 0:
+                raise Exception(f'Konwersja nie powiodła się: {r.stderr[:300]}')
+            if is_upload:
+                os.remove(src_path)
+        else:
+            disk_format = {'img': 'raw', 'vhd': 'vpc', 'vhdx': 'vhdx'}.get(ext.lstrip('.'), ext.lstrip('.'))
+            disk_file   = os.path.join(vm_path, f'disk{ext}')
+            if is_upload:
+                os.rename(src_path, disk_file)
+            else:
+                shutil.copy2(src_path, disk_file)
+
+        # Read actual disk size from image metadata
+        try:
+            ir = host_run(f'qemu-img info --output=json "{disk_file}"', timeout=30)
+            info = json.loads(ir.stdout) if ir.returncode == 0 else {}
+            disk_size = _human_size(info.get('virtual-size', 0))
+        except Exception:
+            disk_size = 'imported'
+
+        vms = _load_vms()
+        vms[vm_id] = {
+            'name':        name,
+            'cpu':         max(1, min(32, cpu)),
+            'ram':         max(256, min(65536, ram)),
+            'disk_size':   disk_size,
+            'disk_format': disk_format,
+            'disk_file':   disk_file,
+            'os_type':     os_type,
+            'boot_image':  '',
+            'description': desc,
+            'network':     _default_network(os_type),
+            'created':     time.strftime('%Y-%m-%d %H:%M:%S'),
+            'imported':    True,
+        }
+        _save_vms(vms)
+        return jsonify({'status': 'ok', 'id': vm_id, 'name': name, 'disk_size': disk_size})
+
+    except Exception as e:
+        shutil.rmtree(vm_path, ignore_errors=True)
+        return jsonify({'error': str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════
+#  DISK MANAGEMENT
+# ═══════════════════════════════════════════════════════════
+
+@vm_bp.route('/machines/<vm_id>/disk-info')
+@admin_required
+@_require_qemu
+def disk_info(vm_id):
+    """Get info about a VM's disk file."""
+    err = require_tools('qemu-img')
+    if err:
+        return err
+    vms = _load_vms()
+    vm = vms.get(vm_id)
+    if not vm:
+        return jsonify({'error': 'VM not found'}), 404
+
+    disk_file = vm.get('disk_file', '')
+    if not disk_file or not os.path.exists(disk_file):
+        return jsonify({'error': 'Disk file not found'}), 404
+
+    try:
+        r = host_run(f'qemu-img info --output=json "{disk_file}"', timeout=10)
+        if r.returncode == 0:
+            info = json.loads(r.stdout)
+            return jsonify({
+                'filename': info.get('filename', ''),
+                'format': info.get('format', ''),
+                'virtual_size': info.get('virtual-size', 0),
+                'virtual_size_human': _human_size(info.get('virtual-size', 0)),
+                'actual_size': info.get('actual-size', 0),
+                'actual_size_human': _human_size(info.get('actual-size', 0)),
+            })
+        return jsonify({'error': r.stderr}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@vm_bp.route('/machines/<vm_id>/resize-disk', methods=['POST'])
+@admin_required
+@_require_qemu
+def resize_disk(vm_id):
+    """Resize a VM's disk (expand only, VM must be stopped)."""
+    err = require_tools('qemu-img')
+    if err:
+        return err
+    if _check_vm_process(vm_id):
+        return jsonify({'error': 'Stop VM before resizing disk'}), 409
+
+    vms = _load_vms()
+    vm = vms.get(vm_id)
+    if not vm:
+        return jsonify({'error': 'VM not found'}), 404
+
+    data = request.get_json(force=True) if request.data else {}
+    new_size = data.get('size', '')
+    if not re.match(r'^\+?\d+[GMK]$', new_size):
+        return jsonify({'error': 'Invalid size (e.g. +10G, +512M)'}), 400
+
+    if not new_size.startswith('+'):
+        new_size = '+' + new_size
+
+    disk_file = vm.get('disk_file', '')
+    if not disk_file or not os.path.exists(disk_file):
+        return jsonify({'error': 'Disk file not found'}), 404
+
+    try:
+        r = host_run(f'qemu-img resize "{disk_file}" {new_size}', timeout=30)
+        if r.returncode == 0:
+            return jsonify({'status': 'ok', 'new_size': new_size})
+        return jsonify({'error': r.stderr}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════
+#  SNAPSHOTS
+# ═══════════════════════════════════════════════════════════
+
+@vm_bp.route('/machines/<vm_id>/snapshots')
+@admin_required
+@_require_qemu
+def list_snapshots(vm_id):
+    """List disk snapshots for a QCOW2 VM."""
+    err = require_tools('qemu-img')
+    if err:
+        return err
+    vms = _load_vms()
+    vm = vms.get(vm_id)
+    if not vm:
+        return jsonify({'error': 'VM not found'}), 404
+
+    disk_file = vm.get('disk_file', '')
+    if not disk_file or not os.path.exists(disk_file):
+        return jsonify({'snapshots': []})
+
+    if vm.get('disk_format') != 'qcow2':
+        return jsonify({'error': 'Snapshots only available for QCOW2 disks'}), 400
+
+    try:
+        r = host_run(f'qemu-img snapshot -l "{disk_file}"', timeout=10)
+        snapshots = []
+        if r.returncode == 0 and r.stdout.strip():
+            # Parse qemu-img snapshot -l output
+            lines = r.stdout.strip().split('\n')
+            for line in lines[2:]:  # Skip headers
+                parts = line.split()
+                if len(parts) >= 5:
+                    snapshots.append({
+                        'id': parts[0],
+                        'tag': parts[1],
+                        'vm_size': parts[2] if len(parts) > 2 else '',
+                        'date': parts[3] if len(parts) > 3 else '',
+                        'time': parts[4] if len(parts) > 4 else '',
+                    })
+        return jsonify({'snapshots': snapshots})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@vm_bp.route('/machines/<vm_id>/snapshots', methods=['POST'])
+@admin_required
+@_require_qemu
+def create_snapshot(vm_id):
+    """Create a disk snapshot (VM must be stopped, disk must be QCOW2)."""
+    err = require_tools('qemu-img')
+    if err:
+        return err
+    if _check_vm_process(vm_id):
+        return jsonify({'error': 'Stop VM before creating snapshot'}), 409
+
+    vms = _load_vms()
+    vm = vms.get(vm_id)
+    if not vm:
+        return jsonify({'error': 'VM not found'}), 404
+
+    if vm.get('disk_format') != 'qcow2':
+        return jsonify({'error': 'Snapshots only available for QCOW2'}), 400
+
+    data = request.get_json(force=True) if request.data else {}
+    tag = _sanitize_name(data.get('name', f'snap-{int(time.time())}'))
+
+    disk_file = vm.get('disk_file', '')
+    try:
+        r = host_run(f'qemu-img snapshot -c "{tag}" "{disk_file}"', timeout=30)
+        if r.returncode == 0:
+            return jsonify({'status': 'ok', 'snapshot': tag})
+        return jsonify({'error': r.stderr}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@vm_bp.route('/machines/<vm_id>/snapshots/<tag>', methods=['POST'])
+@admin_required
+@_require_qemu
+def restore_snapshot(vm_id, tag):
+    """Restore a disk snapshot (VM must be stopped)."""
+    err = require_tools('qemu-img')
+    if err:
+        return err
+    if _check_vm_process(vm_id):
+        return jsonify({'error': 'Stop VM before restoring snapshot'}), 409
+
+    vms = _load_vms()
+    vm = vms.get(vm_id)
+    if not vm:
+        return jsonify({'error': 'VM not found'}), 404
+
+    disk_file = vm.get('disk_file', '')
+    safe_tag = _sanitize_name(tag)
+    try:
+        r = host_run(f'qemu-img snapshot -a "{safe_tag}" "{disk_file}"', timeout=30)
+        if r.returncode == 0:
+            return jsonify({'status': 'ok', 'snapshot': safe_tag})
+        return jsonify({'error': r.stderr}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@vm_bp.route('/machines/<vm_id>/snapshots/<tag>', methods=['DELETE'])
+@admin_required
+@_require_qemu
+def delete_snapshot(vm_id, tag):
+    """Delete a disk snapshot."""
+    err = require_tools('qemu-img')
+    if err:
+        return err
+    vms = _load_vms()
+    vm = vms.get(vm_id)
+    if not vm:
+        return jsonify({'error': 'VM not found'}), 404
+
+    disk_file = vm.get('disk_file', '')
+    safe_tag = _sanitize_name(tag)
+    try:
+        r = host_run(f'qemu-img snapshot -d "{safe_tag}" "{disk_file}"', timeout=30)
+        if r.returncode == 0:
+            return jsonify({'ok': True})
+        return jsonify({'error': r.stderr}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════
+#  CONVERT DISK IMAGES
+# ═══════════════════════════════════════════════════════════
+
+@vm_bp.route('/convert', methods=['POST'])
+@admin_required
+@_require_qemu
+def convert_image():
+    """Convert a disk image between formats (raw, qcow2, vdi, vmdk)."""
+    err = require_tools('qemu-img')
+    if err:
+        return err
+    data = request.get_json(force=True) if request.data else {}
+    source = data.get('source', '')
+    target_format = data.get('format', 'qcow2')
+
+    if target_format not in ('raw', 'qcow2', 'vdi', 'vmdk'):
+        return jsonify({'error': 'Unsupported target format'}), 400
+
+    if not source or not os.path.exists(source):
+        return jsonify({'error': 'Source file not found'}), 404
+
+    source_real = os.path.realpath(source)
+    if not _is_allowed_image_path(source_real):
+        return jsonify({'error': 'Source path not allowed'}), 403
+
+    base, _ = os.path.splitext(source_real)
+    dest = os.path.realpath(f'{base}.{target_format}')
+    if not _is_allowed_image_path(dest):
+        return jsonify({'error': 'Target path not allowed'}), 403
+
+    try:
+        r = host_run(f'qemu-img convert -O {target_format} "{source_real}" "{dest}"', timeout=600)
+        if r.returncode == 0:
+            return jsonify({'status': 'ok', 'output': dest, 'target_format': target_format})
+        return jsonify({'error': r.stderr}), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({'error': 'Conversion timed out (10 min)'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════
+#  PACKAGE INSTALL / UNINSTALL
+# ═══════════════════════════════════════════════════════════
+
+def _on_uninstall(wipe):
+    """Cleanup when the VM Manager package is uninstalled."""
+    # Stop all running VMs and their websockify processes
+    for vm_id in list(_running_vms.keys()):
+        try:
+            info = _running_vms[vm_id]
+            _stop_websockify(info)
+            proc = info.get('proc')
+            if proc:
+                proc.kill()
+        except Exception:
+            pass
+    _running_vms.clear()
+
+
+register_pkg_routes(
+    vm_bp,
+    install_message='VM Manager ready — QEMU/KVM installed.',
+    install_deps=['qemu-system-x86_64'],
+    status_extras=lambda: {
+        'qemu_available': _qemu_available(),
+        'kvm_available': _kvm_available(),
+        'arm_available': _arm_qemu_available(),
+        'raspi_available': _raspi_machine_available(),
+    },
+    on_uninstall=_on_uninstall,
+    wipe_files=[_STATE_FILE],
+    wipe_dirs=[os.path.abspath(_DEFAULT_VM_DIR)],
+)
