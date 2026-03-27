@@ -11,11 +11,10 @@
       "admin_only": false,
       "description": "Monitoring IP kamer z detekcja ruchu i podgladem na zywo.",
       "apt_deps": [
-        "ffmpeg",
-        "ffprobe"
+        "ffmpeg"
       ],
       "pip_deps": [
-        "python-onvif-zeep"
+        "onvif-zeep"
       ],
       "install_endpoint": "/api/surveillance/install",
       "uninstall_endpoint": "/api/surveillance/uninstall",
