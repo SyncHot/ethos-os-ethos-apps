@@ -107,6 +107,9 @@ def _build_net_opts(vm):
 
     if net_type == 'bridge':
         bridge = net.get('bridge', 'br0')
+        if not _validate_bridge_name(bridge):
+            log.warning("Invalid bridge name rejected: %s", bridge)
+            bridge = _BRIDGE_NAME
         tap = _create_tap(bridge)
         if not tap:
             # Fallback to user mode if bridge setup fails
@@ -141,6 +144,13 @@ def _build_net_opts(vm):
 
 _BRIDGE_NAME = 'br0'
 
+
+def _validate_bridge_name(name):
+    """Validate bridge interface name to prevent shell injection."""
+    if not name or not isinstance(name, str):
+        return False
+    return bool(re.match(r'^[a-zA-Z][a-zA-Z0-9\-]{0,14}$', name))
+
 log = __import__('logging').getLogger('vm-manager')
 
 
@@ -164,6 +174,8 @@ def _get_primary_iface():
 
 def _bridge_exists(br='br0'):
     """Check if a bridge interface exists."""
+    if not _validate_bridge_name(br):
+        return False
     try:
         r = subprocess.run(
             f'ip link show {br} type bridge',
@@ -328,6 +340,10 @@ def _allowed_image_roots():
     builder_images = _app_path('installer/images')
     if builder_images:
         roots.append(os.path.realpath(builder_images))
+    # Allow ISOs from mounted drives
+    for mnt in ('/media', '/mnt'):
+        if os.path.isdir(mnt):
+            roots.append(os.path.realpath(mnt))
     return [r.rstrip(os.sep) for r in roots if r]
 
 
@@ -470,6 +486,55 @@ def _human_size(size_bytes):
     return f'{size_bytes:.1f} PB'
 
 
+def _disk_has_gpt(path):
+    """Detect GPT partition table on a disk image (raw or qcow2).
+
+    For raw images we read the GPT header directly (LBA 1, offset 512).
+    For qcow2/vmdk/vdi we use `qemu-img dd` to extract the first 1024 bytes.
+    Falls back to fdisk/sfdisk if available.
+    """
+    _GPT_MAGIC = b'EFI PART'
+
+    ext = os.path.splitext(path)[1].lower()
+    is_raw = ext in ('.img', '.raw', '.iso')
+
+    # Raw images — read directly
+    if is_raw:
+        try:
+            with open(path, 'rb') as f:
+                f.seek(512)
+                return f.read(8) == _GPT_MAGIC
+        except Exception:
+            return False
+
+    # qcow2/vmdk/vdi — use qemu-img dd to extract the first 1024 bytes
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix='.bin') as tmp:
+            subprocess.run(
+                ['qemu-img', 'dd', f'if={path}', f'of={tmp.name}',
+                 'bs=1024', 'count=1', 'skip=0'],
+                capture_output=True, timeout=10)
+            data = tmp.read()
+            if len(data) >= 520:
+                return data[512:520] == _GPT_MAGIC
+    except Exception:
+        pass
+
+    # Fallback: try fdisk or sfdisk
+    for tool in ('fdisk', 'sfdisk'):
+        try:
+            r = subprocess.run(
+                [tool, '-l', path],
+                capture_output=True, timeout=5)
+            if b'gpt' in r.stdout.lower() or b'GPT' in r.stdout:
+                return True
+        except Exception:
+            continue
+
+    return False
+
+
 def _check_vm_process(vm_id):
     """Check if a VM process is still running. Clean up if dead."""
     info = _running_vms.get(vm_id)
@@ -524,6 +589,7 @@ def list_vms():
             'disk_size': vm.get('disk_size', '10G'),
             'os_type': vm.get('os_type', 'linux'),
             'boot_image': vm.get('boot_image', ''),
+            'autostart': vm.get('autostart', False),
             'status': 'running' if is_running else 'stopped',
             'vnc_port': info.get('vnc_port') if is_running else None,
             'vnc_display': info.get('vnc_display') if is_running else None,
@@ -653,6 +719,8 @@ def update_vm(vm_id):
         vm['boot_image'] = new_boot
     if 'description' in data:
         vm['description'] = data['description']
+    if 'autostart' in data:
+        vm['autostart'] = bool(data['autostart'])
     if 'network' in data:
         net = data['network']
         net_type = net.get('net_type', 'user') if isinstance(net, dict) else 'user'
@@ -661,11 +729,63 @@ def update_vm(vm_id):
         pf = _validate_port_forwards(net.get('port_forwards', []) if isinstance(net, dict) else [])
         net_cfg = {'net_type': net_type, 'port_forwards': pf}
         if net_type == 'bridge':
-            net_cfg['bridge'] = net.get('bridge', _BRIDGE_NAME) if isinstance(net, dict) else _BRIDGE_NAME
+            bridge = net.get('bridge', _BRIDGE_NAME) if isinstance(net, dict) else _BRIDGE_NAME
+            if not _validate_bridge_name(bridge):
+                return jsonify({'error': 'Invalid bridge name'}), 400
+            net_cfg['bridge'] = bridge
         vm['network'] = net_cfg
 
     _save_vms(vms)
     return jsonify({'ok': True})
+
+
+@vm_bp.route('/machines/<vm_id>/autostart', methods=['PUT'])
+@admin_required
+@_require_qemu
+def set_vm_autostart(vm_id):
+    """Toggle autostart for a VM (allowed even while running)."""
+    vms = _load_vms()
+    if vm_id not in vms:
+        return jsonify({'error': 'VM not found'}), 404
+    data = request.get_json(force=True) if request.data else {}
+    vms[vm_id]['autostart'] = bool(data.get('autostart', False))
+    _save_vms(vms)
+    return jsonify({'ok': True, 'autostart': vms[vm_id]['autostart']})
+
+
+def vm_autostart_boot():
+    """Start all VMs with autostart=True. Called on EthOS startup."""
+    import logging
+    from flask import current_app, g
+    log = logging.getLogger('vm_autostart')
+    try:
+        vms = _load_vms()
+    except Exception:
+        return
+    candidates = [(vid, v) for vid, v in vms.items() if v.get('autostart')]
+    if not candidates:
+        return
+    if not _qemu_available():
+        log.warning('[vm] Autostart: QEMU not installed, skipping')
+        return
+    log.info('[vm] Autostart: %d VM(s) queued', len(candidates))
+    for vm_id, vm in candidates:
+        if _check_vm_process(vm_id):
+            log.info('[vm] Autostart: %s already running, skip', vm.get('name', vm_id))
+            continue
+        try:
+            with current_app.test_request_context():
+                g.username = 'system'
+                g.role = 'admin'
+                g.groups = ['sudo']
+                resp = start_vm(vm_id)
+                status = resp[1] if isinstance(resp, tuple) else 200
+                if status >= 400:
+                    log.warning('[vm] Autostart: %s failed (HTTP %d)', vm.get('name', vm_id), status)
+                else:
+                    log.info('[vm] Autostart: %s started OK', vm.get('name', vm_id))
+        except Exception as e:
+            log.warning('[vm] Autostart: %s failed: %s', vm.get('name', vm_id), e)
 
 
 @vm_bp.route('/machines/<vm_id>/network', methods=['PUT'])
@@ -687,7 +807,10 @@ def update_vm_network(vm_id):
     pf = _validate_port_forwards(data.get('port_forwards', []))
     net_cfg = {'net_type': net_type, 'port_forwards': pf}
     if net_type == 'bridge':
-        net_cfg['bridge'] = data.get('bridge', _BRIDGE_NAME)
+        bridge = data.get('bridge', _BRIDGE_NAME)
+        if not _validate_bridge_name(bridge):
+            return jsonify({'error': 'Invalid bridge name'}), 400
+        net_cfg['bridge'] = bridge
     vms[vm_id]['network'] = net_cfg
     _save_vms(vms)
     return jsonify({'ok': True})
@@ -1043,15 +1166,9 @@ def start_vm(vm_id):
             # Auto-detect: check if any disk has GPT (EFI) partition table
             for check_disk in [boot_image, disk_file]:
                 if check_disk and os.path.exists(check_disk):
-                    try:
-                        r = subprocess.run(
-                            ['fdisk', '-l', check_disk],
-                            capture_output=True, timeout=5)
-                        if b'Disklabel type: gpt' in r.stdout:
-                            need_uefi = True
-                            break
-                    except Exception:
-                        pass
+                    need_uefi = _disk_has_gpt(check_disk)
+                    if need_uefi:
+                        break
         if need_uefi:
             for ovmf in ovmf_paths:
                 if os.path.exists(ovmf):

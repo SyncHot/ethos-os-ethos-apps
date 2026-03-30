@@ -28,7 +28,7 @@ import time
 from datetime import datetime
 from flask import Blueprint, jsonify, request
 from blueprints.admin_required import admin_required
-from host import data_path, q
+from host import data_path, q, host_run, apt_install
 
 antivirus_bp = Blueprint('antivirus', __name__, url_prefix='/api/antivirus')
 
@@ -91,7 +91,7 @@ def _is_installed():
 
 def _clamav_version():
     try:
-        r = subprocess.run(['clamscan', '--version'], capture_output=True, text=True, timeout=10)
+        r = host_run('clamscan --version', timeout=10)
         if r.returncode == 0:
             return r.stdout.strip().split('\n')[0]
     except Exception:
@@ -111,7 +111,7 @@ def _db_info():
         except Exception:
             pass
     try:
-        r = subprocess.run(['clamscan', '--version'], capture_output=True, text=True, timeout=10)
+        r = host_run('clamscan --version', timeout=10)
         if r.returncode == 0:
             m = re.search(r'/(\d+)/', r.stdout)
             if m:
@@ -125,10 +125,7 @@ def _db_info():
 
 def _read_crontab():
     try:
-        r = subprocess.run(
-            ['sudo', '-n', 'crontab', '-l'],
-            capture_output=True, text=True, timeout=10,
-        )
+        r = host_run('sudo -n crontab -l', timeout=10)
         if r.returncode != 0:
             return []
         return r.stdout.splitlines()
@@ -272,7 +269,7 @@ def start_scan():
         return jsonify({'error': 'Scan already running'}), 409
 
     data      = request.json or {}
-    scan_path = data.get('path', '/home').strip()
+    scan_path = os.path.realpath(data.get('path', '/home').strip())
 
     if not os.path.exists(scan_path):
         return jsonify({'error': 'Path does not exist: ' + scan_path}), 400
@@ -306,16 +303,17 @@ def start_scan():
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                bufsize=1,
             )
             _active_scan['proc'] = proc
 
-            for line in proc.stdout:
+            for line in iter(proc.stdout.readline, ''):
                 line = line.rstrip()
                 if not line:
                     continue
                 if line.endswith(': OK'):
                     scanned += 1
-                    if scanned % 200 == 0:
+                    if scanned % 50 == 0:
                         _emit('progress', -1,
                               'Scanned ' + str(scanned) + ' files...',
                               scanned=scanned, threats=len(threats))
@@ -331,6 +329,9 @@ def start_scan():
 
             proc.wait()
             elapsed = round(time.time() - start, 1)
+
+            if not _active_scan:
+                return
 
             if proc.returncode == 2:
                 _emit('error', 0, 'ClamAV scanner error')
@@ -407,7 +408,7 @@ def get_schedules():
 def create_schedule():
     data      = request.json or {}
     name      = data.get('name', '').strip()
-    scan_path = data.get('path', '/home').strip()
+    scan_path = os.path.realpath(data.get('path', '/home').strip())
     cron_expr = data.get('cron_expr', '0 2 * * 0').strip()
     enabled   = bool(data.get('enabled', True))
 
@@ -490,23 +491,16 @@ def update_db():
 
         _emit('start', 10, 'Stopping freshclam service...')
         try:
-            # Stop the service so it releases the log file lock
-            subprocess.run(['sudo', '-n', 'systemctl', 'stop', 'clamav-freshclam'],
-                           capture_output=True, timeout=15)
+            host_run('sudo -n systemctl stop clamav-freshclam', timeout=15)
             _emit('start', 30, 'Downloading virus database updates...')
-            r = subprocess.run(
-                ['sudo', '-n', 'freshclam', '--stdout', '--no-warnings'],
-                capture_output=True, text=True, timeout=300,
-            )
-            subprocess.run(['sudo', '-n', 'systemctl', 'start', 'clamav-freshclam'],
-                           capture_output=True, timeout=15)
+            r = host_run('sudo -n freshclam --stdout --no-warnings', timeout=300)
+            host_run('sudo -n systemctl start clamav-freshclam', timeout=15)
             if r.returncode not in (0, 1):
-                _emit('error', 0, (r.stderr or r.stdout or 'Update error')[:300])
+                _emit('error', 0, ((r.stderr or r.stdout or 'Update error')[:300]))
                 return
             _emit('done', 100, 'Virus database updated!')
         except Exception as e:
-            subprocess.run(['sudo', '-n', 'systemctl', 'start', 'clamav-freshclam'],
-                           capture_output=True, timeout=15)
+            host_run('sudo -n systemctl start clamav-freshclam', timeout=15)
             _emit('error', 0, str(e))
 
     threading.Thread(target=_bg, daemon=True).start()
@@ -528,22 +522,14 @@ def install():
 
         _emit('start', 5, 'Installing ClamAV...')
         try:
-            r = subprocess.run(
-                ['apt-get', 'install', '-y', 'clamav', 'clamav-freshclam'],
-                capture_output=True, text=True, timeout=300,
-            )
+            r = apt_install('clamav clamav-freshclam', timeout=300)
             if r.returncode != 0:
-                _emit('error', 0, 'Install error: ' + r.stderr[:300])
+                _emit('error', 0, 'Install error: ' + (r.stderr or '')[:300])
                 return
             _emit('progress', 70, 'Downloading virus database...')
-            subprocess.run(['sudo', '-n', 'systemctl', 'stop', 'clamav-freshclam'],
-                           capture_output=True, timeout=15)
-            subprocess.run(
-                ['sudo', '-n', 'freshclam', '--stdout', '--no-warnings'],
-                capture_output=True, text=True, timeout=300,
-            )
-            subprocess.run(['sudo', '-n', 'systemctl', 'start', 'clamav-freshclam'],
-                           capture_output=True, timeout=15)
+            host_run('sudo -n systemctl stop clamav-freshclam', timeout=15)
+            host_run('sudo -n freshclam --stdout --no-warnings', timeout=300)
+            host_run('sudo -n systemctl start clamav-freshclam', timeout=15)
             _emit('done', 100, 'ClamAV installed!')
         except Exception as e:
             _emit('error', 0, str(e))
@@ -558,10 +544,7 @@ def uninstall():
     for s in _load_schedules():
         _remove_schedule_from_cron(s['id'])
     try:
-        subprocess.run(
-            ['apt-get', 'remove', '-y', 'clamav', 'clamav-freshclam'],
-            capture_output=True, text=True, timeout=120,
-        )
+        host_run('apt-get remove -y clamav clamav-freshclam', timeout=120)
     except Exception:
         pass
     return jsonify({'ok': True})

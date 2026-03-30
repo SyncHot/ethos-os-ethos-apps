@@ -53,6 +53,9 @@ AppRegistry['antivirus'] = function (appDef) {
                     <button id="av-update-db-btn" class="app-btn app-btn-sm">
                         <i class="fas fa-rotate"></i> ${t('Aktualizuj bazę')}
                     </button>
+                    <button id="av-uninstall-btn" class="app-btn app-btn-sm" style="color:var(--danger,#ef4444)" title="${t('Odinstaluj ClamAV')}">
+                        <i class="fas fa-trash"></i>
+                    </button>
                 </div>
                 <!-- DB update progress -->
                 <div id="av-updatedb-wrap" style="display:none;padding:0 16px 14px">
@@ -109,8 +112,11 @@ AppRegistry['antivirus'] = function (appDef) {
                     <!-- Progress -->
                     <div id="av-scan-progress" style="display:none">
                         <div class="av-prog-bar"><div class="av-prog-fill av-prog-indeterminate" id="av-prog-fill"></div></div>
-                        <div class="av-prog-msg" id="av-prog-msg"></div>
-                        <div id="av-threats-live" style="max-height:80px;overflow-y:auto;margin-top:4px"></div>
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px">
+                            <span class="av-prog-msg" id="av-prog-msg"></span>
+                            <span id="av-prog-stats" style="font-size:12px;color:var(--text-muted);white-space:nowrap"></span>
+                        </div>
+                        <div id="av-threats-live" style="max-height:100px;overflow-y:auto;margin-top:4px"></div>
                     </div>
                 </div>
             </div>
@@ -240,11 +246,15 @@ AppRegistry['antivirus'] = function (appDef) {
     async function loadAll() {
         const data = await api('/antivirus/status');
 
+        if (data.error) {
+            stateChip.innerHTML = `<i class="fas fa-circle-exclamation" style="color:#ef4444"></i> <span>${t('Błąd')}</span>`;
+            return;
+        }
+
         if (!data.installed) {
             // Show install card only
             stateChip.innerHTML = `<i class="fas fa-circle-xmark" style="color:#ef4444"></i> <span>${t('Nie zainstalowany')}</span>`;
             body.querySelector('#av-install-card').style.display = '';
-            body.querySelector('#av-install-btn').addEventListener('click', startInstall);
             return;
         }
 
@@ -259,22 +269,18 @@ AppRegistry['antivirus'] = function (appDef) {
         }
 
         // Engine card
-        const engineCard = body.querySelector('#av-engine-card');
-        engineCard.style.display = '';
+        body.querySelector('#av-engine-card').style.display = '';
         body.querySelector('#av-version-sub').textContent = data.version || 'ClamAV';
-        body.querySelector('#av-update-db-btn').addEventListener('click', startUpdateDb);
 
         // Scan card
-        const scanCard = body.querySelector('#av-scan-card');
-        scanCard.style.display = '';
-        const scanBtn    = body.querySelector('#av-scan-btn');
-        const cancelBtn  = body.querySelector('#av-cancel-btn');
-        const pathInput  = body.querySelector('#av-scan-path');
-        const progDiv    = body.querySelector('#av-scan-progress');
-        const progMsg    = body.querySelector('#av-prog-msg');
-        const threatsLive = body.querySelector('#av-threats-live');
+        body.querySelector('#av-scan-card').style.display = '';
 
         if (data.scanning && data.active_scan) {
+            const scanBtn   = body.querySelector('#av-scan-btn');
+            const cancelBtn = body.querySelector('#av-cancel-btn');
+            const pathInput = body.querySelector('#av-scan-path');
+            const progDiv   = body.querySelector('#av-scan-progress');
+            const progMsg   = body.querySelector('#av-prog-msg');
             scanBtn.disabled = true;
             scanBtn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> ${t('Skanowanie...')}`;
             pathInput.disabled = true;
@@ -285,27 +291,6 @@ AppRegistry['antivirus'] = function (appDef) {
             attachScanListener(data.active_scan.scan_id);
         }
 
-        body.querySelector('#av-browse-btn').addEventListener('click', () => {
-            openDirPicker(pathInput.value || '/home', t('Wybierz folder do skanowania'), (p) => {
-                pathInput.value = p;
-            });
-        });
-
-        scanBtn.addEventListener('click', () => {
-            const path = pathInput.value.trim() || '/home';
-            startScan(path);
-        });
-
-        cancelBtn.addEventListener('click', async () => {
-            await api('/antivirus/scan/cancel', { method: 'POST' });
-            cancelBtn.style.display = 'none';
-            scanBtn.disabled = false;
-            scanBtn.innerHTML = `<i class="fas fa-play"></i> ${t('Skanuj')}`;
-            pathInput.disabled = false;
-            progDiv.style.display = 'none';
-            scanningChip.style.display = 'none';
-        });
-
         // Last scan card
         if (data.last_scan) {
             renderLastScan(data.last_scan);
@@ -314,14 +299,10 @@ AppRegistry['antivirus'] = function (appDef) {
         // Schedules card
         body.querySelector('#av-sched-card').style.display = '';
         loadSchedules();
-        body.querySelector('#av-add-sched-btn').addEventListener('click', () => openSchedModal());
 
         // History card
         body.querySelector('#av-history-card').style.display = '';
         loadHistory();
-
-        // Schedule modal wiring
-        wireModal();
     }
 
     // ══════════════════════════════════════════════════════════
@@ -342,6 +323,10 @@ AppRegistry['antivirus'] = function (appDef) {
         const handler = (ev) => {
             if (knownScanId && ev.scan_id !== knownScanId) return;
             if (progMsg) progMsg.textContent = ev.message || '';
+            const statsEl = body.querySelector('#av-prog-stats');
+            if (statsEl && ev.scanned !== undefined) {
+                statsEl.innerHTML = `<i class="fas fa-file" style="margin-right:2px"></i>${ev.scanned || 0} &nbsp; <i class="fas fa-bug" style="margin-right:2px;color:${(ev.threats || 0) > 0 ? '#ef4444' : 'inherit'}"></i>${ev.threats || 0}`;
+            }
             if (ev.stage === 'threat' && ev.threat) {
                 const d = document.createElement('div');
                 d.className = 'av-threat-item';
@@ -391,6 +376,7 @@ AppRegistry['antivirus'] = function (appDef) {
             progDiv.style.display = 'none';
             return;
         }
+        progMsg.textContent = t('Skanowanie') + ': ' + scanPath;
         attachScanListener(r.scan_id);
     }
 
@@ -405,7 +391,7 @@ AppRegistry['antivirus'] = function (appDef) {
         body.querySelector('#av-last-icon').className = clean
             ? 'fas fa-check-circle' : 'fas fa-bug';
         body.querySelector('#av-last-icon').style.color = clean ? '#16a34a' : '#ef4444';
-        body.querySelector('#av-last-sub').textContent = fmtDate(scan.finished_at) + ' · ' + esc(scan.path);
+        body.querySelector('#av-last-sub').textContent = fmtDate(scan.finished_at) + ' · ' + (scan.path || '');
         body.querySelector('#av-last-badge').innerHTML = clean
             ? `<span class="pwr-badge pwr-badge-green"><i class="fas fa-check"></i> ${t('Czyste')}</span>`
             : `<span class="pwr-badge av-badge-red"><i class="fas fa-bug"></i> ${t('Zagrożenia')}: ${scan.infected_count}</span>`;
@@ -696,6 +682,47 @@ AppRegistry['antivirus'] = function (appDef) {
         scanOverlay.classList.remove('visible');
         _editSid = null;
     }
+
+    // ── Wire static event listeners (once) ─────────────────────
+    body.querySelector('#av-install-btn').addEventListener('click', startInstall);
+    body.querySelector('#av-update-db-btn').addEventListener('click', startUpdateDb);
+    body.querySelector('#av-browse-btn').addEventListener('click', () => {
+        const pathInput = body.querySelector('#av-scan-path');
+        openDirPicker(pathInput.value || '/home', t('Wybierz folder do skanowania'), (p) => {
+            pathInput.value = p;
+        });
+    });
+    body.querySelector('#av-scan-btn').addEventListener('click', () => {
+        const path = body.querySelector('#av-scan-path').value.trim() || '/home';
+        startScan(path);
+    });
+    body.querySelector('#av-cancel-btn').addEventListener('click', async () => {
+        await api('/antivirus/scan/cancel', { method: 'POST' });
+        body.querySelector('#av-cancel-btn').style.display = 'none';
+        const scanBtn = body.querySelector('#av-scan-btn');
+        scanBtn.disabled = false;
+        scanBtn.innerHTML = `<i class="fas fa-play"></i> ${t('Skanuj')}`;
+        body.querySelector('#av-scan-path').disabled = false;
+        body.querySelector('#av-scan-progress').style.display = 'none';
+        body.querySelector('#av-prog-stats').textContent = '';
+        scanningChip.style.display = 'none';
+    });
+    body.querySelector('#av-add-sched-btn').addEventListener('click', () => openSchedModal());
+    body.querySelector('#av-uninstall-btn').addEventListener('click', async () => {
+        if (!confirm(t('Czy na pewno chcesz odinstalować ClamAV?'))) return;
+        const btn = body.querySelector('#av-uninstall-btn');
+        btn.disabled = true;
+        const r = await api('/antivirus/uninstall', { method: 'POST' });
+        btn.disabled = false;
+        if (r.error) { toast(r.error, 'error'); return; }
+        toast(t('ClamAV odinstalowany'), 'success');
+        ['#av-engine-card','#av-scan-card','#av-last-scan-card','#av-sched-card','#av-history-card']
+            .forEach(sel => { body.querySelector(sel).style.display = 'none'; });
+        dbChip.style.display = 'none';
+        scanningChip.style.display = 'none';
+        loadAll();
+    });
+    wireModal();
 
     // ── Init ──────────────────────────────────────────────────
     loadAll();
