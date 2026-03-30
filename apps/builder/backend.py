@@ -36,7 +36,9 @@ _logger.addHandler(_fh)
 
 # ── Build State (persistent across SSE reconnects) ──
 _BUILD_STATE_FILE = data_path('builder_state.json')
+_BUILD_HISTORY_FILE = data_path('build_history.json')
 _MAX_STATE_LOGS = 500
+_MAX_HISTORY = 50
 
 _build_state = {
     'status': 'idle',       # idle | building | done | error
@@ -55,6 +57,30 @@ def _save_build_state():
     """Persist build state to disk for crash recovery."""
     try:
         _save_json(_BUILD_STATE_FILE, _build_state)
+    except Exception:
+        pass
+
+
+def _save_to_history():
+    """Append completed build to persistent history."""
+    try:
+        history = _load_json(_BUILD_HISTORY_FILE, [])
+        if not isinstance(history, list):
+            history = []
+        entry = {
+            'build_type': _build_state.get('build_type', ''),
+            'status': _build_state.get('status', ''),
+            'message': _build_state.get('message', ''),
+            'result': _build_state.get('result'),
+            'start_time': _build_state.get('start_time', 0),
+            'end_time': time.time(),
+        }
+        if entry['start_time']:
+            entry['duration'] = int(entry['end_time'] - entry['start_time'])
+        history.append(entry)
+        if len(history) > _MAX_HISTORY:
+            history = history[-_MAX_HISTORY:]
+        _save_json(_BUILD_HISTORY_FILE, history)
     except Exception:
         pass
 
@@ -113,6 +139,8 @@ def _update_build(status=None, percent=None, message=None, log=None, result=None
         if status:
             _logger.info('[%s] %s', status, message or '')
         _save_build_state()
+        if status in ('done', 'error'):
+            _save_to_history()
 
 
 def _reset_build(build_type=''):
@@ -343,6 +371,23 @@ def dismiss_build():
             'result': None,
         })
         _save_build_state()
+    return jsonify({'ok': True})
+
+
+@builder_bp.route('/history')
+def build_history():
+    """Return persistent build history (last N builds)."""
+    history = _load_json(_BUILD_HISTORY_FILE, [])
+    if not isinstance(history, list):
+        history = []
+    # Return newest first
+    return jsonify({'ok': True, 'items': list(reversed(history))})
+
+
+@builder_bp.route('/history/clear', methods=['POST'])
+def clear_history():
+    """Clear build history."""
+    _save_json(_BUILD_HISTORY_FILE, [])
     return jsonify({'ok': True})
 
 
@@ -1092,6 +1137,38 @@ WEB
 
 chroot "$ROOT" systemctl enable fail2ban || true
 
+# ── UFW Firewall ──
+echo "LOG:Configuring UFW firewall..."
+chroot "$ROOT" bash -c 'command -v ufw &>/dev/null || apt-get install -y -qq ufw' 2>&1 | tail -3
+chroot "$ROOT" ufw default deny incoming 2>/dev/null || true
+chroot "$ROOT" ufw default allow outgoing 2>/dev/null || true
+chroot "$ROOT" ufw allow 22/tcp comment 'SSH' 2>/dev/null || true
+chroot "$ROOT" ufw allow 9000/tcp comment 'EthOS Web UI' 2>/dev/null || true
+# Enable UFW non-interactively
+chroot "$ROOT" bash -c 'echo "y" | ufw enable' 2>/dev/null || true
+chroot "$ROOT" systemctl enable ufw 2>/dev/null || true
+
+# ── SSH Hardening ──
+echo "LOG:SSH hardening..."
+mkdir -p "$ROOT/etc/ssh/sshd_config.d"
+cat > "$ROOT/etc/ssh/sshd_config.d/ethos-hardening.conf" <<'SSHH'
+# EthOS SSH Hardening
+PermitRootLogin no
+MaxAuthTries 3
+LoginGraceTime 30
+X11Forwarding no
+PermitEmptyPasswords no
+SSHH
+
+# Gate SSH login until the default password is changed via the Web UI.
+# ForceCommand runs check_password_changed.sh which blocks or exec's the shell.
+cat >> "$ROOT/etc/ssh/sshd_config" <<'SSHGATE'
+
+# EthOS: block SSH until default password changed via Web UI
+Match User *
+    ForceCommand /opt/ethos/tools/check_password_changed.sh
+SSHGATE
+
 # ── Force password change on first boot ──
 rm -f "$ROOT/opt/ethos/.password_changed"
 
@@ -1332,8 +1409,13 @@ cp "$NASOS/tools/ethos-power-config.sh" "$ETHOS_DIR/tools/"
 cp "$NASOS/tools/ethos-system-helper.sh" "$ETHOS_DIR/tools/"
 cp "$NASOS/tools/ethos-power.service" "$ETHOS_DIR/tools/"
 cp "$NASOS/tools/ethos-power-blacklist.conf" "$ETHOS_DIR/tools/"
+# Security scripts — SSH password gate + fail2ban event logger
+cp "$NASOS/tools/check_password_changed.sh" "$ETHOS_DIR/tools/" 2>/dev/null || echo "WARN:check_password_changed.sh not found"
+cp "$NASOS/tools/fail2ban_eventlog.py"      "$ETHOS_DIR/tools/" 2>/dev/null || echo "WARN:fail2ban_eventlog.py not found"
 chmod +x "$ETHOS_DIR/tools/ethos-power-config.sh"
 chmod +x "$ETHOS_DIR/tools/ethos-system-helper.sh"
+chmod +x "$ETHOS_DIR/tools/check_password_changed.sh" 2>/dev/null || true
+chmod +x "$ETHOS_DIR/tools/fail2ban_eventlog.py" 2>/dev/null || true
 
 # ── CUPS config ──
 if [[ -d "$NASOS/cups-config" ]]; then
@@ -1383,6 +1465,7 @@ PORT=$NAS_PORT
 ETHOS_ROOT=/opt/ethos
 BACKUP_DIR=/opt/ethos/backups
 ENVFILE
+chmod 640 "$ETHOS_DIR/ethos.env"
 
 cat > "$ETHOS_DIR/start.sh" <<'MGMT_STARTSH'
 #!/bin/bash
