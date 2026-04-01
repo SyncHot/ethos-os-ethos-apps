@@ -57,15 +57,69 @@ def _get_username():
 # -- Text extraction --------------------------------------------------------
 
 def _extract_text_pdf(filepath):
-    """Extract text from a PDF file page by page."""
+    """Extract text from a PDF using pdftotext (poppler), fallback to PyPDF2."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['pdftotext', '-layout', filepath, '-'],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            raw = result.stdout
+            # Split by form-feed (page separator) if present
+            pages = raw.split('\x0c')
+            pages = [p for p in pages if p.strip()]
+            if pages:
+                return [_cleanup_pdf_text(p) for p in pages]
+    except Exception as e:
+        log.warning('[doc_anonymizer] pdftotext failed, using PyPDF2: %s', e)
+
     import PyPDF2
     pages = []
     with open(filepath, 'rb') as f:
         reader = PyPDF2.PdfReader(f)
         for page in reader.pages:
             text = page.extract_text() or ''
-            pages.append(text)
+            pages.append(_cleanup_pdf_text(text))
     return pages
+
+
+def _cleanup_pdf_text(text):
+    """Reassemble fragmented text from PDF extraction.
+
+    Tables in PDFs often produce single-char lines, scattered digits, and
+    broken words.  This tries to rejoin them for better PII detection.
+    """
+    lines = text.split('\n')
+    cleaned = []
+    digit_buf = []
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            # Flush digit buffer on blank line
+            if digit_buf:
+                cleaned.append(''.join(digit_buf))
+                digit_buf = []
+            continue
+
+        # Collect scattered single digits (likely PESEL fragments)
+        if re.match(r'^\d{1,2}$', stripped):
+            digit_buf.append(stripped)
+            continue
+
+        if digit_buf:
+            cleaned.append(''.join(digit_buf))
+            digit_buf = []
+
+        # Collapse excessive whitespace within a line
+        stripped = re.sub(r'\s{3,}', '  ', stripped)
+        cleaned.append(stripped)
+
+    if digit_buf:
+        cleaned.append(''.join(digit_buf))
+
+    return '\n'.join(cleaned)
 
 
 def _extract_text_docx(filepath):
@@ -78,109 +132,356 @@ def _extract_text_docx(filepath):
 
 # -- Regex-based PII detection (fast, reliable for structured data) ---------
 
+_MONTHS_PL = ('stycznia|lutego|marca|kwietnia|maja|czerwca|lipca|sierpnia|'
+              'wrzesnia|września|pazdziernika|października|listopada|grudnia')
+
 _REGEX_PATTERNS = [
     # PESEL: exactly 11 digits, not part of a longer number
     (re.compile(r'(?<!\d)\d{11}(?!\d)'), 'PESEL'),
-    # Phone: Polish formats (9 digits, optional +48 / 0048 prefix)
+    # Polish bank account (IBAN): 2+26 digits with spaces
+    (re.compile(r'(?<!\d)\d{2}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{4}\s?\d{4}(?!\d)'), 'NR_KONTA'),
+    # Document ID: 3 uppercase letters + 6 digits (e.g. CBA 123456)
+    (re.compile(r'\b[A-Z]{3}\s?\d{6}\b'), 'NR_DOKUMENTU'),
+    # Phone: Polish formats with +48
     (re.compile(r'(?:\+48|0048)[\s-]?\d{3}[\s-]?\d{3}[\s-]?\d{3}'), 'TELEFON'),
+    # Phone: 9 digits with separators
     (re.compile(r'(?<!\d)\d{3}[\s-]\d{3}[\s-]\d{3}(?!\d)'), 'TELEFON'),
+    # Phone: landline (2-digit area + 7 digits, e.g. "22 620 00 00")
+    (re.compile(r'(?<!\d)\d{2}\s\d{3}\s\d{2}\s\d{2}(?!\d)'), 'TELEFON'),
+    # Phone: landline with dash separators (e.g. "12-654-33-21", "71-344-89-01")
+    (re.compile(r'(?<!\d)\d{2}-\d{3}-\d{2}-\d{2}(?!\d)'), 'TELEFON'),
     # Email
     (re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'), 'EMAIL'),
     # Polish postal code + city (e.g. "00-001 Warszawa")
-    (re.compile(r'\d{2}-\d{3}\s+[A-Z\u0104\u0106\u0118\u0141\u0143\u00d3\u015a\u0179\u017b]'
-                r'[a-z\u0105\u0107\u0119\u0142\u0144\u00f3\u015b\u017a\u017c]+'), 'ADRES'),
-    # Street address (ul./al./os./pl. + name + optional number)
-    (re.compile(r'(?:ul\.|al\.|os\.|pl\.)\s+[A-Z\u0104-\u017b][a-z\u0105-\u017c]+'
-                r'(?:\s+[A-Z\u0104-\u017b]?[a-z\u0105-\u017c]+)*'
+    (re.compile(r'\d{2}-\d{3}\s+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+'), 'ADRES'),
+    # Street address (ul./al./os./pl. + name + optional number) — single line only
+    (re.compile(r'(?:ul\.|al\.|os\.|pl\.|Al\.)\s+[A-ZĄ-Ż][a-ząćęłńóśźż]+'
+                r'(?:\s[A-ZĄ-Ż]?[a-ząćęłńóśźż]+)*'
                 r'(?:\s+\d+[a-zA-Z]?(?:/\d+[a-zA-Z]?)?)'), 'ADRES'),
+    # NIP: 10 digits with optional dashes (e.g. "525-12-34-567")
+    (re.compile(r'\b\d{3}-\d{2}-\d{2}-\d{3}\b'), 'NR_DOKUMENTU'),
+    # PWZ number (e.g. "nr PWZ 4478123" or "PWZ: 1234567")
+    (re.compile(r'(?:nr\s+)?PWZ[\s:]*\d{7}'), 'NR_DOKUMENTU'),
     # Dates: DD.MM.YYYY, DD-MM-YYYY, DD/MM/YYYY
     (re.compile(r'(?<!\d)\d{1,2}[./-]\d{1,2}[./-]\d{4}(?!\d)'), 'DATA'),
+    # Written dates: "31 marca 2026" / "1 stycznia 2025 r."
+    (re.compile(r'\d{1,2}\s+(?:' + _MONTHS_PL + r')\s+\d{4}(?:\s+r\.)?', re.I), 'DATA'),
 ]
+
+# -- Name detection (regex-based, high recall for Polish documents) ---------
+
+# Common Polish first names used as anchors for detecting name patterns
+_PL_FIRST_NAMES = frozenset({
+    'Adam', 'Adrian', 'Agata', 'Agnieszka', 'Aleksander', 'Aleksandra',
+    'Andrzej', 'Anna', 'Antoni', 'Barbara', 'Bartosz', 'Beata', 'Bogdan',
+    'Bozena', 'Celina', 'Cezary', 'Dariusz', 'Danuta', 'Dawid', 'Dorota',
+    'Edward', 'Elzbieta', 'Ewa', 'Filip', 'Franciszek', 'Grazyna',
+    'Grzegorz', 'Halina', 'Henryk', 'Henryka', 'Hubert', 'Irena',
+    'Iwona', 'Jacek', 'Jadwiga', 'Jakub', 'Jan', 'Janina', 'Jaroslaw',
+    'Jerzy', 'Joanna', 'Jolanta', 'Jozef', 'Julia', 'Justyna',
+    'Kamil', 'Karol', 'Katarzyna', 'Kazimierz', 'Konrad', 'Krystyna',
+    'Krzysztof', 'Leszek', 'Lukasz', 'Maciej', 'Magdalena', 'Malgorzata',
+    'Marcin', 'Marek', 'Maria', 'Mariusz', 'Marta', 'Michal', 'Miroslawa',
+    'Monika', 'Natalia', 'Norbert', 'Olga', 'Patryk', 'Pawel', 'Piotr',
+    'Przemyslaw', 'Rafal', 'Renata', 'Robert', 'Roman', 'Ryszard',
+    'Sebastian', 'Stanislaw', 'Stefan', 'Sylwia', 'Szymon', 'Tadeusz',
+    'Teresa', 'Tomasz', 'Wanda', 'Weronika', 'Wieslaw', 'Wiktoria',
+    'Witold', 'Wladyslaw', 'Wojciech', 'Zbigniew', 'Zofia', 'Zygmunt',
+})
+
+# Title prefixes that signal a person name follows
+_TITLE_PREFIXES = (
+    r'dr\s+n\.\s*med\.\s*',
+    r'dr\s+hab\.\s*n\.\s*med\.\s*',
+    r'prof\.\s*dr\s+hab\.\s*n\.\s*med\.\s*',
+    r'prof\.\s*dr\s+hab\.\s*',
+    r'prof\.\s*',
+    r'dr\s+hab\.\s*',
+    r'dr\s+',
+    r'lek\.\s*med\.\s*',
+    r'lek\.\s*',
+    r'mgr\s+',
+    r'inz\.\s*',
+)
+
+# Capitalized Polish surname (including compound): e.g. "Kowalski", "Kowalska-Nowak"
+_SURNAME_RE = r'[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]{2,}(?:-[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]{2,})?'
+
+# Polish name stopwords: words that look like names but aren't
+_NAME_STOPWORDS = frozenset({
+    'Pacjent', 'Pacjentka', 'Pacjenta', 'Lekarz', 'Konsultanci', 'Klinika',
+    'Szpital', 'Centrum', 'Instytut', 'Poradnia', 'Oddzial', 'Pani', 'Pan',
+    'Placowka', 'Adres', 'Telefon', 'Email', 'Podpis', 'Data', 'Numer',
+    'Rozpoznanie', 'Badanie', 'Wyniki', 'Epikryza', 'Wnioski', 'Opinia',
+    'Przebieg', 'Zalecenia', 'Kontrola', 'Osoba', 'Siostra', 'Brat',
+    'Matka', 'Ojciec', 'Zona', 'Maz',
+})
+
+
+def _detect_names(text):
+    """Detect Polish person names using pattern matching."""
+    entities = []
+    seen = set()
+
+    # 1) Title + name patterns (dr, prof., lek. etc.) — search full text
+    for prefix in _TITLE_PREFIXES:
+        # title + FirstName [MiddleName|Initial] Surname[-Compound]
+        pat = re.compile(
+            r'(?:' + prefix + r')'
+            r'([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+'            # first name
+            r'(?:[ \t]+[A-ZĄĆĘŁŃÓŚŹŻ]\.?[a-ząćęłńóśźż]*)?' # optional middle/initial
+            r'[ \t]+' + _SURNAME_RE + r')'                    # surname
+        )
+        for m in pat.finditer(text):
+            name = m.group(1).strip()
+            full = m.group(0).strip()
+            if name not in seen and name.split()[0] not in _NAME_STOPWORDS:
+                seen.add(name)
+                seen.add(full)
+                entities.append({'text': full, 'category': 'LEKARZ'})
+
+    # 2) Known first name + surname(s) — search line-by-line to avoid
+    #    cross-line false positives
+    name_pat = re.compile(
+        r'\b([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+)'
+        r'(?:[ \t]+([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+))?'
+        r'[ \t]+(' + _SURNAME_RE + r')\b'
+    )
+    for line in text.split('\n'):
+        for m in name_pat.finditer(line):
+            first = m.group(1)
+            middle = m.group(2) or ''
+            surname = m.group(3)
+            full_match = m.group(0).strip()
+
+            if first not in _PL_FIRST_NAMES and middle not in _PL_FIRST_NAMES:
+                continue
+            if first in _NAME_STOPWORDS:
+                continue
+            if len(surname) < 3:
+                continue
+            if full_match not in seen:
+                seen.add(full_match)
+                entities.append({'text': full_match, 'category': 'IMIE_NAZWISKO'})
+
+    # 3) "K. Surname" abbreviation patterns
+    abbrev_pat = re.compile(
+        r'\b([A-ZĄĆĘŁŃÓŚŹŻ]\.)[ \t]+(' + _SURNAME_RE + r')\b'
+    )
+    for m in abbrev_pat.finditer(text):
+        abbrev = m.group(0).strip()
+        surname = m.group(2)
+        if len(surname) >= 4 and abbrev not in seen:
+            seen.add(abbrev)
+            entities.append({'text': abbrev, 'category': 'IMIE_NAZWISKO'})
+
+    return entities
+
+
+def _detect_facilities(text):
+    """Detect Polish medical facility names using pattern matching."""
+    entities = []
+    seen = set()
+
+    # Use [^\n]* to stay within single lines
+    facility_patterns = [
+        re.compile(r'Szpital(?:u|em)?[ \t]+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+'
+                   r'(?:[ \t]+(?:im\.\s+)?[a-ząćęłńóśźżA-ZĄĆĘŁŃÓŚŹŻ.]+)*'),
+        re.compile(r'Klinik[aięy][ \t]+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+'
+                   r'(?:[ \t]+[a-ząćęłńóśźżA-ZĄĆĘŁŃÓŚŹŻ]+){0,5}'),
+        re.compile(r'Centrum[ \t]+(?:Medyczn[a-z]*|Zdrowia)[ \t]+[A-Za-ząćęłńóśźż]+'
+                   r'(?:[ \t]+[A-Za-ząćęłńóśźż.]+)*'),
+        re.compile(r'Poradni[aęy][ \t]+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+'
+                   r'(?:[ \t]+[a-ząćęłńóśźżA-ZĄĆĘŁŃÓŚŹŻ]+){0,4}'),
+        re.compile(r'Instytut(?:u)?[ \t]+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+'
+                   r'(?:[ \t]+[a-ząćęłńóśźżA-ZĄĆĘŁŃÓŚŹŻ]+){0,5}'),
+        re.compile(r'(?:Osrodek|Ośrodek)[ \t]+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+'
+                   r'(?:[ \t]+[a-ząćęłńóśźżA-ZĄĆĘŁŃÓŚŹŻ]+){0,3}'),
+        re.compile(r'(?:NZOZ|SPZOZ|ZOZ)[ \t]+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+'
+                   r'(?:[ \t]+[a-ząćęłńóśźżA-ZĄĆĘŁŃÓŚŹŻ]+){0,3}'),
+    ]
+
+    for pat in facility_patterns:
+        for m in pat.finditer(text):
+            name = m.group(0).strip()
+            # Trim trailing prepositions, articles, and title prefixes
+            name = re.sub(r'[ \t]+(?:w|we|z|ze|na|przy|do|i|lub|oraz|dr|prof|lek|mgr)\.?[ \t]*$', '', name)
+            if name not in seen and len(name) > 8:
+                seen.add(name)
+                entities.append({'text': name, 'category': 'NAZWA_PLACOWKI'})
+
+    return entities
 
 
 def _regex_detect(text):
     """Detect PII using regex patterns. Returns list of entity dicts."""
+    # Normalize: collapse whitespace/newlines between digits
+    normalized = re.sub(r'(\d)[\s\n]+(\d)', r'\1 \2', text)
+
     entities = []
     seen = set()
     for pattern, category in _REGEX_PATTERNS:
-        for m in pattern.finditer(text):
+        for m in pattern.finditer(normalized):
             matched = m.group(0).strip()
-            if matched and matched not in seen:
+            if not matched or len(matched) < 3:
+                continue
+            # Skip matches containing newlines (broken table fragments)
+            if '\n' in matched:
+                continue
+            if matched not in seen:
                 seen.add(matched)
                 entities.append({'text': matched, 'category': category})
-    return entities
+
+    # Remove entities that are substrings of a longer entity in same category
+    final = []
+    for e in entities:
+        is_substring = False
+        for other in entities:
+            if other is not e and e['text'] in other['text'] and e['category'] == other['category']:
+                is_substring = True
+                break
+        if not is_substring:
+            final.append(e)
+    return final
 
 
 # -- LLM anonymization (for names, doctor names, facility names) ------------
 
-_SYSTEM_PROMPT = (
-    "Jestes ekspertem od anonimizacji dokumentow medycznych.\n"
-    "Znajdz WSZYSTKIE imiona i nazwiska osob w tekscie.\n"
-    "Szukaj: imion pacjentow, nazwisk, imion lekarzy (po 'dr', 'lek.', 'prof.').\n\n"
-    "Zwroc TYLKO tablice JSON:\n"
-    '[{"text": "Jan Kowalski", "category": "IMIE_NAZWISKO"}, '
-    '{"text": "Anna Nowak", "category": "LEKARZ"}]\n\n'
-    "Kategorie: IMIE_NAZWISKO (pacjent), LEKARZ (lekarz/personel), "
-    "NAZWA_PLACOWKI (szpital/przychodnia).\n"
-    "Jesli brak, zwroc: []\n"
-    "Odpowiedz TYLKO JSON, bez komentarzy."
-)
-
-_USER_PROMPT_TEMPLATE = (
-    "Znajdz imiona, nazwiska i nazwy placowek w tekscie:\n\n"
-    "---\n{text}\n---\n\n"
-    "JSON:"
-)
-
 
 def _call_llm(text_chunk):
-    """Send text to the local LLM and get PII entities back."""
+    """Send text to the local LLM in a subprocess to avoid blocking gevent.
+
+    Uses a result file instead of stdout because llama.cpp's C runtime
+    writes CUDA/GGML init messages to stdout, polluting the JSON output.
+    """
+    import subprocess as _sp
+    import tempfile
+
+    # Write text to a temp file for the subprocess
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False,
+                                     dir=_JOBS_DIR) as tf:
+        tf.write(text_chunk[:3000])
+        text_path = tf.name
+
+    result_path = text_path + '.result.json'
+
+    script = r'''
+import sys, json, os, re
+sys.path.insert(0, '/opt/ethos/backend')
+sys.path.insert(0, '/opt/ethos/backend/blueprints')
+
+text_path = sys.argv[1]
+result_path = sys.argv[2]
+
+with open(text_path) as f:
+    text = f.read()
+
+from model_library import get_library
+lib = get_library()
+llm, err = lib.load_model()
+if err:
+    with open(result_path, 'w') as rf:
+        json.dump([], rf)
+    sys.exit(0)
+lib.touch_model()
+
+system_prompt = (
+    "Wypisz imiona i nazwiska osob oraz nazwy placowek medycznych z tekstu.\n"
+    "Ignoruj daty, adresy, numery, telefony, email.\n"
+    "Format odpowiedzi - TYLKO JSON tablica:\n"
+    '[{"text":"Katarzyna Nowak","category":"IMIE_NAZWISKO"},'
+    '{"text":"dr Jan Kowalski","category":"LEKARZ"},'
+    '{"text":"Szpital Miejski","category":"NAZWA_PLACOWKI"}]\n'
+    "Kategorie: IMIE_NAZWISKO, LEKARZ, NAZWA_PLACOWKI.\n"
+    "Bez komentarzy, bez markdown."
+)
+user_prompt = "Tekst:\n" + text + "\n\nJSON:"
+
+resp = llm.create_chat_completion(
+    messages=[
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ],
+    max_tokens=1024,
+    temperature=0.1,
+)
+content = resp["choices"][0]["message"]["content"].strip()
+if "```" in content:
+    m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', content, re.DOTALL)
+    if m:
+        content = m.group(1).strip()
+
+# Try to salvage truncated JSON arrays by closing them
+def _try_parse_json_array(s):
     try:
-        from model_library import get_library
-    except ImportError:
-        raise RuntimeError('AI Chat not installed - model_library unavailable')
-
-    lib = get_library()
-    llm, err = lib.load_model()
-    if err:
-        raise RuntimeError('Cannot load LLM model: ' + str(err))
-
-    lib.touch_model()
-
-    messages = [
-        {'role': 'system', 'content': _SYSTEM_PROMPT},
-        {'role': 'user', 'content': _USER_PROMPT_TEMPLATE.format(text=text_chunk[:3000])},
-    ]
-
-    resp = llm.create_chat_completion(
-        messages=messages,
-        max_tokens=2048,
-        temperature=0.1,
-    )
-
-    content = resp['choices'][0]['message']['content'].strip()
-
-    # Parse JSON from response -- handle markdown code blocks
-    if '```' in content:
-        match = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', content, re.DOTALL)
-        if match:
-            content = match.group(1).strip()
-
-    try:
-        entities = json.loads(content)
-        if not isinstance(entities, list):
-            entities = []
+        arr = json.loads(s)
+        if isinstance(arr, dict) and "text" in arr:
+            return [arr]
+        if isinstance(arr, list):
+            return arr
+        return []
     except json.JSONDecodeError:
-        match = re.search(r'\[.*\]', content, re.DOTALL)
-        if match:
-            try:
-                entities = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                entities = []
-        else:
-            entities = []
+        pass
+    # Truncated array: try closing the last complete element
+    # Find last complete }, then close the array
+    idx = s.rfind('}')
+    if idx > 0:
+        candidate = s[:idx+1] + ']'
+        try:
+            arr = json.loads(candidate)
+            if isinstance(arr, list):
+                return arr
+        except json.JSONDecodeError:
+            pass
+    # Find embedded array
+    m2 = re.search(r'\[.*\}', s, re.DOTALL)
+    if m2:
+        try:
+            return json.loads(m2.group(0) + ']')
+        except json.JSONDecodeError:
+            pass
+    return []
 
-    return [e for e in entities if isinstance(e, dict) and 'text' in e and 'category' in e]
+entities = _try_parse_json_array(content)
+result = [e for e in entities if isinstance(e, dict) and "text" in e and "category" in e]
+with open(result_path, 'w') as rf:
+    json.dump(result, rf, ensure_ascii=False)
+'''
+
+    try:
+        log.info('[doc_anonymizer] Starting LLM subprocess (text=%d chars)', len(text_chunk))
+        proc = _sp.run(
+            [sys.executable, '-c', script, text_path, result_path],
+            capture_output=True, text=True,
+            timeout=600,  # 10 min max
+            cwd='/opt/ethos/backend',
+        )
+        log.info('[doc_anonymizer] LLM subprocess finished (rc=%s, stdout=%d, stderr=%d)',
+                 proc.returncode, len(proc.stdout), len(proc.stderr))
+        if proc.stderr:
+            log.debug('[doc_anonymizer] LLM stderr: %s', proc.stderr[:300])
+        if proc.returncode != 0:
+            log.warning('[doc_anonymizer] LLM subprocess failed (rc=%s): %s',
+                        proc.returncode, proc.stderr[:500])
+            return []
+        if not os.path.exists(result_path):
+            log.warning('[doc_anonymizer] LLM result file not created. stdout=%s',
+                        proc.stdout[:300])
+            return []
+        with open(result_path) as rf:
+            result = json.load(rf)
+        log.info('[doc_anonymizer] LLM returned %d entities', len(result))
+        return result
+    except _sp.TimeoutExpired:
+        log.warning('[doc_anonymizer] LLM subprocess timed out (600s)')
+        return []
+    except Exception as e:
+        log.warning('[doc_anonymizer] LLM subprocess error: %s', e)
+        return []
+    finally:
+        for p in (text_path, result_path):
+            if os.path.exists(p):
+                os.unlink(p)
 
 
 def _normalize_category(cat):
@@ -204,6 +505,7 @@ _PLACEHOLDER_MAP = {
     'EMAIL': '[EMAIL]',
     'NR_PACJENTA': '[NR_PACJENTA]',
     'NR_DOKUMENTU': '[NR_DOKUMENTU]',
+    'NR_KONTA': '[NR_KONTA]',
     'NAZWA_PLACOWKI': '[PLACOWKA]',
     'LEKARZ': '[LEKARZ]',
     'INNE_PII': '[DANE_OSOBOWE]',
@@ -243,57 +545,64 @@ def _replace_entities_in_text(text, entities):
 
 # -- Document generation ----------------------------------------------------
 
-def _generate_pdf(anonymized_pages, output_path):
-    """Generate a PDF from anonymized text pages using reportlab."""
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib.units import cm
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.lib.enums import TA_LEFT
-    from reportlab.pdfbase import pdfmetrics
-    from reportlab.pdfbase.ttfonts import TTFont
+def _redact_pdf(src_path, output_path, entities):
+    """Redact PII in a PDF using PyMuPDF — preserves original layout."""
+    import fitz
 
-    font_name = 'Helvetica'
-    for font_path in ['/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
-                      '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf']:
-        if os.path.exists(font_path):
-            try:
-                fname = os.path.basename(font_path).replace('.ttf', '')
-                pdfmetrics.registerFont(TTFont(fname, font_path))
-                font_name = fname
-                break
-            except Exception:
-                continue
+    seen_texts = {}
+    for e in entities:
+        cat = _normalize_category(e.get('category', 'INNE_PII'))
+        txt = e.get('text', '').strip()
+        if txt and txt not in seen_texts:
+            seen_texts[txt] = _PLACEHOLDER_MAP.get(cat, '[DANE]')
 
-    doc = SimpleDocTemplate(output_path, pagesize=A4,
-                            leftMargin=2 * cm, rightMargin=2 * cm,
-                            topMargin=2 * cm, bottomMargin=2 * cm)
+    # Sort by length descending so longer matches take priority
+    sorted_items = sorted(seen_texts.items(), key=lambda x: len(x[0]), reverse=True)
 
-    styles = getSampleStyleSheet()
-    body_style = ParagraphStyle(
-        'AnonBody', parent=styles['Normal'],
-        fontName=font_name, fontSize=10, leading=14,
-        alignment=TA_LEFT,
+    doc = fitz.open(src_path)
+    total_redactions = []
+
+    for page in doc:
+        for original, placeholder in sorted_items:
+            instances = page.search_for(original)
+            for inst in instances:
+                page.add_redact_annot(
+                    inst, text=placeholder, fontsize=0,
+                    fill=(0, 0, 0), text_color=(1, 1, 1),
+                )
+                total_redactions.append({
+                    'original': original,
+                    'placeholder': placeholder,
+                    'category': next(
+                        (_normalize_category(e['category'])
+                         for e in entities if e.get('text', '').strip() == original),
+                        'INNE_PII'),
+                    'occurrences': 1,
+                })
+
+    for page in doc:
+        page.apply_redactions()
+
+    # Add a small "ZANONIMIZOWANO" watermark on first page
+    first = doc[0]
+    first.insert_text(
+        (first.rect.width - 180, 20),
+        'DOKUMENT ZANONIMIZOWANY',
+        fontsize=8, color=(0.5, 0.5, 0.5),
     )
-    header_style = ParagraphStyle(
-        'AnonHeader', parent=styles['Normal'],
-        fontName=font_name, fontSize=8, leading=10,
-        textColor='gray',
-    )
 
-    story = [
-        Paragraph('DOKUMENT ZANONIMIZOWANY', header_style),
-        Spacer(1, 0.5 * cm),
-    ]
+    doc.save(output_path, garbage=4, deflate=True)
+    doc.close()
 
-    for i, page_text in enumerate(anonymized_pages):
-        safe = page_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-        safe = safe.replace('\n', '<br/>')
-        story.append(Paragraph(safe, body_style))
-        if i < len(anonymized_pages) - 1:
-            story.append(PageBreak())
-
-    doc.build(story)
+    # Merge redaction counts
+    seen = {}
+    for r in total_redactions:
+        key = r['original']
+        if key not in seen:
+            seen[key] = r
+        else:
+            seen[key]['occurrences'] += 1
+    return list(seen.values())
 
 
 def _anonymize_docx_inplace(src_path, output_path, all_entities):
@@ -412,43 +721,46 @@ def _run_anonymization(job_id, src_path, filename, file_ext, username):
         total_parts = len(text_parts)
         all_entities = []
 
-        # Phase 1: Regex-based detection (fast, reliable for structured PII)
+        # For PDFs, normalize text to fix fragmented extraction
+        # (digits split across lines, newlines in bank accounts, etc.)
+        if file_ext == '.pdf':
+            text_parts = [re.sub(r'(\d)[\s\n]+(\d)', r'\1 \2', p) for p in text_parts]
+
+        # Concatenate all text for detection (catches items spanning pages)
+        full_text = '\n\n'.join(t for t in text_parts if t.strip())
+        # Normalize digit sequences in full text (catches cross-page items)
+        full_text = re.sub(r'(\d)[\s\n]+(\d)', r'\1 \2', full_text)
+
+        # Phase 1: Regex-based detection on full text (fast, reliable)
         _emit_progress(job_id, 'regex', 20,
                        'Wykrywanie PESEL, telefonow, adresow (regex)...')
-        for text_part in text_parts:
-            regex_hits = _regex_detect(text_part)
-            all_entities.extend(regex_hits)
+        regex_hits = _regex_detect(full_text)
+        all_entities.extend(regex_hits)
 
-        # Phase 2: LLM-based detection (names, doctor names, facilities)
-        for i, text_part in enumerate(text_parts):
-            if not text_part.strip():
-                continue
-            pct = 30 + int(50 * (i / max(total_parts, 1)))
-            _emit_progress(job_id, 'analyzing', pct,
-                           'Analiza LLM (imiona/nazwiska) - fragment %d/%d...' % (i + 1, total_parts))
-            try:
-                entities = _call_llm(text_part)
-                all_entities.extend(entities)
-            except Exception as e:
-                log.warning('[doc_anonymizer] LLM error on chunk %d: %s', i, e)
+        # Phase 2: Name & facility detection (regex-based, high recall)
+        _emit_progress(job_id, 'analyzing', 40,
+                       'Wykrywanie imion, nazwisk i placowek...')
+        name_hits = _detect_names(full_text)
+        facility_hits = _detect_facilities(full_text)
+        all_entities.extend(name_hits)
+        all_entities.extend(facility_hits)
+
+        # Phase 3: LLM-based detection (supplementary, catches unusual names)
+        _emit_progress(job_id, 'analyzing', 55,
+                       'Analiza LLM (dodatkowe imiona/nazwiska)...')
+        try:
+            llm_entities = _call_llm(full_text)
+            # Only add LLM entities not already found by regex/name detection
+            existing_texts = {e['text'].lower() for e in all_entities}
+            for le in llm_entities:
+                if le.get('text', '').lower() not in existing_texts:
+                    all_entities.append(le)
+                    existing_texts.add(le['text'].lower())
+        except Exception as e:
+            log.warning('[doc_anonymizer] LLM error: %s', e)
 
         _emit_progress(job_id, 'replacing', 85,
                        'Zastepowanie danych osobowych...')
-
-        anonymized_parts = []
-        total_replacements = []
-        for part in text_parts:
-            anon_text, repls = _replace_entities_in_text(part, all_entities)
-            anonymized_parts.append(anon_text)
-            total_replacements.extend(repls)
-
-        seen_repls = {}
-        for r in total_replacements:
-            key = r['original']
-            if key not in seen_repls:
-                seen_repls[key] = r
-            else:
-                seen_repls[key]['occurrences'] += r['occurrences']
 
         _emit_progress(job_id, 'generating', 90,
                        'Generowanie zanonimizowanego dokumentu...')
@@ -457,9 +769,30 @@ def _run_anonymization(job_id, src_path, filename, file_ext, username):
         out_path = os.path.join(job, out_filename)
 
         if file_ext == '.pdf':
-            _generate_pdf(anonymized_parts, out_path)
+            redact_repls = _redact_pdf(src_path, out_path, all_entities)
+            seen_repls = {}
+            for r in redact_repls:
+                key = r['original']
+                if key not in seen_repls:
+                    seen_repls[key] = r
+                else:
+                    seen_repls[key]['occurrences'] += r['occurrences']
         elif file_ext in ('.docx', '.doc'):
             _anonymize_docx_inplace(src_path, out_path, all_entities)
+            seen_repls = {}
+            for e in all_entities:
+                txt = e.get('text', '').strip()
+                if not txt or txt in seen_repls:
+                    continue
+                cat = _normalize_category(e.get('category', 'INNE_PII'))
+                seen_repls[txt] = {
+                    'original': txt,
+                    'placeholder': _PLACEHOLDER_MAP.get(cat, '[DANE]'),
+                    'category': cat,
+                    'occurrences': 1,
+                }
+        else:
+            seen_repls = {}
 
         meta = {
             'job_id': job_id,
