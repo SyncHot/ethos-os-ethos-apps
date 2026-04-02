@@ -31,7 +31,7 @@ from flask import Blueprint, request, jsonify, send_file, g
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from utils import register_pkg_routes, get_username_or
-from host import data_path
+from host import data_path, host_run
 
 log = logging.getLogger('ethos.doc_anonymizer')
 
@@ -46,6 +46,49 @@ def _ensure_jobs_dir():
     os.makedirs(_JOBS_DIR, exist_ok=True)
 
 
+def _ensure_deps():
+    """Install all required pip packages and system tools if missing."""
+    missing_pip = []
+    try:
+        import fitz  # noqa: F401
+    except ImportError:
+        missing_pip.append('PyMuPDF')
+    try:
+        import PyPDF2  # noqa: F401
+    except ImportError:
+        missing_pip.append('PyPDF2')
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        missing_pip.append('Pillow')
+    try:
+        import pytesseract  # noqa: F401
+    except ImportError:
+        missing_pip.append('pytesseract')
+    try:
+        import docx  # noqa: F401
+    except ImportError:
+        missing_pip.append('python-docx')
+    try:
+        import reportlab  # noqa: F401
+    except ImportError:
+        missing_pip.append('reportlab')
+
+    if missing_pip:
+        pkgs = ' '.join(missing_pip)
+        log.info('[doc_anonymizer] Installing pip deps: %s', pkgs)
+        host_run(f'/opt/ethos/venv/bin/pip install --quiet {pkgs}', timeout=120)
+
+    import shutil
+    if not shutil.which('pdftotext'):
+        log.info('[doc_anonymizer] Installing poppler-utils')
+        host_run('apt-get install -y -qq poppler-utils', timeout=60)
+
+    if not shutil.which('tesseract'):
+        log.info('[doc_anonymizer] Installing Tesseract OCR + Polish language pack')
+        host_run('apt-get install -y -qq tesseract-ocr tesseract-ocr-pol', timeout=120)
+
+
 def _job_dir(job_id):
     return os.path.join(_JOBS_DIR, job_id)
 
@@ -57,7 +100,7 @@ def _get_username():
 # -- Text extraction --------------------------------------------------------
 
 def _extract_text_pdf(filepath):
-    """Extract text from a PDF using pdftotext (poppler), fallback to PyPDF2."""
+    """Extract text from a PDF using pdftotext (poppler), fallback to PyPDF2, then OCR."""
     import subprocess
     try:
         result = subprocess.run(
@@ -66,7 +109,6 @@ def _extract_text_pdf(filepath):
         )
         if result.returncode == 0 and result.stdout.strip():
             raw = result.stdout
-            # Split by form-feed (page separator) if present
             pages = raw.split('\x0c')
             pages = [p for p in pages if p.strip()]
             if pages:
@@ -81,7 +123,92 @@ def _extract_text_pdf(filepath):
         for page in reader.pages:
             text = page.extract_text() or ''
             pages.append(_cleanup_pdf_text(text))
+
+    # If no text extracted (scanned PDF), try OCR
+    has_text = any(p.strip() for p in pages)
+    if not has_text:
+        log.info('[doc_anonymizer] No text extracted, attempting OCR for %s', filepath)
+        ocr_pages = _ocr_pdf(filepath)
+        if ocr_pages:
+            return ocr_pages
+
     return pages
+
+
+def _ocr_pdf(filepath):
+    """Extract text from a scanned PDF using Tesseract OCR."""
+    try:
+        import fitz
+        import pytesseract
+        from PIL import Image
+        import io
+    except ImportError as e:
+        log.warning('[doc_anonymizer] OCR dependencies not available: %s', e)
+        return None
+
+    pages = []
+    try:
+        doc = fitz.open(filepath)
+        for page_num, page in enumerate(doc):
+            # Render page at 300 DPI for good OCR quality
+            mat = fitz.Matrix(300 / 72, 300 / 72)
+            pix = page.get_pixmap(matrix=mat)
+            img_data = pix.tobytes('png')
+            img = Image.open(io.BytesIO(img_data))
+
+            # OCR with Polish + English language support
+            text = pytesseract.image_to_string(img, lang='pol+eng', config='--psm 6')
+            text = _normalize_ocr_text(text)
+            pages.append(_cleanup_pdf_text(text))
+            log.debug('[doc_anonymizer] OCR page %d: %d chars', page_num + 1, len(text))
+
+        doc.close()
+    except Exception as e:
+        log.error('[doc_anonymizer] OCR failed: %s', e)
+        return None
+
+    has_text = any(p.strip() for p in pages)
+    if not has_text:
+        return None
+
+    log.info('[doc_anonymizer] OCR extracted %d pages', len(pages))
+    return pages
+
+
+# Words that should stay ALL CAPS (abbreviations, headers)
+_OCR_KEEP_UPPER = frozenset({
+    'PESEL', 'NIP', 'REGON', 'KRS', 'PWZ', 'NFZ', 'ZUS', 'PIT', 'VAT',
+    'KARTA', 'INFORMACYJNA', 'MR', 'CT', 'EKG', 'USG', 'RTG', 'MRI',
+    'DNA', 'RNA', 'HIV', 'HCV', 'HBS', 'CRP', 'HDL', 'LDL', 'TSH',
+    'BMI', 'EWUS', 'NZOZ', 'SP', 'ZOZ', 'II', 'III', 'IV', 'VI',
+})
+
+
+def _normalize_ocr_text(text):
+    """Normalize OCR text: convert ALL CAPS person names to Title Case.
+
+    OCR often outputs names in ALL CAPS (e.g. "ALICJA KOWALSKA").
+    Regex patterns expect Title Case, so we normalize words that look
+    like names while preserving known abbreviations.
+    """
+    lines = text.split('\n')
+    normalized = []
+    for line in lines:
+        words = line.split()
+        new_words = []
+        for word in words:
+            # Skip non-alpha, short words, known abbreviations
+            stripped = word.strip('.,;:!?()[]/-')
+            if (len(stripped) >= 3
+                    and stripped.isupper()
+                    and stripped.isalpha()
+                    and stripped not in _OCR_KEEP_UPPER):
+                # Convert to title case, preserve surrounding punctuation
+                new_words.append(word.replace(stripped, stripped.title()))
+            else:
+                new_words.append(word)
+        normalized.append(' '.join(new_words))
+    return '\n'.join(normalized)
 
 
 def _cleanup_pdf_text(text):
@@ -154,12 +281,17 @@ _REGEX_PATTERNS = [
     (re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'), 'EMAIL'),
     # Polish postal code + city (e.g. "00-001 Warszawa")
     (re.compile(r'\d{2}-\d{3}\s+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+'), 'ADRES'),
-    # Street address (ul./al./os./pl. + name + optional number) — single line only
+    # Street address (ul./al./os./pl. + name + optional number) — limit to max 4 words
     (re.compile(r'(?:ul\.|al\.|os\.|pl\.|Al\.)\s+[A-ZĄ-Ż][a-ząćęłńóśźż]+'
-                r'(?:\s[A-ZĄ-Ż]?[a-ząćęłńóśźż]+)*'
+                r'(?:\s[A-ZĄ-Ż][a-ząćęłńóśźż]+){0,3}'
                 r'(?:\s+\d+[a-zA-Z]?(?:/\d+[a-zA-Z]?)?)'), 'ADRES'),
-    # NIP: 10 digits with optional dashes (e.g. "525-12-34-567")
-    (re.compile(r'\b\d{3}-\d{2}-\d{2}-\d{3}\b'), 'NR_DOKUMENTU'),
+    # NIP: 10 digits with dashes (e.g. "525-12-34-567" or "NIP: 5251234567")
+    (re.compile(r'\b\d{3}-\d{2}-\d{2}-\d{3}\b'), 'NIP'),
+    (re.compile(r'NIP[\s:]*\d{10}\b'), 'NIP'),
+    # REGON: 9 or 14 digits (e.g. "REGON: 123456789")
+    (re.compile(r'REGON[\s:]*\d{9}(?:\d{5})?\b'), 'REGON'),
+    # KRS: 10 digits (e.g. "KRS: 0000234567" or "KRS 0000234567")
+    (re.compile(r'KRS[\s:]*\d{10}\b'), 'KRS'),
     # PWZ number (e.g. "nr PWZ 4478123" or "PWZ: 1234567")
     (re.compile(r'(?:nr\s+)?PWZ[\s:]*\d{7}'), 'NR_DOKUMENTU'),
     # Dates: DD.MM.YYYY, DD-MM-YYYY, DD/MM/YYYY
@@ -173,21 +305,77 @@ _REGEX_PATTERNS = [
 # Common Polish first names used as anchors for detecting name patterns
 _PL_FIRST_NAMES = frozenset({
     'Adam', 'Adrian', 'Agata', 'Agnieszka', 'Aleksander', 'Aleksandra',
-    'Andrzej', 'Anna', 'Antoni', 'Barbara', 'Bartosz', 'Beata', 'Bogdan',
-    'Bozena', 'Celina', 'Cezary', 'Dariusz', 'Danuta', 'Dawid', 'Dorota',
-    'Edward', 'Elzbieta', 'Ewa', 'Filip', 'Franciszek', 'Grazyna',
-    'Grzegorz', 'Halina', 'Henryk', 'Henryka', 'Hubert', 'Irena',
-    'Iwona', 'Jacek', 'Jadwiga', 'Jakub', 'Jan', 'Janina', 'Jaroslaw',
-    'Jerzy', 'Joanna', 'Jolanta', 'Jozef', 'Julia', 'Justyna',
-    'Kamil', 'Karol', 'Katarzyna', 'Kazimierz', 'Konrad', 'Krystyna',
-    'Krzysztof', 'Leszek', 'Lukasz', 'Maciej', 'Magdalena', 'Malgorzata',
-    'Marcin', 'Marek', 'Maria', 'Mariusz', 'Marta', 'Michal', 'Miroslawa',
-    'Monika', 'Natalia', 'Norbert', 'Olga', 'Patryk', 'Pawel', 'Piotr',
-    'Przemyslaw', 'Rafal', 'Renata', 'Robert', 'Roman', 'Ryszard',
-    'Sebastian', 'Stanislaw', 'Stefan', 'Sylwia', 'Szymon', 'Tadeusz',
-    'Teresa', 'Tomasz', 'Wanda', 'Weronika', 'Wieslaw', 'Wiktoria',
-    'Witold', 'Wladyslaw', 'Wojciech', 'Zbigniew', 'Zofia', 'Zygmunt',
+    'Alfred', 'Alicja', 'Alina', 'Amelia', 'Anastazja', 'Andrzej', 'Anna',
+    'Antoni', 'Antonina', 'Arkadiusz', 'Artur',
+    'Barbara', 'Bartlomiej', 'Bartosz', 'Beata', 'Benedykt', 'Bernadeta',
+    'Blanka', 'Bogdan', 'Bogdana', 'Bogumil', 'Bogumila', 'Boguslaw',
+    'Boguslawa', 'Boleslawa', 'Bozena', 'Bronislaw', 'Bronislawa',
+    'Celina', 'Cezary', 'Czeslaw', 'Czeslaw',
+    'Damian', 'Daniel', 'Daniela', 'Danuta', 'Dariusz', 'Dawid', 'Dominik',
+    'Dominika', 'Dorota',
+    'Edmund', 'Edward', 'Eleonora', 'Elzbieta', 'Emil', 'Emilia', 'Eugenia',
+    'Eugeniusz', 'Ewa', 'Ewelina',
+    'Fabian', 'Filip', 'Franciszek', 'Fryderyk',
+    'Gabriel', 'Gabriela', 'Genowefa', 'Gertruda', 'Grazyna', 'Grzegorz',
+    'Gustaw',
+    'Halina', 'Hanna', 'Helena', 'Henryk', 'Henryka', 'Hubert',
+    'Ignacy', 'Igor', 'Ilona', 'Irena', 'Ireneusz', 'Iwona', 'Izabela',
+    'Jacek', 'Jadwiga', 'Jakub', 'Jan', 'Janina', 'Janusz', 'Jaroslaw',
+    'Jerzy', 'Joanna', 'Jolanta', 'Jozef', 'Jozefa', 'Julia', 'Julian',
+    'Juliusz', 'Justyna',
+    'Kamil', 'Kamila', 'Karol', 'Karolina', 'Katarzyna', 'Kazimiera',
+    'Kazimierz', 'Klaudia', 'Konrad', 'Kornelia', 'Krystian', 'Krystyna',
+    'Krzysztof',
+    'Laura', 'Leon', 'Leonard', 'Leszek', 'Lidia', 'Lilian', 'Lucjan',
+    'Lucyna', 'Ludmila', 'Ludwik', 'Luiza', 'Lukasz',
+    'Maciej', 'Magdalena', 'Maja', 'Maksymilian', 'Malgorzata', 'Marcel',
+    'Marcin', 'Marek', 'Maria', 'Marian', 'Marianna', 'Mariusz', 'Marlena',
+    'Marta', 'Mateusz', 'Michal', 'Michalina', 'Mieczyslaw', 'Milena',
+    'Miroslaw', 'Miroslawa', 'Monika',
+    'Natalia', 'Natasza', 'Nikola', 'Nikolaj', 'Nina', 'Norbert',
+    'Olga', 'Oliwia', 'Oskar',
+    'Patrycja', 'Patryk', 'Paulina', 'Pawel', 'Piotr', 'Przemyslaw',
+    'Radoslaw', 'Rafal', 'Regina', 'Renata', 'Robert', 'Roman', 'Rozalia',
+    'Rudolf', 'Ryszard',
+    'Sabina', 'Sandra', 'Sebastian', 'Stanislaw', 'Stanislawa', 'Stefan',
+    'Stefania', 'Sylwester', 'Sylwia', 'Szymon',
+    'Tadeusz', 'Tatiana', 'Teresa', 'Tomasz', 'Tymoteusz',
+    'Urszula',
+    'Waldemar', 'Walentyna', 'Wanda', 'Weronika', 'Wieslaw', 'Wieslawa',
+    'Wiktoria', 'Wiktor', 'Witold', 'Wladyslaw', 'Wladyslawa',
+    'Wojciech',
+    'Zbigniew', 'Zdzislaw', 'Zenon', 'Zofia', 'Zygmunt', 'Zyta',
 })
+
+# Declined (accusative/genitive) forms of common Polish first names
+# Mapping: declined form -> base form (for matching)
+_PL_FIRST_NAMES_DECLINED = {}
+for _name in _PL_FIRST_NAMES:
+    if _name.endswith('a') and len(_name) > 3:
+        # feminine -a -> -e (acc), -y/-i (gen)
+        _stem = _name[:-1]
+        for _suf in ('e', 'y', 'i'):
+            _PL_FIRST_NAMES_DECLINED[_stem + _suf] = _name
+    elif not _name.endswith('a') and len(_name) > 3:
+        # masculine consonant endings: +a (gen), +owi (dat), +em (inst)
+        _PL_FIRST_NAMES_DECLINED[_name + 'a'] = _name
+        _PL_FIRST_NAMES_DECLINED[_name + 'owi'] = _name
+        _PL_FIRST_NAMES_DECLINED[_name + 'em'] = _name
+        # special cases: names ending in -ek drop e: Marek->Marka
+        if _name.endswith('ek'):
+            _stem = _name[:-2] + 'k'
+            _PL_FIRST_NAMES_DECLINED[_stem + 'a'] = _name
+            _PL_FIRST_NAMES_DECLINED[_stem + 'owi'] = _name
+            _PL_FIRST_NAMES_DECLINED[_stem + 'iem'] = _name
+        # names ending in -sz: Tomasz->Tomasza, -usz: Tadeusz->Tadeusza
+        if _name.endswith('sz') or _name.endswith('rz'):
+            _PL_FIRST_NAMES_DECLINED[_name + 'a'] = _name
+
+# Also handle declined surname patterns: -skiego/-skim/-skiemu, -ckiego/-ckim
+_SURNAME_RE_DECLINED = (
+    r'[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]{2,}'
+    r'(?:-[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]{2,})?'
+)
 
 # Title prefixes that signal a person name follows
 _TITLE_PREFIXES = (
@@ -218,19 +406,70 @@ _NAME_STOPWORDS = frozenset({
 })
 
 
+def _is_known_first_name(name):
+    """Check if name is a known Polish first name (including declined forms)."""
+    return name in _PL_FIRST_NAMES or name in _PL_FIRST_NAMES_DECLINED
+
+
+def _surname_variants(surname):
+    """Generate nominative + common declined forms of a Polish surname."""
+    forms = {surname}
+    # Normalize to nominative
+    base = surname
+    if surname.endswith('skiego'):
+        base = surname[:-3] + ''  # -skiego -> -ski
+        base = surname[:-4] + 'i'  # -skiego -> -ski
+    elif surname.endswith('ckiego'):
+        base = surname[:-4] + 'i'  # -ckiego -> -cki
+    elif surname.endswith('skiej'):
+        base = surname[:-2] + 'a'  # -skiej -> -ska
+    elif surname.endswith('ckiej'):
+        base = surname[:-2] + 'a'  # -ckiej -> -cka
+    elif surname.endswith('skiego'):
+        base = surname[:-4] + 'i'
+    elif surname.endswith('skiemu') or surname.endswith('ckiemu'):
+        base = surname[:-3] + ''
+    elif surname.endswith('skim') or surname.endswith('ckim'):
+        base = surname[:-1] + ''
+
+    forms.add(base)
+
+    # Generate declined forms from base
+    if base.endswith('ski'):
+        stem = base[:-1]  # -ski -> -sk
+        forms.update([stem + 'iego', stem + 'iemu', stem + 'im', stem + 'i'])
+    elif base.endswith('cki'):
+        stem = base[:-1]  # -cki -> -ck
+        forms.update([stem + 'iego', stem + 'iemu', stem + 'im', stem + 'i'])
+    if base.endswith('ska'):
+        stem = base[:-1]  # -ska -> -sk
+        forms.update([stem + 'iej', stem + 'ą'])
+    elif base.endswith('cka'):
+        stem = base[:-1]  # -cka -> -ck
+        forms.update([stem + 'iej', stem + 'ą'])
+    elif base.endswith('a') and not base.endswith('ska') and not base.endswith('cka'):
+        # generic feminine: -a -> -ej, -ą
+        forms.update([base[:-1] + 'ej', base[:-1] + 'ą'])
+    elif not base.endswith('a'):
+        # generic masculine consonant: +a (gen), +owi, +em
+        forms.update([base + 'a', base + 'owi', base + 'em'])
+
+    return forms
+
+
 def _detect_names(text):
     """Detect Polish person names using pattern matching."""
     entities = []
     seen = set()
+    known_surnames = set()  # collect detected surnames for cross-referencing
 
     # 1) Title + name patterns (dr, prof., lek. etc.) — search full text
     for prefix in _TITLE_PREFIXES:
-        # title + FirstName [MiddleName|Initial] Surname[-Compound]
         pat = re.compile(
             r'(?:' + prefix + r')'
-            r'([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+'            # first name
-            r'(?:[ \t]+[A-ZĄĆĘŁŃÓŚŹŻ]\.?[a-ząćęłńóśźż]*)?' # optional middle/initial
-            r'[ \t]+' + _SURNAME_RE + r')'                    # surname
+            r'([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+'
+            r'(?:[ \t]+[A-ZĄĆĘŁŃÓŚŹŻ]\.?[a-ząćęłńóśźż]*)?'
+            r'[ \t]+' + _SURNAME_RE + r')'
         )
         for m in pat.finditer(text):
             name = m.group(1).strip()
@@ -239,9 +478,14 @@ def _detect_names(text):
                 seen.add(name)
                 seen.add(full)
                 entities.append({'text': full, 'category': 'LEKARZ'})
+                # extract surname for cross-ref
+                parts = name.split()
+                if parts:
+                    for sp in parts[-1].split('-'):
+                        if len(sp) >= 4:
+                            known_surnames.add(sp)
 
-    # 2) Known first name + surname(s) — search line-by-line to avoid
-    #    cross-line false positives
+    # 2) Known first name + surname(s) — search line-by-line
     name_pat = re.compile(
         r'\b([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+)'
         r'(?:[ \t]+([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+))?'
@@ -254,7 +498,7 @@ def _detect_names(text):
             surname = m.group(3)
             full_match = m.group(0).strip()
 
-            if first not in _PL_FIRST_NAMES and middle not in _PL_FIRST_NAMES:
+            if not _is_known_first_name(first) and not _is_known_first_name(middle):
                 continue
             if first in _NAME_STOPWORDS:
                 continue
@@ -263,8 +507,84 @@ def _detect_names(text):
             if full_match not in seen:
                 seen.add(full_match)
                 entities.append({'text': full_match, 'category': 'IMIE_NAZWISKO'})
+                for sp in surname.split('-'):
+                    if len(sp) >= 4:
+                        known_surnames.add(sp)
 
-    # 3) "K. Surname" abbreviation patterns
+    # 2b) Surname-first: SURNAME Firstname (common in Polish official forms)
+    surname_first_pat = re.compile(
+        r'\b(' + _SURNAME_RE + r')'
+        r'[ \t]+([A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+)\b'
+    )
+    for line in text.split('\n'):
+        for m in surname_first_pat.finditer(line):
+            surname_cand = m.group(1)
+            first_cand = m.group(2)
+            full_match = m.group(0).strip()
+            if full_match in seen:
+                continue
+            if not _is_known_first_name(first_cand):
+                continue
+            if surname_cand in _NAME_STOPWORDS or first_cand in _NAME_STOPWORDS:
+                continue
+            if len(surname_cand) < 3:
+                continue
+            seen.add(full_match)
+            entities.append({'text': full_match, 'category': 'IMIE_NAZWISKO'})
+            for sp in surname_cand.split('-'):
+                if len(sp) >= 4:
+                    known_surnames.add(sp)
+
+    # 3) Contextual label patterns — "Imię i nazwisko: NAME", "Syn: NAME" etc.
+    _LABEL_PATTERNS = [
+        r'[Ii]mi[eę]\s+i\s+nazwisko\s*:\s*',
+        r'[Nn]azwisko\s+panie[nń]skie\s*:\s*',
+        r'[Nn]azwisko\s*:\s*',
+        r'[Ss]yn\s*:\s*',
+        r'[Cc][oó]rka\s*:\s*',
+        r'[Mm][aą][zż]\s*:\s*',
+        r'[Żż]ona\s*:\s*',
+        r'[Oo]jciec\s*:\s*',
+        r'[Mm]atka\s*:\s*',
+        r'[Oo]piekun(?:\s+prawny)?\s*:\s*',
+        r'[Pp]rzedstawiciel(?:\s+ustawowy)?\s*(?:\([^)]*\))?\s*:\s*',
+        r'[Oo]soba\s+upowa[zż]niona[^:]*:\s*',
+        r'[Pp]e[lł]nomocnik[^:]*:\s*',
+        r'[Bb]abcia\s+(?:macierzysta|ojczysta)\s*:\s*',
+        r'[Dd]ziadek\s+(?:macierzysty|ojczysty)\s*:\s*',
+    ]
+    for label_re in _LABEL_PATTERNS:
+        label_pat = re.compile(
+            label_re + r'(' + _SURNAME_RE
+            + r'(?:[ \t]+[A-ZĄĆĘŁŃÓŚŹŻ][a-ząćęłńóśźż]+)*'
+            + r'(?:[ \t]+' + _SURNAME_RE + r')?'
+            + r')'
+        )
+        for m in label_pat.finditer(text):
+            val = m.group(1).strip()
+            if val and len(val) >= 3 and val not in seen:
+                seen.add(val)
+                entities.append({'text': val, 'category': 'IMIE_NAZWISKO'})
+                for part in val.split():
+                    for sp in part.split('-'):
+                        if len(sp) >= 4 and sp[0].isupper():
+                            known_surnames.add(sp)
+
+    # 4) "z d." (z domu = maiden name) pattern
+    maiden_pat = re.compile(
+        r'z\s+d(?:omu)?\.\s+(' + _SURNAME_RE + r')'
+    )
+    for m in maiden_pat.finditer(text):
+        maiden = m.group(0).strip()
+        surname = m.group(1)
+        if maiden not in seen:
+            seen.add(maiden)
+            entities.append({'text': maiden, 'category': 'IMIE_NAZWISKO'})
+            for sp in surname.split('-'):
+                if len(sp) >= 4:
+                    known_surnames.add(sp)
+
+    # 5) "K. Surname" abbreviation patterns
     abbrev_pat = re.compile(
         r'\b([A-ZĄĆĘŁŃÓŚŹŻ]\.)[ \t]+(' + _SURNAME_RE + r')\b'
     )
@@ -274,6 +594,28 @@ def _detect_names(text):
         if len(surname) >= 4 and abbrev not in seen:
             seen.add(abbrev)
             entities.append({'text': abbrev, 'category': 'IMIE_NAZWISKO'})
+            for sp in surname.split('-'):
+                if len(sp) >= 4:
+                    known_surnames.add(sp)
+
+    # 6) Surname cross-referencing: find standalone mentions of known surnames
+    #    Expand each known surname into all declined forms
+    if known_surnames:
+        all_variants = set()
+        for sn in known_surnames:
+            all_variants.update(_surname_variants(sn))
+        # filter out very short forms that could cause false positives
+        all_variants = {v for v in all_variants if len(v) >= 4}
+        surname_alt = '|'.join(re.escape(s) for s in sorted(all_variants, key=len, reverse=True))
+        crossref_pat = re.compile(r'\b(' + surname_alt + r')\b')
+        for m in crossref_pat.finditer(text):
+            sname = m.group(1)
+            if sname not in seen:
+                start = m.start()
+                if start > 0 and text[start-1].isalpha():
+                    continue
+                seen.add(sname)
+                entities.append({'text': sname, 'category': 'IMIE_NAZWISKO'})
 
     return entities
 
@@ -378,7 +720,22 @@ with open(text_path) as f:
 
 from model_library import get_library
 lib = get_library()
-llm, err = lib.load_model()
+
+# Prefer the best available Bielik model (Q8 > Q4) for Polish PII detection
+bielik_preference = ['bielik-7b-q8', 'bielik-7b-q4']
+best_bielik = None
+downloaded = lib._config.get('downloaded', {})
+for bid in bielik_preference:
+    dl = downloaded.get(bid)
+    if dl and os.path.isfile(dl.get('path', '')):
+        best_bielik = bid
+        break
+
+if best_bielik:
+    llm, err = lib.load_model(best_bielik)
+else:
+    llm, err = lib.load_model()
+
 if err:
     with open(result_path, 'w') as rf:
         json.dump([], rf)
@@ -386,13 +743,16 @@ if err:
 lib.touch_model()
 
 system_prompt = (
-    "Wypisz imiona i nazwiska osob oraz nazwy placowek medycznych z tekstu.\n"
-    "Ignoruj daty, adresy, numery, telefony, email.\n"
+    "Wypisz TYLKO imiona i nazwiska osob oraz nazwy placowek medycznych z tekstu.\n"
+    "NIE wypisuj: rozpoznan (ICD-10), lekow, dawek, zalecen, dat, adresow, "
+    "numerow PESEL/telefon/konta, email, wynikow badan.\n"
+    "Kazda pozycja to KROTKI tekst (imie+nazwisko lub nazwa placowki) - "
+    "max kilka slow, nigdy cale zdanie.\n"
     "Format odpowiedzi - TYLKO JSON tablica:\n"
     '[{"text":"Katarzyna Nowak","category":"IMIE_NAZWISKO"},'
     '{"text":"dr Jan Kowalski","category":"LEKARZ"},'
     '{"text":"Szpital Miejski","category":"NAZWA_PLACOWKI"}]\n'
-    "Kategorie: IMIE_NAZWISKO, LEKARZ, NAZWA_PLACOWKI.\n"
+    "Dozwolone kategorie: IMIE_NAZWISKO, LEKARZ, NAZWA_PLACOWKI.\n"
     "Bez komentarzy, bez markdown."
 )
 user_prompt = "Tekst:\n" + text + "\n\nJSON:"
@@ -491,6 +851,67 @@ def _normalize_category(cat):
     return ascii_str.upper().strip()
 
 
+# Valid categories that the LLM is allowed to return
+_VALID_LLM_CATEGORIES = frozenset({
+    'IMIE_NAZWISKO', 'LEKARZ', 'NAZWA_PLACOWKI',
+})
+
+# ICD-10 code pattern (e.g. "I10", "E11.9", "M54.5", "J18.0")
+_ICD_CODE_RE = re.compile(r'\b[A-Z]\d{2}(?:\.\d{1,2})?\b')
+
+# Medical terms that should NEVER be anonymized
+_MEDICAL_STOPWORDS = frozenset({
+    'rozpoznanie', 'epikryza', 'zalecenia', 'leczenie', 'badanie', 'wyniki',
+    'dawkowanie', 'kontrola', 'skierowanie', 'zaswiadczenie', 'zaświadczenie',
+    'pacjent', 'pacjentka', 'choroba', 'zapalenie', 'niedokrwienna',
+    'nadcisnienie', 'cukrzyca', 'hipercholesterolemia', 'diagnostyka',
+    'rehabilitacja', 'operacja', 'zabieg', 'terapia', 'recepta',
+    'amlodypina', 'metformina', 'atorwastatyna', 'ramipril', 'bisoprolol',
+})
+
+
+def _validate_llm_entities(entities):
+    """Filter LLM output to remove garbage, diagnoses, and too-long entries."""
+    valid = []
+    for e in entities:
+        text = e.get('text', '').strip()
+        cat = _normalize_category(e.get('category', ''))
+
+        # Reject empty or very short
+        if len(text) < 3:
+            continue
+
+        # Reject entities that are too long (real names are short)
+        if len(text) > 80:
+            log.debug('[doc_anonymizer] LLM entity too long (%d chars), skipping: %s...', len(text), text[:50])
+            continue
+
+        # Reject invalid categories — LLM may hallucinate RZPOZNANIE, LECZKA etc.
+        if cat not in _VALID_LLM_CATEGORIES:
+            log.debug('[doc_anonymizer] LLM invalid category %s, skipping: %s', cat, text[:50])
+            continue
+
+        # Reject if it contains ICD codes (diagnoses)
+        if _ICD_CODE_RE.search(text):
+            log.debug('[doc_anonymizer] LLM entity contains ICD code, skipping: %s', text[:50])
+            continue
+
+        # Reject if it contains medical stopwords
+        text_lower = text.lower()
+        if any(sw in text_lower for sw in _MEDICAL_STOPWORDS):
+            log.debug('[doc_anonymizer] LLM entity contains medical term, skipping: %s', text[:50])
+            continue
+
+        # Reject entities that look like full sentences (contain verbs/punctuation patterns)
+        if text.count(' ') > 8:
+            log.debug('[doc_anonymizer] LLM entity has too many words, skipping: %s', text[:50])
+            continue
+
+        valid.append({'text': text, 'category': cat})
+
+    return valid
+
+
 # -- Replacement logic ------------------------------------------------------
 
 _PLACEHOLDER_MAP = {
@@ -506,6 +927,9 @@ _PLACEHOLDER_MAP = {
     'NR_PACJENTA': '[NR_PACJENTA]',
     'NR_DOKUMENTU': '[NR_DOKUMENTU]',
     'NR_KONTA': '[NR_KONTA]',
+    'NIP': '[NIP]',
+    'REGON': '[REGON]',
+    'KRS': '[KRS]',
     'NAZWA_PLACOWKI': '[PLACOWKA]',
     'LEKARZ': '[LEKARZ]',
     'INNE_PII': '[DANE_OSOBOWE]',
@@ -546,44 +970,326 @@ def _replace_entities_in_text(text, entities):
 # -- Document generation ----------------------------------------------------
 
 def _redact_pdf(src_path, output_path, entities):
-    """Redact PII in a PDF using PyMuPDF — preserves original layout."""
+    """Redact PII in a PDF using blur overlay — preserves layout, hides text."""
     import fitz
+    from io import BytesIO
 
     seen_texts = {}
     for e in entities:
         cat = _normalize_category(e.get('category', 'INNE_PII'))
         txt = e.get('text', '').strip()
         if txt and txt not in seen_texts:
-            seen_texts[txt] = _PLACEHOLDER_MAP.get(cat, '[DANE]')
+            seen_texts[txt] = (_PLACEHOLDER_MAP.get(cat, '[DANE]'), cat)
 
-    # Sort by length descending so longer matches take priority
     sorted_items = sorted(seen_texts.items(), key=lambda x: len(x[0]), reverse=True)
 
     doc = fitz.open(src_path)
     total_redactions = []
 
-    for page in doc:
-        for original, placeholder in sorted_items:
+    # Blur parameters
+    blur_radius = 8
+    try:
+        from PIL import Image, ImageFilter
+        has_pil = True
+    except ImportError:
+        has_pil = False
+        log.warning('[doc_anonymizer] Pillow not installed, using solid redaction')
+
+    for page_idx, page in enumerate(doc):
+        page_rects = []  # (rect, placeholder, category)
+        for original, (placeholder, category) in sorted_items:
             instances = page.search_for(original)
             for inst in instances:
-                page.add_redact_annot(
-                    inst, text=placeholder, fontsize=0,
-                    fill=(0, 0, 0), text_color=(1, 1, 1),
-                )
+                page_rects.append((inst, placeholder, category, original))
                 total_redactions.append({
                     'original': original,
                     'placeholder': placeholder,
-                    'category': next(
-                        (_normalize_category(e['category'])
-                         for e in entities if e.get('text', '').strip() == original),
-                        'INNE_PII'),
+                    'category': category,
                     'occurrences': 1,
                 })
 
-    for page in doc:
-        page.apply_redactions()
+        if not page_rects:
+            continue
 
-    # Add a small "ZANONIMIZOWANO" watermark on first page
+        if has_pil:
+            # Capture page pixmap BEFORE redaction for blur source
+            zoom = 2  # 2x for quality
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+            # Apply redactions with white fill to remove original text
+            for rect, placeholder, category, original in page_rects:
+                page.add_redact_annot(rect, text='', fill=(1, 1, 1))
+            page.apply_redactions()
+
+            # Insert blurred image patches and placeholder text
+            for rect, placeholder, category, original in page_rects:
+                # Scale rect coords to pixmap coords
+                x0 = max(0, int(rect.x0 * zoom) - 2)
+                y0 = max(0, int(rect.y0 * zoom) - 2)
+                x1 = min(img.width, int(rect.x1 * zoom) + 2)
+                y1 = min(img.height, int(rect.y1 * zoom) + 2)
+
+                if x1 <= x0 or y1 <= y0:
+                    continue
+
+                # Crop, blur, save as PNG
+                crop = img.crop((x0, y0, x1, y1))
+                blurred = crop.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+                buf = BytesIO()
+                blurred.save(buf, format='PNG')
+                buf.seek(0)
+
+                # Insert blurred image at original position
+                page.insert_image(rect, stream=buf.getvalue())
+        else:
+            # Fallback: solid redaction (black fill, white text)
+            for rect, placeholder, category, original in page_rects:
+                page.add_redact_annot(
+                    rect, text=placeholder, fontsize=0,
+                    fill=(0, 0, 0), text_color=(1, 1, 1),
+                )
+            page.apply_redactions()
+
+    # Add watermark on first page
+    first = doc[0]
+    first.insert_text(
+        (first.rect.width - 180, 20),
+        'DOKUMENT ZANONIMIZOWANY',
+        fontsize=8, color=(0.5, 0.5, 0.5),
+    )
+
+    doc.save(output_path, garbage=4, deflate=True)
+    doc.close()
+
+    # Merge redaction counts
+    seen = {}
+    for r in total_redactions:
+        key = r['original']
+        if key not in seen:
+            seen[key] = r
+        else:
+            seen[key]['occurrences'] += 1
+    return list(seen.values())
+
+
+def _is_scanned_pdf(filepath):
+    """Check if a PDF is scanned (image-only, no text layer)."""
+    try:
+        import fitz
+        doc = fitz.open(filepath)
+        for page in doc:
+            if page.get_text().strip():
+                doc.close()
+                return False
+        doc.close()
+        return True
+    except Exception:
+        return False
+
+
+def _redact_scanned_pdf(src_path, output_path, entities):
+    """Redact PII in a scanned PDF using OCR bounding boxes + blur."""
+    import fitz
+    from io import BytesIO
+    try:
+        import pytesseract
+        from PIL import Image, ImageFilter
+    except ImportError:
+        log.error('[doc_anonymizer] OCR redaction requires pytesseract + Pillow')
+        return []
+
+    # Build lookup of texts to redact
+    seen_texts = {}
+    for e in entities:
+        cat = _normalize_category(e.get('category', 'INNE_PII'))
+        txt = e.get('text', '').strip()
+        if txt and txt not in seen_texts:
+            seen_texts[txt] = cat
+
+    if not seen_texts:
+        # Nothing to redact, just copy
+        import shutil
+        shutil.copy2(src_path, output_path)
+        return []
+
+    # --- Categorize entities for targeted matching ---
+    # Person-related categories: individual word matching is safe (names are unique)
+    _PERSON_CATS = {'IMIE_NAZWISKO', 'LEKARZ', 'OSOBA'}
+    # Numeric categories: match digit portions only
+    _NUMERIC_CATS = {'PESEL', 'NIP', 'REGON', 'TELEFON', 'NUMER_KONTA'}
+    # Date category: match exact string
+    _DATE_CATS = {'DATA'}
+    # Remaining (addresses, institutions, etc.): phrase-level matching only
+
+    _SKIP_WORDS = {
+        'lek', 'dr', 'med', 'prof', 'mgr', 'inz', 'hab', 'doc',
+        'im', 'ul', 'al', 'os', 'pl', 'str', 'nr', 'tel', 'fax',
+        'sp', 'zoo', 'nip', 'regon', 'krs', 'www', 'com',
+    }
+
+    # Build targeted lookups
+    name_words = {}      # word -> [(entity_text, category)]
+    numeric_patterns = []  # (digits_str, entity_text, category)
+    date_strings = []    # (date_str, entity_text, category)
+    phrase_entities = []  # (words_list, entity_text, category)
+
+    for txt, cat in seen_texts.items():
+        if cat in _PERSON_CATS:
+            for word in txt.split():
+                w = word.strip('.,;:!?()[]/-').lower()
+                if len(w) >= 3 and w not in _SKIP_WORDS:
+                    if w not in name_words:
+                        name_words[w] = []
+                    name_words[w].append((txt, cat))
+        elif cat in _NUMERIC_CATS:
+            digits = re.sub(r'[^\d]', '', txt)
+            if len(digits) >= 7:
+                numeric_patterns.append((digits, txt, cat))
+        elif cat in _DATE_CATS:
+            date_strings.append((txt.strip(), txt, cat))
+        else:
+            # Addresses, institutions — phrase matching
+            words = [w.strip('.,;:!?()[]/-').lower()
+                     for w in txt.split() if len(w.strip('.,;:!?()[]/-')) >= 3]
+            words = [w for w in words if w not in _SKIP_WORDS]
+            if words:
+                phrase_entities.append((words, txt, cat))
+
+    doc = fitz.open(src_path)
+    total_redactions = []
+    blur_radius = 12
+
+    for page_idx, page in enumerate(doc):
+        dpi = 300
+        scale = dpi / 72
+        mat = fitz.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=mat)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+        ocr_data = pytesseract.image_to_data(
+            img, lang='pol+eng', config='--psm 6',
+            output_type=pytesseract.Output.DICT
+        )
+
+        blur_rects = []
+        matched_entities = set()
+        n_words = len(ocr_data['text'])
+
+        def _bbox(idx):
+            return (ocr_data['left'][idx], ocr_data['top'][idx],
+                    ocr_data['width'][idx], ocr_data['height'][idx])
+
+        def _add_rect(idx, pad=4):
+            x, y, w, h = _bbox(idx)
+            blur_rects.append((
+                max(0, x - pad), max(0, y - pad),
+                min(img.width, x + w + pad), min(img.height, y + h + pad)
+            ))
+
+        def _add_span(start, count, pad=4):
+            x0 = min(ocr_data['left'][start + j] for j in range(count))
+            y0 = min(ocr_data['top'][start + j] for j in range(count))
+            x1 = max(ocr_data['left'][start + j] + ocr_data['width'][start + j]
+                     for j in range(count))
+            y1 = max(ocr_data['top'][start + j] + ocr_data['height'][start + j]
+                     for j in range(count))
+            blur_rects.append((
+                max(0, x0 - pad), max(0, y0 - pad),
+                min(img.width, x1 + pad), min(img.height, y1 + pad)
+            ))
+
+        # 1) Person name words — match individual words
+        for i in range(n_words):
+            word = ocr_data['text'][i].strip()
+            if not word:
+                continue
+            word_lower = word.strip('.,;:!?()[]/-').lower()
+            if word_lower in name_words:
+                _add_rect(i)
+                for ent_txt, ent_cat in name_words[word_lower]:
+                    matched_entities.add((ent_txt, ent_cat))
+
+        # 2) Numeric IDs — match digit sequences against known IDs
+        for i in range(n_words):
+            word = ocr_data['text'][i].strip()
+            if not word:
+                continue
+            word_digits = re.sub(r'[^\d]', '', word)
+            if len(word_digits) < 7:
+                continue
+            for digits, ent_txt, ent_cat in numeric_patterns:
+                if digits in word_digits or word_digits in digits:
+                    _add_rect(i)
+                    matched_entities.add((ent_txt, ent_cat))
+                    break
+
+        # 3) Dates — match exact date strings in OCR
+        ocr_texts_lower = [ocr_data['text'][i].strip().lower() for i in range(n_words)]
+        for date_str, ent_txt, ent_cat in date_strings:
+            # Try single-word match (e.g. "10.10.2025")
+            date_lower = date_str.lower()
+            for i in range(n_words):
+                if ocr_texts_lower[i] == date_lower:
+                    _add_rect(i)
+                    matched_entities.add((ent_txt, ent_cat))
+            # Try two-word match (e.g. "10-10-" "2025")
+            for i in range(n_words - 1):
+                pair = ocr_texts_lower[i] + ocr_texts_lower[i + 1]
+                pair_sp = ocr_texts_lower[i] + ' ' + ocr_texts_lower[i + 1]
+                if date_lower == pair or date_lower == pair_sp:
+                    _add_span(i, 2)
+                    matched_entities.add((ent_txt, ent_cat))
+
+        # 4) Phrases (addresses, institutions) — require majority of words to match
+        # in a contiguous OCR window
+        for phrase_words, ent_txt, ent_cat in phrase_entities:
+            needed = max(2, len(phrase_words) * 2 // 3)  # at least 2/3 match
+            pw_set = set(phrase_words)
+            win = len(phrase_words) + 2  # allow a bit of slack
+            for i in range(n_words - needed + 1):
+                end = min(i + win, n_words)
+                window_words = set()
+                for j in range(i, end):
+                    w = ocr_data['text'][j].strip('.,;:!?()[]/-').lower()
+                    if w:
+                        window_words.add(w)
+                hits = pw_set & window_words
+                if len(hits) >= needed:
+                    _add_span(i, end - i)
+                    matched_entities.add((ent_txt, ent_cat))
+                    break
+
+        if not blur_rects:
+            continue
+
+        # Apply blur to all matched rectangles
+        for (x0, y0, x1, y1) in blur_rects:
+            if x1 <= x0 or y1 <= y0:
+                continue
+            crop = img.crop((x0, y0, x1, y1))
+            blurred = crop.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+            img.paste(blurred, (x0, y0))
+
+        for ent_txt, ent_cat in matched_entities:
+            total_redactions.append({
+                'original': ent_txt,
+                'placeholder': _PLACEHOLDER_MAP.get(ent_cat, '[DANE]'),
+                'category': ent_cat,
+                'occurrences': 1,
+            })
+
+        # Replace page image with blurred version (JPEG for smaller output)
+        buf = BytesIO()
+        img.save(buf, format='JPEG', quality=85, optimize=True)
+        buf.seek(0)
+
+        # Clear page and insert full blurred image
+        page.clean_contents()
+        page.insert_image(page.rect, stream=buf.getvalue())
+
+    # Add watermark on first page
     first = doc[0]
     first.insert_text(
         (first.rect.width - 180, 20),
@@ -658,6 +1364,11 @@ def _anonymize_docx_inplace(src_path, output_path, all_entities):
 _active_jobs = {}
 _jobs_lock = threading.Lock()
 
+# Sequential job queue — process one document at a time to save resources
+_job_queue = []       # list of (job_id, src_path, filename, ext, username)
+_queue_lock = threading.Lock()
+_worker_running = False
+
 
 def _cleanup_stuck_jobs():
     """Mark any 'processing' jobs as 'error' on startup (server crashed)."""
@@ -716,7 +1427,7 @@ def _run_anonymization(job_id, src_path, filename, file_ext, username):
         if not text_parts or all(not t.strip() for t in text_parts):
             raise ValueError(
                 'Nie udalo sie wyodrebnic tekstu z dokumentu. '
-                'Plik moze byc zeskanowany (obraz) - wymagane OCR.')
+                'Plik moze byc zeskanowany — OCR nie rozpoznal tekstu.')
 
         total_parts = len(text_parts)
         all_entities = []
@@ -750,6 +1461,8 @@ def _run_anonymization(job_id, src_path, filename, file_ext, username):
                        'Analiza LLM (dodatkowe imiona/nazwiska)...')
         try:
             llm_entities = _call_llm(full_text)
+            # Validate and filter LLM output (reject garbage, diagnoses, long text)
+            llm_entities = _validate_llm_entities(llm_entities)
             # Only add LLM entities not already found by regex/name detection
             existing_texts = {e['text'].lower() for e in all_entities}
             for le in llm_entities:
@@ -769,7 +1482,11 @@ def _run_anonymization(job_id, src_path, filename, file_ext, username):
         out_path = os.path.join(job, out_filename)
 
         if file_ext == '.pdf':
-            redact_repls = _redact_pdf(src_path, out_path, all_entities)
+            if _is_scanned_pdf(src_path):
+                log.info('[doc_anonymizer] Scanned PDF detected, using OCR redaction')
+                redact_repls = _redact_scanned_pdf(src_path, out_path, all_entities)
+            else:
+                redact_repls = _redact_pdf(src_path, out_path, all_entities)
             seen_repls = {}
             for r in redact_repls:
                 key = r['original']
@@ -832,12 +1549,42 @@ def _run_anonymization(job_id, src_path, filename, file_ext, username):
                 _active_jobs[job_id]['status'] = 'error'
 
 
+def _queue_worker():
+    """Process queued jobs one at a time."""
+    global _worker_running
+    while True:
+        with _queue_lock:
+            if not _job_queue:
+                _worker_running = False
+                return
+            job_args = _job_queue.pop(0)
+
+        job_id = job_args[0]
+        with _jobs_lock:
+            if job_id in _active_jobs:
+                _active_jobs[job_id]['status'] = 'processing'
+
+        _run_anonymization(*job_args)
+
+
+def _enqueue_job(job_id, src_path, filename, ext, username):
+    """Add a job to the sequential queue and start worker if needed."""
+    global _worker_running
+    with _queue_lock:
+        _job_queue.append((job_id, src_path, filename, ext, username))
+        if not _worker_running:
+            _worker_running = True
+            t = threading.Thread(target=_queue_worker, daemon=True)
+            t.start()
+
+
 # -- Routes -----------------------------------------------------------------
 
 @doc_anonymizer_bp.route('/upload', methods=['POST'])
 def anon_upload():
     """Upload a PDF/DOCX file for anonymization."""
     _ensure_jobs_dir()
+    _ensure_deps()
 
     if 'file' not in request.files:
         return jsonify({'error': 'No file uploaded'}), 400
@@ -851,15 +1598,20 @@ def anon_upload():
     if ext not in ('.pdf', '.docx', '.doc'):
         return jsonify({'error': 'Obslugiwane formaty: PDF, DOCX'}), 400
 
-    # Check AI Chat dependency
+    # Check AI Chat dependency — prefer Bielik for Polish PII
     try:
         from model_library import get_library
         lib = get_library()
+        downloaded = lib._config.get('downloaded', {})
+        has_bielik = any(
+            downloaded.get(bid) and os.path.isfile(downloaded[bid].get('path', ''))
+            for bid in ('bielik-7b-q8', 'bielik-7b-q4')
+        )
         active = lib.get_active_model()
-        if not active:
+        if not has_bielik and not active:
             return jsonify({
-                'error': 'Brak aktywnego modelu LLM. '
-                         'Otworz AI Assistant i pobierz model Bielik 7B.'
+                'error': 'Brak modelu LLM. '
+                         'Otwórz AI Assistant i pobierz model Bielik 7B.'
             }), 400
     except ImportError:
         return jsonify({
@@ -885,24 +1637,21 @@ def anon_upload():
         json.dump(meta, mf, ensure_ascii=False)
 
     with _jobs_lock:
-        _active_jobs[job_id] = {'status': 'processing', 'progress': 0}
+        _active_jobs[job_id] = {'status': 'queued', 'progress': 0}
 
-    t = threading.Thread(target=_run_anonymization,
-                         args=(job_id, src_path, filename, ext, username),
-                         daemon=True)
-    t.start()
+    _enqueue_job(job_id, src_path, filename, ext, username)
 
     return jsonify({'ok': True, 'job_id': job_id, 'filename': filename})
 
 
 @doc_anonymizer_bp.route('/jobs', methods=['GET'])
 def anon_jobs():
-    """List all anonymization jobs for the current user."""
+    """List all anonymization jobs for the current user, newest first."""
     _ensure_jobs_dir()
     username = _get_username()
     jobs = []
 
-    for entry in sorted(os.listdir(_JOBS_DIR), reverse=True):
+    for entry in os.listdir(_JOBS_DIR):
         meta_path = os.path.join(_JOBS_DIR, entry, 'meta.json')
         if not os.path.isfile(meta_path):
             continue
@@ -912,12 +1661,20 @@ def anon_jobs():
             if meta.get('username') == username or getattr(g, 'role', None) == 'admin':
                 with _jobs_lock:
                     live = _active_jobs.get(entry, {})
-                if live and meta.get('status') == 'processing':
-                    meta['progress'] = live.get('progress', 0)
-                    meta['message'] = live.get('message', '')
+                if live:
+                    live_status = live.get('status', '')
+                    if live_status == 'queued' and meta.get('status') == 'processing':
+                        meta['status'] = 'queued'
+                        meta['message'] = 'W kolejce...'
+                    elif meta.get('status') == 'processing':
+                        meta['progress'] = live.get('progress', 0)
+                        meta['message'] = live.get('message', '')
                 jobs.append(meta)
         except Exception:
             continue
+
+    # Sort by created_at descending (newest first)
+    jobs.sort(key=lambda j: j.get('created_at', 0), reverse=True)
 
     return jsonify({'items': jobs})
 
@@ -966,12 +1723,47 @@ def anon_delete_job(job_id):
 @doc_anonymizer_bp.route('/status', methods=['GET'])
 def anon_app_status():
     """Check app status and AI Chat dependency."""
+    import shutil
+
+    has_fitz = True
+    try:
+        import fitz  # noqa: F401
+    except ImportError:
+        has_fitz = False
+
+    has_pypdf2 = True
+    try:
+        import PyPDF2  # noqa: F401
+    except ImportError:
+        has_pypdf2 = False
+
+    has_pillow = True
+    try:
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        has_pillow = False
+
+    has_tesseract = bool(shutil.which('tesseract'))
+    has_pytesseract = True
+    try:
+        import pytesseract  # noqa: F401
+    except ImportError:
+        has_pytesseract = False
+
     result = {
         'installed': True,
         'ai_chat_available': False,
         'model_loaded': False,
         'active_model': None,
         'recommended_model': 'bielik-7b-q4',
+        'deps_ok': has_fitz and has_pypdf2 and has_pillow and bool(shutil.which('pdftotext')),
+        'has_fitz': has_fitz,
+        'has_pypdf2': has_pypdf2,
+        'has_pillow': has_pillow,
+        'has_pdftotext': bool(shutil.which('pdftotext')),
+        'has_ocr': has_tesseract and has_pytesseract,
+        'has_tesseract': has_tesseract,
+        'has_pytesseract': has_pytesseract,
     }
 
     try:
@@ -983,6 +1775,14 @@ def anon_app_status():
             result['active_model'] = active.get('name', active.get('id'))
         loaded_llm, loaded_id = lib.get_loaded_model()
         result['model_loaded'] = loaded_llm is not None
+
+        # Check for downloaded Bielik models (preferred for anonymization)
+        downloaded = lib._config.get('downloaded', {})
+        for bid in ('bielik-7b-q8', 'bielik-7b-q4'):
+            dl = downloaded.get(bid)
+            if dl and os.path.isfile(dl.get('path', '')):
+                result['bielik_model'] = bid
+                break
     except ImportError:
         pass
 
