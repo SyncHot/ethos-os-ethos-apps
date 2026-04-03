@@ -4167,208 +4167,128 @@ function _smRender(body) {
     }
 
 } // end _smRender
-    // ─── Section: Diagnostics ────────────────────────────
-    function renderDiagnosticsSection(el) {
-        const state = { disks: [], selectedDisk: null, activeTab: 'info', operation: null, pollTimer: null, logOffset: 0, smartData: null, history: [] };
-
-        function humanSize(b) {
-            if (b == null) return '—';
-            const n = Number(b); if (isNaN(n)) return String(b);
-            if (n >= 1e12) return (n / 1e12).toFixed(1) + ' TB';
-            if (n >= 1e9) return (n / 1e9).toFixed(1) + ' GB';
-            if (n >= 1e6) return (n / 1e6).toFixed(1) + ' MB';
-            return (n / 1024).toFixed(0) + ' KB';
-        }
-        function healthColor(disk) {
-            if (!disk.smart_available) return '#888';
-            if (disk.pending_sectors > 0) return '#ef4444';
-            if (disk.reallocated_sectors > 0) return '#f59e0b';
-            if (disk.smart_healthy === false) return '#ef4444';
-            return '#10b981';
-        }
-        function tempColor(t) { if (t == null) return ''; if (t > 60) return '#ef4444'; if (t > 50) return '#f59e0b'; return '#10b981'; }
-        function isRunning() { return state.operation && (state.operation.status === 'running' || state.operation.status === 'starting'); }
-        function escHtml(s) { if (!s) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-        el.innerHTML = `
-        <div class="dr-wrap">
-            <div class="dr-sidebar">
-                <div class="dr-sidebar-header">
-                    <span><i class="fas fa-hard-drive"></i> Dyski</span>
-                    <button class="dr-btn dr-btn-sm dr-btn-outline" id="dr-refresh-disks" title="${t('Odśwież')}"><i class="fas fa-sync-alt"></i></button>
-                </div>
-                <div class="dr-disk-list" id="dr-disk-list"></div>
-            </div>
-            <div class="dr-main">
-                <div class="dr-banner" id="dr-banner">
-                    <i class="fas fa-cog fa-spin" style="color:var(--accent);font-size:18px"></i>
-                    <div class="dr-banner-info">
-                        <div class="dr-banner-title" id="dr-banner-title"></div>
-                        <div class="dr-banner-progress"><div class="dr-banner-bar" id="dr-banner-bar"></div></div>
-                        <div class="dr-banner-detail" id="dr-banner-detail"></div>
+        /* ─── Tab: Check ─── */
+        function renderCheckTab(cEl) {
+            const d = state.selectedDisk;
+            const parts = (d.partitions || []).filter(p => p.fstype);
+            cEl.innerHTML = `
+                <div class="dr-card"><div class="dr-card-title"><i class="fas fa-search"></i> ${t('Sprawdzanie systemu plików (fsck)')}</div>
+                    ${parts.length ? `
+                    <div class="dr-row" style="margin-bottom:12px">
+                        <select class="dr-select" id="dr-check-part" style="flex:1">
+                            <option value="">— ${t('Wybierz partycję')} —</option>
+                            ${parts.map(p => `<option value="${escHtml(p.name)}">/dev/${escHtml(p.name)} (${escHtml(p.fstype)}, ${humanSize(p.size)})</option>`).join('')}
+                        </select>
+                        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary);cursor:pointer"><input type="checkbox" id="dr-check-repair"> ${t('Napraw (fsck -y)')}</label>
                     </div>
-                    <button class="dr-btn dr-btn-sm dr-btn-danger" id="dr-banner-cancel"><i class="fas fa-stop"></i> Anuluj</button>
+                    <div class="dr-row"><button class="dr-btn" id="dr-check-start" ${isRunning() ? 'disabled' : ''}><i class="fas fa-play"></i> Rozpocznij sprawdzanie</button></div>
+                    ` : `<div class="dr-nodata">${t('Brak partycji z systemem plików')}</div>`}
                 </div>
-                <div class="dr-tabs" id="dr-tabs">
-                    <div class="dr-tab active" data-tab="info"><i class="fas fa-info-circle"></i> Info</div>
-                    <div class="dr-tab" data-tab="smart"><i class="fas fa-heartbeat"></i> SMART</div>
-                    <div class="dr-tab" data-tab="check"><i class="fas fa-search"></i> ${t('Sprawdź')}</div>
-                    <div class="dr-tab" data-tab="repair"><i class="fas fa-wrench"></i> Naprawa</div>
-                    <div class="dr-tab" data-tab="history"><i class="fas fa-clock-rotate-left"></i> Historia</div>
-                </div>
-                <div class="dr-content" id="dr-content">
-                    <div class="dr-empty"><i class="fas fa-hard-drive"></i><span>Wybierz dysk z listy</span></div>
-                </div>
-            </div>
-        </div>`;
-
-        const $ = s => el.querySelector(s);
-        const $$ = s => el.querySelectorAll(s);
-
-        /* ─── Load disks ─── */
-        async function loadDisks() {
-            try {
-                const data = await api('/diskrepair/disks');
-                state.disks = data || [];
-                renderDiskList();
-                if (state.selectedDisk) {
-                    const still = state.disks.find(d => d.name === state.selectedDisk.name);
-                    if (still) state.selectedDisk = still;
-                }
-            } catch (e) { toast(t('Błąd ładowania dysków: ') + e.message, 'error'); }
-        }
-
-        function renderDiskList() {
-            const list = $('#dr-disk-list');
-            if (!state.disks.length) { list.innerHTML = `<div class="dr-nodata"><i class="fas fa-info-circle"></i> ${t('Nie znaleziono dysków')}</div>`; return; }
-            list.innerHTML = state.disks.map(d => {
-                const sel = state.selectedDisk && state.selectedDisk.name === d.name;
-                const icon = (d.rotational === false || (d.model && /ssd|nvme/i.test(d.model))) ? 'fa-microchip' : 'fa-hard-drive';
-                const hc = healthColor(d);
-                const tc = tempColor(d.temperature);
-                return `<div class="dr-disk-item ${sel ? 'active' : ''}" data-disk="${escHtml(d.name)}">
-                    <i class="fas ${icon} dr-disk-icon"></i>
-                    <div class="dr-disk-meta">
-                        <div class="dr-disk-model">${escHtml(d.model || d.name)}</div>
-                        <div class="dr-disk-size">${humanSize(d.size)}</div>
+                <div id="dr-check-progress" style="display:none">
+                    <div class="dr-card"><div class="dr-card-title"><i class="fas fa-cog fa-spin"></i> ${t('Postęp')}</div>
+                        <div class="dr-progress-outer"><div class="dr-progress-inner" id="dr-check-bar"></div><div class="dr-progress-text" id="dr-check-pct">0%</div></div>
+                        <div class="dr-log" id="dr-check-log"></div>
+                        <div style="margin-top:10px"><button class="dr-btn dr-btn-sm dr-btn-danger" id="dr-check-cancel"><i class="fas fa-stop"></i> Anuluj</button></div>
                     </div>
-                    ${d.temperature != null ? `<span class="dr-temp-badge" style="color:${sel ? '#fff' : tc}">${d.temperature}°C</span>` : ''}
-                    <span class="dr-health-dot" style="background:${hc}" title="${d.smart_healthy === false ? 'FAILING' : d.smart_healthy ? 'OK' : '?'}"></span>
                 </div>`;
-            }).join('');
-            list.querySelectorAll('.dr-disk-item').forEach(item => {
-                item.onclick = () => {
-                    const name = item.dataset.disk;
-                    const disk = state.disks.find(d => d.name === name);
-                    if (disk) selectDisk(disk);
+            const startBtn = cEl.querySelector('#dr-check-start');
+            if (startBtn) {
+                startBtn.onclick = () => {
+                    const part = cEl.querySelector('#dr-check-part').value;
+                    const repair = cEl.querySelector('#dr-check-repair').checked;
+                    if (!part) { toast(t('Wybierz partycję'), 'warning'); return; }
+                    startFsck(part, repair);
                 };
-            });
-        }
-
-        function selectDisk(disk) { state.selectedDisk = disk; state.smartData = null; renderDiskList(); renderTab(); }
-
-        /* ─── Tabs ─── */
-        $$('.dr-tab').forEach(tab => {
-            tab.onclick = () => {
-                state.activeTab = tab.dataset.tab;
-                $$('.dr-tab').forEach(t => t.classList.toggle('active', t === tab));
-                renderTab();
-            };
-        });
-
-        function renderTab() {
-            const content = $('#dr-content');
-            if (!state.selectedDisk) { content.innerHTML = '<div class="dr-empty"><i class="fas fa-hard-drive"></i><span>Wybierz dysk z listy</span></div>'; return; }
-            switch (state.activeTab) {
-                case 'info': renderInfoTab(content); break;
-                case 'smart': renderSmartTab(content); break;
-                case 'check': renderCheckTab(content); break;
-                case 'repair': renderRepairTab(content); break;
-                case 'history': renderHistoryTab(content); break;
+            }
+            const cancelBtn = cEl.querySelector('#dr-check-cancel');
+            if (cancelBtn) cancelBtn.onclick = cancelOperation;
+            if (isRunning() && state.operation && state.operation.operation === 'fsck') {
+                const wrap = cEl.querySelector('#dr-check-progress'); if (wrap) wrap.style.display = '';
             }
         }
 
-        /* ─── Tab: Info ─── */
-        function renderInfoTab(cEl) {
-            const d = state.selectedDisk;
-            const noSmart = !d.smart_available;
-            cEl.innerHTML = `
-                <div class="dr-card">
-                    <div class="dr-card-title"><i class="fas fa-hard-drive"></i> Informacje o dysku</div>
-                    <div class="dr-kv">
-                        <span class="dr-kv-label">${t('Urządzenie')}</span><span class="dr-kv-value">/dev/${escHtml(d.name)}</span>
-                        <span class="dr-kv-label">Model</span><span class="dr-kv-value">${escHtml(d.model || '—')}</span>
-                        <span class="dr-kv-label">Rozmiar</span><span class="dr-kv-value">${humanSize(d.size)}</span>
-                        <span class="dr-kv-label">SMART</span><span class="dr-kv-value">${noSmart ? `<span style="color:#f59e0b">${t('Niedostępny')}</span>` : (d.smart_healthy ? '<span style="color:#10b981">Zdrowy</span>' : '<span style="color:#ef4444">Problemy!</span>')}</span>
-                        <span class="dr-kv-label">Temperatura</span><span class="dr-kv-value">${d.temperature != null ? d.temperature + '°C' : '—'}</span>
-                        <span class="dr-kv-label">Godziny pracy</span><span class="dr-kv-value">${d.power_on_hours != null ? d.power_on_hours.toLocaleString() + ' h' : '—'}</span>
-                        <span class="dr-kv-label">Realokowane sektory</span><span class="dr-kv-value">${d.reallocated_sectors != null ? `<span style="color:${d.reallocated_sectors > 0 ? '#f59e0b' : '#10b981'}">${d.reallocated_sectors}</span>` : '—'}</span>
-                        <span class="dr-kv-label">${t('Oczekujące sektory')}</span><span class="dr-kv-value">${d.pending_sectors != null ? `<span style="color:${d.pending_sectors > 0 ? '#ef4444' : '#10b981'}">${d.pending_sectors}</span>` : '—'}</span>
-                    </div>
-                </div>
-                ${noSmart ? `<div class="dr-warning"><i class="fas fa-exclamation-triangle"></i> ${t('SMART niedostępny dla tego dysku (dyski USB mogą nie obsługiwać SMART).')}</div>` : ''}
-                <div class="dr-card">
-                    <div class="dr-card-title"><i class="fas fa-table-cells"></i> Partycje</div>
-                    ${d.partitions && d.partitions.length ? `
-                    <table class="dr-table">
-                        <thead><tr><th>${t('Nazwa')}</th><th>${t('Rozmiar')}</th><th>${t('System plików')}</th><th>${t('Punkt montowania')}</th><th>Status</th><th></th></tr></thead>
-                        <tbody>${d.partitions.map(p => `<tr>
-                            <td>/dev/${escHtml(p.name)}</td><td>${humanSize(p.size)}</td><td>${escHtml(p.fstype || '—')}</td><td>${escHtml(p.mountpoint || '—')}</td>
-                            <td>${p.mounted ? '<span style="color:#10b981"><i class="fas fa-circle" style="font-size:8px"></i> Zamontowany</span>' : '<span style="color:var(--text-muted)"><i class="far fa-circle" style="font-size:8px"></i> Niezamontowany</span>'}</td>
-                            <td><button class="dr-btn dr-btn-sm dr-btn-outline dr-part-check" data-part="${escHtml(p.name)}" ${isRunning() ? 'disabled' : ''}><i class="fas fa-search"></i> ${t('Sprawdź')}</button></td>
-                        </tr>`).join('')}</tbody>
-                    </table>` : '<div class="dr-nodata">Brak partycji</div>'}
-                </div>`;
-            cEl.querySelectorAll('.dr-part-check').forEach(btn => { btn.onclick = () => startFsck(btn.dataset.part, false); });
-        }
-
-        /* ─── Tab: SMART ─── */
-        async function renderSmartTab(cEl) {
-            const d = state.selectedDisk;
-            if (!d.smart_available) { cEl.innerHTML = `<div class="dr-warning"><i class="fas fa-exclamation-triangle"></i> ${t('SMART niedostępny dla tego dysku.')}</div>`; return; }
-            cEl.innerHTML = `<div class="dr-nodata"><i class="fas fa-spinner fa-spin"></i> ${t('Ładowanie danych SMART...')}</div>`;
-            try {
-                const smart = await api(`/diskrepair/smart/${d.name}`);
-                state.smartData = smart;
-                const healthy = smart.health && /passed|ok/i.test(smart.health);
-                cEl.innerHTML = `
-                    <div class="dr-health-big">
-                        <i class="fas ${healthy ? 'fa-check-circle' : 'fa-exclamation-triangle'} dr-health-icon" style="color:${healthy ? '#10b981' : '#ef4444'}"></i>
-                        <div><div class="dr-health-text" style="color:${healthy ? '#10b981' : '#ef4444'}">${healthy ? 'SMART: Zdrowy' : 'SMART: Problemy wykryte!'}</div><div style="font-size:12px;color:var(--text-muted)">${escHtml(smart.health || '')}</div></div>
-                    </div>
-                    <div class="dr-metrics">
-                        <div class="dr-metric"><div class="dr-metric-value" style="color:${tempColor(smart.temperature)}">${smart.temperature != null ? smart.temperature + '°C' : '—'}</div><div class="dr-metric-label">Temperatura</div></div>
-                        <div class="dr-metric"><div class="dr-metric-value">${smart.power_on_hours != null ? smart.power_on_hours.toLocaleString() : '—'}</div><div class="dr-metric-label">Godziny pracy</div></div>
-                        <div class="dr-metric"><div class="dr-metric-value">${smart.power_cycle_count != null ? smart.power_cycle_count.toLocaleString() : '—'}</div><div class="dr-metric-label">Cykle zasilania</div></div>
-                    </div>
-                    ${smart.attributes && smart.attributes.length ? `
-                    <div class="dr-card"><div class="dr-card-title"><i class="fas fa-list"></i> Atrybuty SMART</div>
-                        <div style="overflow-x:auto"><table class="dr-table">
-                            <thead><tr><th>ID</th><th>${t('Nazwa')}</th><th>${t('Wartość')}</th><th>${t('Najgorsza')}</th><th>${t('Próg')}</th><th>Raw</th><th>Status</th></tr></thead>
-                            <tbody>${smart.attributes.map(a => {
-                                const failing = a.thresh && a.value && Number(a.value) <= Number(a.thresh);
-                                const warn = a.name && /reallocat|pending|uncorrect/i.test(a.name) && Number(a.raw) > 0;
-                                const color = failing ? '#ef4444' : warn ? '#f59e0b' : '#10b981';
-                                return `<tr><td>${escHtml(a.id)}</td><td>${escHtml(a.name)}</td><td>${escHtml(a.value)}</td><td>${escHtml(a.worst)}</td><td>${escHtml(a.thresh)}</td><td style="font-family:monospace">${escHtml(a.raw)}</td><td><span class="dr-smart-status" style="background:${color}"></span></td></tr>`;
-                            }).join('')}</tbody>
-                        </table></div>
-                    </div>` : ''}
-                    ${smart.error_log ? `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-exclamation-circle"></i> ${t('Log błędów')}</div><pre style="font-size:11px;color:var(--text-muted);white-space:pre-wrap;margin:0">${escHtml(smart.error_log)}</pre></div>` : ''}
-                    ${smart.self_test_log ? `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-vial"></i> ${t('Log testów')}</div><pre style="font-size:11px;color:var(--text-muted);white-space:pre-wrap;margin:0">${escHtml(smart.self_test_log)}</pre></div>` : ''}
-                    <div class="dr-row" style="margin-top:8px">
-                        <button class="dr-btn" id="dr-smart-short" ${isRunning() ? 'disabled' : ''}><i class="fas fa-bolt"></i> ${t('Test krótki')}</button>
-                        <button class="dr-btn dr-btn-warn" id="dr-smart-long" ${isRunning() ? 'disabled' : ''}><i class="fas fa-clock"></i> ${t('Test długi')}</button>
-                    </div>`;
-                const shortBtn = cEl.querySelector('#dr-smart-short');
-                const longBtn = cEl.querySelector('#dr-smart-long');
-                if (shortBtn) shortBtn.onclick = () => startSmartTest('short');
-                if (longBtn) longBtn.onclick = () => startSmartTest('long');
-            } catch (e) { cEl.innerHTML = `<div class="dr-warning"><i class="fas fa-times-circle"></i> ${t('Błąd ładowania SMART:')} ${escHtml(e.message)}</div>`; }
-        }
-
-        async function startSmartTest(type) {
+        async function startFsck(partition, repair) {
             if (isRunning()) { toast('Inna operacja w toku', 'warning'); return; }
+            try { await api('/diskrepair/fsck', { method: 'POST', body: { partition, repair } }); toast(t('Sprawdzanie rozpoczęte'), 'info'); state.logOffset = 0; startPolling(); } catch (e) { toast(t('Błąd: ') + e.message, 'error'); }
+        }
+
+        /* ─── Tab: Repair ─── */
+        function renderRepairTab(cEl) {
             const d = state.selectedDisk;
-            try { const r = await api('/diskrepair/smart-test', { method: 'POST', body: { disk: d.name, type } }); toast(r.message || 'Test SMART uruchomiony', 'success'); } catch (e) { toast(t('Błąd: ') + e.message, 'error'); }
+            const parts = (d.partitions || []).filter(p => p.fstype);
+            cEl.innerHTML = `
+                <div class="dr-warning"><i class="fas fa-exclamation-triangle"></i> ${t('Operacje naprawcze mogą trwać bardzo długo i mogą uszkodzić dane. Upewnij się, że masz kopię zapasową!')}</div>
+                <div class="dr-card"><div class="dr-card-title"><i class="fas fa-search-plus"></i> ${t('Skanowanie uszkodzonych sektorów (badblocks)')}</div>
+                    <div class="dr-row" style="margin-bottom:10px">
+                        <span style="font-size:12px;color:var(--text-secondary)">Dysk:</span>
+                        <strong style="font-size:12px;color:var(--text-primary)">/dev/${escHtml(d.name)}</strong>
+                        <select class="dr-select" id="dr-bb-mode">
+                            <option value="readonly">Tylko odczyt (bezpieczny)</option>
+                            <option value="nondestructive">Niedestrukcyjny zapis</option>
+                        </select>
+                    </div>
+                    <div class="dr-warning"><i class="fas fa-clock"></i> ${t('Badblocks może trwać wiele godzin, w zależności od rozmiaru dysku.')}</div>
+                    <button class="dr-btn dr-btn-warn" id="dr-bb-start" ${isRunning() ? 'disabled' : ''}><i class="fas fa-play"></i> Rozpocznij skanowanie</button>
+                </div>
+                <div class="dr-card"><div class="dr-card-title"><i class="fas fa-wrench"></i> ${t('Naprawa systemu plików')}</div>
+                    ${parts.length ? `
+                    <div class="dr-row" style="margin-bottom:10px">
+                        <select class="dr-select" id="dr-repair-part" style="flex:1">
+                            <option value="">— ${t('Wybierz partycję')} —</option>
+                            ${parts.map(p => `<option value="${escHtml(p.name)}">/dev/${escHtml(p.name)} (${escHtml(p.fstype)}, ${humanSize(p.size)})${p.mounted ? ' [' + t('zamontowany') + ']' : ''}</option>`).join('')}
+                        </select>
+                        <button class="dr-btn dr-btn-sm dr-btn-outline" id="dr-repair-unmount"><i class="fas fa-eject"></i> Odmontuj</button>
+                        <button class="dr-btn dr-btn-danger" id="dr-repair-start" ${isRunning() ? 'disabled' : ''}><i class="fas fa-wrench"></i> Napraw (fsck -y)</button>
+                    </div>
+                    ` : `<div class="dr-nodata">${t('Brak partycji z systemem plików')}</div>`}
+                </div>
+                <div id="dr-repair-progress" style="display:none">
+                    <div class="dr-card"><div class="dr-card-title"><i class="fas fa-cog fa-spin"></i> ${t('Postęp operacji')}</div>
+                        <div class="dr-progress-outer"><div class="dr-progress-inner" id="dr-repair-bar"></div><div class="dr-progress-text" id="dr-repair-pct">0%</div></div>
+                        <div class="dr-log" id="dr-repair-log"></div>
+                        <div style="margin-top:10px"><button class="dr-btn dr-btn-sm dr-btn-danger" id="dr-repair-cancel"><i class="fas fa-stop"></i> Anuluj</button></div>
+                    </div>
+                </div>`;
+            const bbStartBtn = cEl.querySelector('#dr-bb-start');
+            if (bbStartBtn) bbStartBtn.onclick = () => { const mode = cEl.querySelector('#dr-bb-mode').value; startBadblocks(state.selectedDisk.name, mode); };
+            const repairStartBtn = cEl.querySelector('#dr-repair-start');
+            if (repairStartBtn) repairStartBtn.onclick = () => { const part = cEl.querySelector('#dr-repair-part').value; if (!part) { toast(t('Wybierz partycję'), 'warning'); return; } startFsck(part, true); };
+            const unmountBtn = cEl.querySelector('#dr-repair-unmount');
+            if (unmountBtn) unmountBtn.onclick = async () => {
+                const part = cEl.querySelector('#dr-repair-part').value;
+                if (!part) { toast(t('Wybierz partycję'), 'warning'); return; }
+                try { await api('/diskrepair/unmount', { method: 'POST', body: { partition: part } }); toast('Odmontowano /dev/' + part, 'success'); await loadDisks(); renderTab(); } catch (e) { toast(t('Błąd odmontowywania: ') + e.message, 'error'); }
+            };
+            const repairCancel = cEl.querySelector('#dr-repair-cancel');
+            if (repairCancel) repairCancel.onclick = cancelOperation;
+            if (isRunning()) { const wrap = cEl.querySelector('#dr-repair-progress'); if (wrap) wrap.style.display = ''; }
+        }
+
+        async function startBadblocks(disk, mode) {
+            if (isRunning()) { toast('Inna operacja w toku', 'warning'); return; }
+            try { await api('/diskrepair/badblocks', { method: 'POST', body: { disk, mode } }); toast(t('Skanowanie badblocks rozpoczęte'), 'info'); state.logOffset = 0; startPolling(); } catch (e) { toast(t('Błąd: ') + e.message, 'error'); }
+        }
+
+        /* ─── Tab: History ─── */
+        async function renderHistoryTab(cEl) {
+            cEl.innerHTML = `<div class="dr-nodata"><i class="fas fa-spinner fa-spin"></i> ${t('Ładowanie...')}</div>`;
+            try {
+                const data = await api('/diskrepair/history');
+                state.history = data || [];
+                if (!state.history.length) { cEl.innerHTML = '<div class="dr-nodata"><i class="fas fa-clock-rotate-left"></i> Brak historii operacji</div>'; return; }
+                cEl.innerHTML = `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-clock-rotate-left"></i> Historia operacji</div>
+                    ${state.history.slice().reverse().map(h => {
+                        const ok = h.success || h.result === 'success';
+                        const icon = ok ? 'fa-check-circle' : 'fa-times-circle';
+                        const color = ok ? '#10b981' : '#ef4444';
+                        const ts = h.timestamp ? new Date(typeof h.timestamp === 'number' && h.timestamp < 1e12 ? h.timestamp * 1000 : h.timestamp).toLocaleString(getLocale()) : '';
+                        return `<div class="dr-hist-item">
+                            <i class="fas ${icon} dr-hist-icon" style="color:${color}"></i>
+                            <div class="dr-hist-meta"><div style="font-weight:500;color:var(--text-primary)">${escHtml(h.operation || h.type || '?')} — ${escHtml(h.disk || h.partition || '')}</div><div style="font-size:11px;color:var(--text-muted)">${escHtml(h.message || h.detail || '')}</div></div>
+                            <div class="dr-hist-time">${ts}</div>
+                        </div>`;
+                    }).join('')}
+                </div>`;
+            } catch (e) { cEl.innerHTML = `<div class="dr-warning"><i class="fas fa-times-circle"></i> ${t('Błąd:')} ${escHtml(e.message)}</div>`; }
         }
 
