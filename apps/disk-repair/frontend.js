@@ -5306,3 +5306,92 @@ function renderStorageManager(body) {
             };
         };
 
+        /* ─── LUKS Encryption ─── */
+        $('#st-encrypt-btn').onclick = async () => {
+            if (!state.selected) return;
+            const drive = state.drives.find(d => d.name === state.selected);
+            if (!drive) return;
+            const dev = `/dev/${drive.name}`;
+
+            if (drive.fstype === 'crypto_LUKS') {
+                const info = await api(`/encryption/status?device=${encodeURIComponent(dev)}`);
+                if (info.unlocked) {
+                    if (!await confirmDialog(t('Zablokować zaszyfrowany wolumen?'))) return;
+                    try {
+                        const r = await api('/encryption/lock', { method: 'POST', body: { device: dev } });
+                        if (r.error) { toast(r.error, 'error'); return; }
+                        toast(t('Wolumen zablokowany'), 'success'); loadDrives();
+                    } catch (e) { toast(e.message, 'error'); }
+                } else {
+                    showModal(t('Odblokuj wolumen'), `
+                        <div class="usr-form">
+                            <label>${t('Hasło szyfrowania')}</label>
+                            <input type="password" id="st-luks-pw" class="modal-input" autofocus>
+                            <label style="margin-top:8px">${t('Punkt montowania (opcjonalnie)')}</label>
+                            <input type="text" id="st-luks-mp" class="modal-input" placeholder="/mnt/encrypted" value="/mnt/encrypted">
+                        </div>`, [
+                        { label: t('Anuluj'), class: 'secondary' },
+                        { label: t('Odblokuj'), class: 'primary', action: async (m) => {
+                            const pw = m.querySelector('#st-luks-pw').value;
+                            const mp = m.querySelector('#st-luks-mp').value.trim();
+                            if (!pw) { toast(t('Podaj hasło'), 'warning'); return; }
+                            try {
+                                const r = await api('/encryption/unlock', { method: 'POST', body: { device: dev, passphrase: pw, mount: mp } });
+                                if (r.error) { toast(r.error, 'error'); return; }
+                                toast(t('Wolumen odblokowany'), 'success'); loadDrives();
+                            } catch (e) { toast(e.message, 'error'); }
+                        }}
+                    ]);
+                }
+            } else {
+                if (drive.mountpoint) { toast(t('Odmontuj dysk przed szyfrowaniem'), 'warning'); return; }
+                showModal(t('Szyfruj LUKS2 — ') + dev, `
+                    <div class="usr-form">
+                        <div class="st-fmt-system-info sto-sys-info-danger" style="margin-bottom:12px">
+                            <i class="fas fa-exclamation-triangle sto-text-danger"></i>
+                            <span class="sto-text-danger"><b>${t('UWAGA:')}</b> ${t('Wszystkie dane na urządzeniu zostaną usunięte!')}</span>
+                        </div>
+                        <label>${t('Hasło szyfrowania (min 8 znaków)')}</label>
+                        <input type="password" id="st-luks-pw1" class="modal-input">
+                        <label>${t('Powtórz hasło')}</label>
+                        <input type="password" id="st-luks-pw2" class="modal-input">
+                        <label>${t('Etykieta')}</label>
+                        <input type="text" id="st-luks-label" class="modal-input" value="encrypted" maxlength="32">
+                        <label>${t('System plików')}</label>
+                        <select id="st-luks-fs" class="modal-input">
+                            <option value="btrfs">Btrfs</option>
+                            <option value="ext4">ext4</option>
+                            <option value="xfs">XFS</option>
+                        </select>
+                        <label style="margin-top:8px"><input type="checkbox" id="st-luks-auto"> ${t('Auto-odblokuj przy starcie (keyfile)')}</label>
+                    </div>`, [
+                    { label: t('Anuluj'), class: 'secondary' },
+                    { label: t('Szyfruj'), class: 'danger', action: async (m) => {
+                        const pw1 = m.querySelector('#st-luks-pw1').value;
+                        const pw2 = m.querySelector('#st-luks-pw2').value;
+                        const label = m.querySelector('#st-luks-label').value.trim() || 'encrypted';
+                        const fs = m.querySelector('#st-luks-fs').value;
+                        const autoUnlock = m.querySelector('#st-luks-auto').checked;
+                        if (!pw1 || pw1.length < 8) { toast(t('Hasło min 8 znaków'), 'warning'); return; }
+                        if (pw1 !== pw2) { toast(t('Hasła nie pasują'), 'warning'); return; }
+                        try {
+                            const r = await api('/encryption/encrypt', { method: 'POST', body: { device: dev, passphrase: pw1, label, filesystem: fs } });
+                            if (r.error) { toast(r.error, 'error'); return; }
+                            toast(t('Wolumen zaszyfrowany!'), 'success');
+                            if (autoUnlock) {
+                                await api('/encryption/auto-unlock', { method: 'PUT', body: { device: dev, passphrase: pw1, mount: `/mnt/${label}` } });
+                            }
+                            loadDrives();
+                        } catch (e) { toast(e.message, 'error'); }
+                    }}
+                ]);
+            }
+        };
+
+        /* ─── Init Disks Section ─── */
+        $('#st-refresh').onclick = () => loadDrives();
+        loadDrives();
+
+        return null;
+    }
+
