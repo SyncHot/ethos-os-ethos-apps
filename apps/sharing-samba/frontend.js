@@ -4167,360 +4167,208 @@ function _smRender(body) {
     }
 
 } // end _smRender
-    // ─── Section: Volumes/LVM ────────────────────────────
-    function renderVolumesSection(el) {
-        const state = { vgs: [], lvs: [], disks: [] };
-        function _esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    // ─── Section: Diagnostics ────────────────────────────
+    function renderDiagnosticsSection(el) {
+        const state = { disks: [], selectedDisk: null, activeTab: 'info', operation: null, pollTimer: null, logOffset: 0, smartData: null, history: [] };
 
-        el.innerHTML = `<div style="padding:16px">
-            <div class="raid-toolbar">
-                <button class="raid-btn" id="lvm-refresh"><i class="fas fa-sync-alt"></i> ${t('Refresh')}</button>
-                <div class="raid-toolbar-right"><span class="raid-status-text" id="lvm-status"></span></div>
+        function humanSize(b) {
+            if (b == null) return '—';
+            const n = Number(b); if (isNaN(n)) return String(b);
+            if (n >= 1e12) return (n / 1e12).toFixed(1) + ' TB';
+            if (n >= 1e9) return (n / 1e9).toFixed(1) + ' GB';
+            if (n >= 1e6) return (n / 1e6).toFixed(1) + ' MB';
+            return (n / 1024).toFixed(0) + ' KB';
+        }
+        function healthColor(disk) {
+            if (!disk.smart_available) return '#888';
+            if (disk.pending_sectors > 0) return '#ef4444';
+            if (disk.reallocated_sectors > 0) return '#f59e0b';
+            if (disk.smart_healthy === false) return '#ef4444';
+            return '#10b981';
+        }
+        function tempColor(t) { if (t == null) return ''; if (t > 60) return '#ef4444'; if (t > 50) return '#f59e0b'; return '#10b981'; }
+        function isRunning() { return state.operation && (state.operation.status === 'running' || state.operation.status === 'starting'); }
+        function escHtml(s) { if (!s) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+        el.innerHTML = `
+        <div class="dr-wrap">
+            <div class="dr-sidebar">
+                <div class="dr-sidebar-header">
+                    <span><i class="fas fa-hard-drive"></i> Dyski</span>
+                    <button class="dr-btn dr-btn-sm dr-btn-outline" id="dr-refresh-disks" title="${t('Odśwież')}"><i class="fas fa-sync-alt"></i></button>
+                </div>
+                <div class="dr-disk-list" id="dr-disk-list"></div>
             </div>
-            <div id="lvm-vg-section"></div>
-            <div id="lvm-lv-section"></div>
+            <div class="dr-main">
+                <div class="dr-banner" id="dr-banner">
+                    <i class="fas fa-cog fa-spin" style="color:var(--accent);font-size:18px"></i>
+                    <div class="dr-banner-info">
+                        <div class="dr-banner-title" id="dr-banner-title"></div>
+                        <div class="dr-banner-progress"><div class="dr-banner-bar" id="dr-banner-bar"></div></div>
+                        <div class="dr-banner-detail" id="dr-banner-detail"></div>
+                    </div>
+                    <button class="dr-btn dr-btn-sm dr-btn-danger" id="dr-banner-cancel"><i class="fas fa-stop"></i> Anuluj</button>
+                </div>
+                <div class="dr-tabs" id="dr-tabs">
+                    <div class="dr-tab active" data-tab="info"><i class="fas fa-info-circle"></i> Info</div>
+                    <div class="dr-tab" data-tab="smart"><i class="fas fa-heartbeat"></i> SMART</div>
+                    <div class="dr-tab" data-tab="check"><i class="fas fa-search"></i> ${t('Sprawdź')}</div>
+                    <div class="dr-tab" data-tab="repair"><i class="fas fa-wrench"></i> Naprawa</div>
+                    <div class="dr-tab" data-tab="history"><i class="fas fa-clock-rotate-left"></i> Historia</div>
+                </div>
+                <div class="dr-content" id="dr-content">
+                    <div class="dr-empty"><i class="fas fa-hard-drive"></i><span>Wybierz dysk z listy</span></div>
+                </div>
+            </div>
         </div>`;
 
         const $ = s => el.querySelector(s);
-        $('#lvm-refresh').onclick = loadLVM;
+        const $$ = s => el.querySelectorAll(s);
 
-        async function loadLVM() {
-            const statusEl = el.querySelector('#lvm-status');
-            if (statusEl) statusEl.textContent = t('Loading...');
+        /* ─── Load disks ─── */
+        async function loadDisks() {
             try {
-                const [vgs, lvs, disks] = await Promise.all([api('/raid/lvm/vgs'), api('/raid/lvm/lvs'), api('/raid/disks')]);
-                state.vgs = vgs || []; state.lvs = lvs || []; state.disks = disks || [];
-                if (statusEl) statusEl.textContent = `${state.vgs.length} VG, ${state.lvs.length} LV`;
-                renderVGSection(); renderLVSection();
-            } catch (e) { if (statusEl) statusEl.textContent = t('Error loading data'); }
+                const data = await api('/diskrepair/disks');
+                state.disks = data || [];
+                renderDiskList();
+                if (state.selectedDisk) {
+                    const still = state.disks.find(d => d.name === state.selectedDisk.name);
+                    if (still) state.selectedDisk = still;
+                }
+            } catch (e) { toast(t('Błąd ładowania dysków: ') + e.message, 'error'); }
         }
 
-        function renderVGSection() {
-            const area = el.querySelector('#lvm-vg-section');
-            if (!area) return;
-            area.innerHTML = `<div class="raid-lvm-section">
-                <div class="raid-section-title"><i class="fas fa-archive"></i> ${t('Volume Groups')}
-                    <button class="raid-btn raid-btn-sm raid-btn-primary" id="lvm-create-vg" style="margin-left:auto"><i class="fas fa-plus"></i> ${t('Create VG')}</button>
-                </div>
-                <div id="lvm-vg-wizard"></div>
-                ${state.vgs.length ? `<div class="raid-cards">${state.vgs.map(vg => `<div class="raid-card">
-                    <div class="raid-card-head">
-                        <div class="raid-card-icon" style="background:rgba(139,92,246,.12);color:#8b5cf6;"><i class="fas fa-archive"></i></div>
-                        <div><div class="raid-card-title">${_esc(vg.vg_name)}</div><div class="raid-card-sub">${_esc(vg.vg_size || '')}</div></div>
-                        <button class="raid-btn raid-btn-sm raid-btn-danger lvm-del-vg" data-vg="${_esc(vg.vg_name)}" style="margin-left:auto" title="${t('Delete VG')}"><i class="fas fa-trash"></i></button>
+        function renderDiskList() {
+            const list = $('#dr-disk-list');
+            if (!state.disks.length) { list.innerHTML = `<div class="dr-nodata"><i class="fas fa-info-circle"></i> ${t('Nie znaleziono dysków')}</div>`; return; }
+            list.innerHTML = state.disks.map(d => {
+                const sel = state.selectedDisk && state.selectedDisk.name === d.name;
+                const icon = (d.rotational === false || (d.model && /ssd|nvme/i.test(d.model))) ? 'fa-microchip' : 'fa-hard-drive';
+                const hc = healthColor(d);
+                const tc = tempColor(d.temperature);
+                return `<div class="dr-disk-item ${sel ? 'active' : ''}" data-disk="${escHtml(d.name)}">
+                    <i class="fas ${icon} dr-disk-icon"></i>
+                    <div class="dr-disk-meta">
+                        <div class="dr-disk-model">${escHtml(d.model || d.name)}</div>
+                        <div class="dr-disk-size">${humanSize(d.size)}</div>
                     </div>
-                    <div class="raid-card-body">
-                        <div class="raid-card-row"><span class="raid-card-label">${t('Free')}</span><span class="raid-card-val">${_esc(vg.vg_free || '')}</span></div>
-                        <div class="raid-card-row"><span class="raid-card-label">${t('PV Count')}</span><span class="raid-card-val">${_esc(vg.pv_count || '')}</span></div>
-                        <div class="raid-card-row"><span class="raid-card-label">${t('LV Count')}</span><span class="raid-card-val">${_esc(vg.lv_count || '')}</span></div>
-                    </div>
-                    ${(vg.pvs || []).length ? `<div class="raid-disk-map">${vg.pvs.map(p =>
-                        `<span class="raid-disk-chip"><span class="dot ok"></span>${_esc((p.pv_name || '').replace('/dev/', ''))}</span>`
-                    ).join('')}</div>` : ''}
-                </div>`).join('')}</div>` : `<div class="raid-empty"><i class="fas fa-archive"></i><span>${t('No volume groups')}</span></div>`}
-            </div>`;
-            area.querySelector('#lvm-create-vg').onclick = showCreateVGWizard;
-            area.querySelectorAll('.lvm-del-vg').forEach(btn => {
-                btn.onclick = async (e) => {
-                    e.stopPropagation();
-                    const vgName = btn.dataset.vg;
-                    if (!await confirmDialog(t('Potwierdzenie'), t('Delete volume group ') + vgName + '?')) return;
-                    try { const res = await api(`/raid/lvm/vg/${encodeURIComponent(vgName)}`, { method: 'DELETE' }); if (res.error) throw new Error(res.error); loadLVM(); } catch (e) { toast(t('Failed to delete VG: ') + (e.message || e), 'error'); }
+                    ${d.temperature != null ? `<span class="dr-temp-badge" style="color:${sel ? '#fff' : tc}">${d.temperature}°C</span>` : ''}
+                    <span class="dr-health-dot" style="background:${hc}" title="${d.smart_healthy === false ? 'FAILING' : d.smart_healthy ? 'OK' : '?'}"></span>
+                </div>`;
+            }).join('');
+            list.querySelectorAll('.dr-disk-item').forEach(item => {
+                item.onclick = () => {
+                    const name = item.dataset.disk;
+                    const disk = state.disks.find(d => d.name === name);
+                    if (disk) selectDisk(disk);
                 };
             });
         }
 
-        function showCreateVGWizard() {
-            const wizard = el.querySelector('#lvm-vg-wizard');
-            if (!wizard) return;
-            const available = state.disks;
-            wizard.innerHTML = `<div class="raid-wizard">
-                <div class="raid-wizard-title"><i class="fas fa-plus-circle"></i> ${t('Create Volume Group')}</div>
-                <div class="raid-form-row"><label>${t('VG Name')}</label><input class="fm-input" id="lvm-vg-name" placeholder="vg0" style="max-width:200px"></div>
-                <div style="margin-top:8px;margin-bottom:4px;font-size:12px;color:var(--text-muted)"><i class="fas fa-hdd"></i> ${t('Select physical volumes')} (${available.length} ${t('available')}):</div>
-                ${available.length ? `<div class="raid-disk-select" id="lvm-vg-disks">
-                    ${available.map(d => `<label class="raid-disk-opt"><input type="checkbox" value="${_esc(d.device)}"><span class="dname">${_esc(d.name)}</span><span class="dsize">${_esc(d.size)}</span></label>`).join('')}
-                </div>` : `<div class="raid-status-text">${t('No available disks')}</div>`}
-                <div class="raid-form-actions">
-                    <button class="raid-btn raid-btn-primary" id="lvm-vg-confirm" ${!available.length ? 'disabled' : ''}>${t('Create')}</button>
-                    <button class="raid-btn" id="lvm-vg-cancel">${t('Cancel')}</button>
-                </div>
-            </div>`;
-            wizard.querySelectorAll('.raid-disk-opt input[type="checkbox"]').forEach(cb => {
-                cb.onchange = () => cb.closest('.raid-disk-opt').classList.toggle('checked', cb.checked);
-            });
-            wizard.querySelector('#lvm-vg-cancel').onclick = () => { wizard.innerHTML = ''; };
-            wizard.querySelector('#lvm-vg-confirm').onclick = async () => {
-                const name = wizard.querySelector('#lvm-vg-name').value.trim();
-                const devices = [...wizard.querySelectorAll('#lvm-vg-disks input:checked')].map(cb => cb.value);
-                if (!name) { toast(t('VG name is required'), 'warning'); return; }
-                if (!devices.length) { toast(t('Select at least one device'), 'warning'); return; }
-                const btn = wizard.querySelector('#lvm-vg-confirm'); btn.disabled = true;
-                try { const res = await api('/raid/lvm/vg', { method: 'POST', body: { name, devices } }); if (res.error) throw new Error(res.error); wizard.innerHTML = ''; loadLVM(); } catch (e) { toast(t('Failed: ') + (e.message || e), 'error'); btn.disabled = false; }
+        function selectDisk(disk) { state.selectedDisk = disk; state.smartData = null; renderDiskList(); renderTab(); }
+
+        /* ─── Tabs ─── */
+        $$('.dr-tab').forEach(tab => {
+            tab.onclick = () => {
+                state.activeTab = tab.dataset.tab;
+                $$('.dr-tab').forEach(t => t.classList.toggle('active', t === tab));
+                renderTab();
             };
+        });
+
+        function renderTab() {
+            const content = $('#dr-content');
+            if (!state.selectedDisk) { content.innerHTML = '<div class="dr-empty"><i class="fas fa-hard-drive"></i><span>Wybierz dysk z listy</span></div>'; return; }
+            switch (state.activeTab) {
+                case 'info': renderInfoTab(content); break;
+                case 'smart': renderSmartTab(content); break;
+                case 'check': renderCheckTab(content); break;
+                case 'repair': renderRepairTab(content); break;
+                case 'history': renderHistoryTab(content); break;
+            }
         }
 
-        function renderLVSection() {
-            const area = el.querySelector('#lvm-lv-section');
-            if (!area) return;
-            area.innerHTML = `<div class="raid-lvm-section">
-                <div class="raid-section-title"><i class="fas fa-cube"></i> ${t('Logical Volumes')}
-                    <button class="raid-btn raid-btn-sm raid-btn-primary" id="lvm-create-lv" style="margin-left:auto" ${!state.vgs.length ? 'disabled' : ''}><i class="fas fa-plus"></i> ${t('Create LV')}</button>
+        /* ─── Tab: Info ─── */
+        function renderInfoTab(cEl) {
+            const d = state.selectedDisk;
+            const noSmart = !d.smart_available;
+            cEl.innerHTML = `
+                <div class="dr-card">
+                    <div class="dr-card-title"><i class="fas fa-hard-drive"></i> Informacje o dysku</div>
+                    <div class="dr-kv">
+                        <span class="dr-kv-label">${t('Urządzenie')}</span><span class="dr-kv-value">/dev/${escHtml(d.name)}</span>
+                        <span class="dr-kv-label">Model</span><span class="dr-kv-value">${escHtml(d.model || '—')}</span>
+                        <span class="dr-kv-label">Rozmiar</span><span class="dr-kv-value">${humanSize(d.size)}</span>
+                        <span class="dr-kv-label">SMART</span><span class="dr-kv-value">${noSmart ? `<span style="color:#f59e0b">${t('Niedostępny')}</span>` : (d.smart_healthy ? '<span style="color:#10b981">Zdrowy</span>' : '<span style="color:#ef4444">Problemy!</span>')}</span>
+                        <span class="dr-kv-label">Temperatura</span><span class="dr-kv-value">${d.temperature != null ? d.temperature + '°C' : '—'}</span>
+                        <span class="dr-kv-label">Godziny pracy</span><span class="dr-kv-value">${d.power_on_hours != null ? d.power_on_hours.toLocaleString() + ' h' : '—'}</span>
+                        <span class="dr-kv-label">Realokowane sektory</span><span class="dr-kv-value">${d.reallocated_sectors != null ? `<span style="color:${d.reallocated_sectors > 0 ? '#f59e0b' : '#10b981'}">${d.reallocated_sectors}</span>` : '—'}</span>
+                        <span class="dr-kv-label">${t('Oczekujące sektory')}</span><span class="dr-kv-value">${d.pending_sectors != null ? `<span style="color:${d.pending_sectors > 0 ? '#ef4444' : '#10b981'}">${d.pending_sectors}</span>` : '—'}</span>
+                    </div>
                 </div>
-                <div id="lvm-lv-wizard"></div>
-                ${state.lvs.length ? `<table class="raid-table">
-                    <thead><tr><th>${t('Name')}</th><th>${t('VG')}</th><th>${t('Size')}</th><th>${t('Path')}</th><th></th></tr></thead>
-                    <tbody>${state.lvs.map(lv => `<tr>
-                        <td><strong>${_esc(lv.lv_name)}</strong></td>
-                        <td>${_esc(lv.vg_name)}</td>
-                        <td>${_esc(lv.lv_size)}</td>
-                        <td><code style="font-size:11px">${_esc(lv.lv_path || `/dev/${lv.vg_name}/${lv.lv_name}`)}</code></td>
-                        <td><button class="raid-btn raid-btn-sm raid-btn-danger lvm-del-lv" data-vg="${_esc(lv.vg_name)}" data-lv="${_esc(lv.lv_name)}"><i class="fas fa-trash"></i></button></td>
-                    </tr>`).join('')}</tbody>
-                </table>` : `<div class="raid-empty" style="height:120px"><i class="fas fa-cube"></i><span>${t('No logical volumes')}</span></div>`}
-            </div>`;
-            area.querySelector('#lvm-create-lv').onclick = showCreateLVWizard;
-            area.querySelectorAll('.lvm-del-lv').forEach(btn => {
-                btn.onclick = async () => {
-                    const vg = btn.dataset.vg, lv = btn.dataset.lv;
-                    if (!await confirmDialog(t('Potwierdzenie'), t('Delete logical volume ') + vg + '/' + lv + '?')) return;
-                    try { const res = await api(`/raid/lvm/lv/${encodeURIComponent(vg)}/${encodeURIComponent(lv)}`, { method: 'DELETE' }); if (res.error) throw new Error(res.error); loadLVM(); } catch (e) { toast(t('Failed: ') + (e.message || e), 'error'); }
-                };
-            });
+                ${noSmart ? `<div class="dr-warning"><i class="fas fa-exclamation-triangle"></i> ${t('SMART niedostępny dla tego dysku (dyski USB mogą nie obsługiwać SMART).')}</div>` : ''}
+                <div class="dr-card">
+                    <div class="dr-card-title"><i class="fas fa-table-cells"></i> Partycje</div>
+                    ${d.partitions && d.partitions.length ? `
+                    <table class="dr-table">
+                        <thead><tr><th>${t('Nazwa')}</th><th>${t('Rozmiar')}</th><th>${t('System plików')}</th><th>${t('Punkt montowania')}</th><th>Status</th><th></th></tr></thead>
+                        <tbody>${d.partitions.map(p => `<tr>
+                            <td>/dev/${escHtml(p.name)}</td><td>${humanSize(p.size)}</td><td>${escHtml(p.fstype || '—')}</td><td>${escHtml(p.mountpoint || '—')}</td>
+                            <td>${p.mounted ? '<span style="color:#10b981"><i class="fas fa-circle" style="font-size:8px"></i> Zamontowany</span>' : '<span style="color:var(--text-muted)"><i class="far fa-circle" style="font-size:8px"></i> Niezamontowany</span>'}</td>
+                            <td><button class="dr-btn dr-btn-sm dr-btn-outline dr-part-check" data-part="${escHtml(p.name)}" ${isRunning() ? 'disabled' : ''}><i class="fas fa-search"></i> ${t('Sprawdź')}</button></td>
+                        </tr>`).join('')}</tbody>
+                    </table>` : '<div class="dr-nodata">Brak partycji</div>'}
+                </div>`;
+            cEl.querySelectorAll('.dr-part-check').forEach(btn => { btn.onclick = () => startFsck(btn.dataset.part, false); });
         }
 
-        function showCreateLVWizard() {
-            const wizard = el.querySelector('#lvm-lv-wizard');
-            if (!wizard) return;
-            wizard.innerHTML = `<div class="raid-wizard">
-                <div class="raid-wizard-title"><i class="fas fa-plus-circle"></i> ${t('Create Logical Volume')}</div>
-                <div class="raid-form-row"><label>${t('Volume Group')}</label>
-                    <select class="fm-input" id="lvm-lv-vg" style="max-width:200px">
-                        ${state.vgs.map(vg => `<option value="${_esc(vg.vg_name)}">${_esc(vg.vg_name)} (${_esc(vg.vg_free || '')} ${t('free')})</option>`).join('')}
-                    </select>
-                </div>
-                <div class="raid-form-row"><label>${t('LV Name')}</label><input class="fm-input" id="lvm-lv-name" placeholder="lv0" style="max-width:200px"></div>
-                <div class="raid-form-row"><label>${t('Size')}</label>
-                    <input class="fm-input" id="lvm-lv-size" placeholder="${t('e.g. 10G, 500M')}" style="max-width:160px">
-                    <label class="raid-disk-opt" style="padding:6px 10px"><input type="checkbox" id="lvm-lv-useall"> <span class="dname">${t('Use all free space')}</span></label>
-                </div>
-                <div class="raid-form-actions">
-                    <button class="raid-btn raid-btn-primary" id="lvm-lv-confirm">${t('Create')}</button>
-                    <button class="raid-btn" id="lvm-lv-cancel">${t('Cancel')}</button>
-                </div>
-            </div>`;
-            const useAllCb = wizard.querySelector('#lvm-lv-useall');
-            const sizeInput = wizard.querySelector('#lvm-lv-size');
-            useAllCb.onchange = () => { sizeInput.disabled = useAllCb.checked; if (useAllCb.checked) sizeInput.value = ''; };
-            wizard.querySelector('#lvm-lv-cancel').onclick = () => { wizard.innerHTML = ''; };
-            wizard.querySelector('#lvm-lv-confirm').onclick = async () => {
-                const vg_name = wizard.querySelector('#lvm-lv-vg').value;
-                const name = wizard.querySelector('#lvm-lv-name').value.trim();
-                const size = sizeInput.value.trim();
-                const use_all = useAllCb.checked;
-                if (!name) { toast(t('LV name is required'), 'warning'); return; }
-                if (!use_all && !size) { toast(t('Specify size or use all free space'), 'warning'); return; }
-                const btn = wizard.querySelector('#lvm-lv-confirm'); btn.disabled = true;
-                try { const res = await api('/raid/lvm/lv', { method: 'POST', body: { vg_name, name, size, use_all } }); if (res.error) throw new Error(res.error); wizard.innerHTML = ''; loadLVM(); } catch (e) { toast(t('Failed: ') + (e.message || e), 'error'); btn.disabled = false; }
-            };
-        }
-
-        loadLVM();
-        return null;
-    }
-
-    // ─── Section: Sharing ────────────────────────────────
-    function renderSharingSection(el) {
-        const $ = (s) => el.querySelector(s);
-
-        el.innerHTML = `<div class="shr-loading"><i class="fas fa-spinner fa-spin shr-spin-icon"></i>${t('Ładowanie…')}</div>`;
-
-        (async () => {
-            let installedProtos;
+        /* ─── Tab: SMART ─── */
+        async function renderSmartTab(cEl) {
+            const d = state.selectedDisk;
+            if (!d.smart_available) { cEl.innerHTML = `<div class="dr-warning"><i class="fas fa-exclamation-triangle"></i> ${t('SMART niedostępny dla tego dysku.')}</div>`; return; }
+            cEl.innerHTML = `<div class="dr-nodata"><i class="fas fa-spinner fa-spin"></i> ${t('Ładowanie danych SMART...')}</div>`;
             try {
-                const pkgs = await api('/ethos-packages');
-                const installed = new Set(pkgs.filter(p => p.installed).map(p => p.id));
-                installedProtos = _SH_ALL_PROTOS.filter(p => installed.has(p.pkgId));
-            } catch (e) {
-                installedProtos = _SH_ALL_PROTOS;
-            }
-
-            if (!installedProtos.length) {
-                el.innerHTML = `
-                <div class="shr-empty">
-                    <i class="fas fa-share-alt shr-empty-icon"></i>
-                    <h3 class="shr-empty-title">${t('Brak zainstalowanych protokołów')}</h3>
-                    <p class="shr-empty-text">
-                        ${t('Zainstaluj protokoły udostępniania (Samba, NFS, DLNA, WebDAV, SFTP, FTP) w')}
-                        <a href="#" id="sh-goto-store" class="shr-link">${t('App Store')}</a>.
-                    </p>
-                </div>`;
-                const link = $('#sh-goto-store');
-                if (link) link.onclick = (e) => { e.preventDefault(); if (typeof openApp === 'function') openApp('app-store'); };
-                return;
-            }
-
-            el.style.cssText = 'display:flex;flex-direction:row;overflow:hidden;padding:0;height:100%';
-            el.innerHTML = `
-                <div class="sh-sidebar shr-sidebar">
-                    ${installedProtos.map(p => `
-                        <button class="sh-tab shr-tab-btn" data-tab="${p.id}"><i class="fas ${p.icon} shr-tab-icon"></i><span>${p.label}</span></button>
-                    `).join('')}
-                </div>
-                <div id="sh-panel" class="shr-panel"></div>`;
-
-            let activeTab = null;
-
-            function switchTab(id) {
-                activeTab = id;
-                el.querySelectorAll('.sh-tab').forEach(b => {
-                    const active = b.dataset.tab === id;
-                    b.style.borderLeftColor = active ? '#6366f1' : 'transparent';
-                    b.style.color = active ? 'var(--text)' : 'var(--text-muted)';
-                    b.style.fontWeight = active ? '600' : '400';
-                    b.style.background = active ? 'rgba(99,102,241,.06)' : 'none';
-                });
-                const render = { samba: renderSamba, nfs: renderNFS, dlna: renderDLNA, webdav: renderWebDAV, sftp: renderSFTP, ftp: renderFTP };
-                (render[id] || render.samba)($('#sh-panel'));
-            }
-
-            el.querySelectorAll('.sh-tab').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
-            switchTab(installedProtos[0].id);
-
-            /* ── SAMBA ── */
-            function renderSamba(panel) {
-                const st = { shares: [] };
-                panel.innerHTML = `
-                <div class="shr-header">
-                    <span class="shr-title"><i class="fab fa-windows shr-icon-accent"></i>Samba</span>
-                    <span id="sh-smb-status"></span>
-                    <div class="shr-spacer"></div>
-                    <button class="fm-toolbar-btn btn-green" id="sh-smb-add"><i class="fas fa-plus"></i> ${t('Dodaj')}</button>
-                    <button class="fm-toolbar-btn" id="sh-smb-ref" title="${t('Odśwież')}"><i class="fas fa-sync-alt"></i></button>
-                </div>
-                <div id="sh-smb-list"></div>
-                <div id="sh-smb-form" style="display:none"></div>
-                <div class="shr-pw-section">
-                    <h4 class="shr-form-title"><i class="fas fa-key shr-icon-warn"></i> ${t('Hasło Samba')}</h4>
-                    <div class="shr-pw-row">
-                        <input type="text" id="sh-smb-pwu" class="fm-input" placeholder="${t('Użytkownik')}" style="width:140px">
-                        <input type="password" id="sh-smb-pwp" class="fm-input" placeholder="${t('Hasło')}" style="width:160px">
-                        <button class="fm-toolbar-btn btn-green" id="sh-smb-pwb"><i class="fas fa-save"></i> ${t('Ustaw')}</button>
+                const smart = await api(`/diskrepair/smart/${d.name}`);
+                state.smartData = smart;
+                const healthy = smart.health && /passed|ok/i.test(smart.health);
+                cEl.innerHTML = `
+                    <div class="dr-health-big">
+                        <i class="fas ${healthy ? 'fa-check-circle' : 'fa-exclamation-triangle'} dr-health-icon" style="color:${healthy ? '#10b981' : '#ef4444'}"></i>
+                        <div><div class="dr-health-text" style="color:${healthy ? '#10b981' : '#ef4444'}">${healthy ? 'SMART: Zdrowy' : 'SMART: Problemy wykryte!'}</div><div style="font-size:12px;color:var(--text-muted)">${escHtml(smart.health || '')}</div></div>
                     </div>
-                </div>`;
+                    <div class="dr-metrics">
+                        <div class="dr-metric"><div class="dr-metric-value" style="color:${tempColor(smart.temperature)}">${smart.temperature != null ? smart.temperature + '°C' : '—'}</div><div class="dr-metric-label">Temperatura</div></div>
+                        <div class="dr-metric"><div class="dr-metric-value">${smart.power_on_hours != null ? smart.power_on_hours.toLocaleString() : '—'}</div><div class="dr-metric-label">Godziny pracy</div></div>
+                        <div class="dr-metric"><div class="dr-metric-value">${smart.power_cycle_count != null ? smart.power_cycle_count.toLocaleString() : '—'}</div><div class="dr-metric-label">Cykle zasilania</div></div>
+                    </div>
+                    ${smart.attributes && smart.attributes.length ? `
+                    <div class="dr-card"><div class="dr-card-title"><i class="fas fa-list"></i> Atrybuty SMART</div>
+                        <div style="overflow-x:auto"><table class="dr-table">
+                            <thead><tr><th>ID</th><th>${t('Nazwa')}</th><th>${t('Wartość')}</th><th>${t('Najgorsza')}</th><th>${t('Próg')}</th><th>Raw</th><th>Status</th></tr></thead>
+                            <tbody>${smart.attributes.map(a => {
+                                const failing = a.thresh && a.value && Number(a.value) <= Number(a.thresh);
+                                const warn = a.name && /reallocat|pending|uncorrect/i.test(a.name) && Number(a.raw) > 0;
+                                const color = failing ? '#ef4444' : warn ? '#f59e0b' : '#10b981';
+                                return `<tr><td>${escHtml(a.id)}</td><td>${escHtml(a.name)}</td><td>${escHtml(a.value)}</td><td>${escHtml(a.worst)}</td><td>${escHtml(a.thresh)}</td><td style="font-family:monospace">${escHtml(a.raw)}</td><td><span class="dr-smart-status" style="background:${color}"></span></td></tr>`;
+                            }).join('')}</tbody>
+                        </table></div>
+                    </div>` : ''}
+                    ${smart.error_log ? `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-exclamation-circle"></i> ${t('Log błędów')}</div><pre style="font-size:11px;color:var(--text-muted);white-space:pre-wrap;margin:0">${escHtml(smart.error_log)}</pre></div>` : ''}
+                    ${smart.self_test_log ? `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-vial"></i> ${t('Log testów')}</div><pre style="font-size:11px;color:var(--text-muted);white-space:pre-wrap;margin:0">${escHtml(smart.self_test_log)}</pre></div>` : ''}
+                    <div class="dr-row" style="margin-top:8px">
+                        <button class="dr-btn" id="dr-smart-short" ${isRunning() ? 'disabled' : ''}><i class="fas fa-bolt"></i> ${t('Test krótki')}</button>
+                        <button class="dr-btn dr-btn-warn" id="dr-smart-long" ${isRunning() ? 'disabled' : ''}><i class="fas fa-clock"></i> ${t('Test długi')}</button>
+                    </div>`;
+                const shortBtn = cEl.querySelector('#dr-smart-short');
+                const longBtn = cEl.querySelector('#dr-smart-long');
+                if (shortBtn) shortBtn.onclick = () => startSmartTest('short');
+                if (longBtn) longBtn.onclick = () => startSmartTest('long');
+            } catch (e) { cEl.innerHTML = `<div class="dr-warning"><i class="fas fa-times-circle"></i> ${t('Błąd ładowania SMART:')} ${escHtml(e.message)}</div>`; }
+        }
 
-                async function load() {
-                    try {
-                        const [shares, status] = await Promise.all([api('/storage/samba/shares'), api('/storage/samba/status')]);
-                        st.shares = shares || [];
-                        panel.querySelector('#sh-smb-status').innerHTML = _shBadge(status.running);
-                        renderList();
-                    } catch (e) { panel.querySelector('#sh-smb-list').innerHTML = `<div class="shr-error">${t('Błąd')}: ${e.message}</div>`; }
-                }
-
-                function renderList() {
-                    const w = panel.querySelector('#sh-smb-list');
-                    if (!st.shares.length) { w.innerHTML = `<div class="shr-empty-msg">${t('Brak udziałów')}</div>`; return; }
-                    w.innerHTML = `<table class="shr-table">
-                        <thead><tr class="shr-thead-row">
-                            <th class="shr-th">${t('Nazwa')}</th><th class="shr-th">${t('Ścieżka')}</th>
-                            <th class="shr-td-center">${t('Gość')}</th><th class="shr-td-center">${t('Zapis')}</th><th></th>
-                        </tr></thead><tbody>${st.shares.map(s => `<tr class="shr-tr">
-                            <td class="shr-td-name">${_shEsc(s.name)}</td>
-                            <td class="shr-td-sec">${_shEsc(s.path)}</td>
-                            <td class="shr-td-center">${s.guest_ok ? '<i class="fas fa-check shr-check-ok"></i>' : '<i class="fas fa-times shr-check-no"></i>'}</td>
-                            <td class="shr-td-center">${s.writable ? '<i class="fas fa-check shr-check-ok"></i>' : '<i class="fas fa-times shr-check-no"></i>'}</td>
-                            <td class="shr-td-actions">
-                                <button class="fm-toolbar-btn btn-sm sh-sma" data-name="${_shEscAttr(s.name)}" title="${t('Uprawnienia')}"><i class="fas fa-shield-alt"></i></button>
-                                <button class="fm-toolbar-btn btn-sm sh-sme" data-name="${_shEscAttr(s.name)}" data-path="${_shEscAttr(s.path)}" data-guest="${s.guest_ok}" data-writable="${s.writable}"><i class="fas fa-pen"></i></button>
-                                <button class="fm-toolbar-btn btn-sm btn-red sh-smd" data-name="${_shEscAttr(s.name)}"><i class="fas fa-trash"></i></button>
-                            </td></tr>`).join('')}</tbody></table>`;
-                    w.querySelectorAll('.sh-sma').forEach(b => b.onclick = () => showAclEditor(b.dataset.name));
-                    w.querySelectorAll('.sh-sme').forEach(b => b.onclick = () => showForm({ name: b.dataset.name, path: b.dataset.path, guest_ok: b.dataset.guest === 'true', writable: b.dataset.writable === 'true' }));
-                    w.querySelectorAll('.sh-smd').forEach(b => b.onclick = async () => { if (!await confirmDialog(t('Usunąć udział'), t('Usunąć') + ` "${b.dataset.name}"?`)) return; await api('/storage/samba/share', { method: 'DELETE', body: { name: b.dataset.name } }); toast(t('Usunięto'), 'success'); load(); });
-                }
-
-                function showForm(s) {
-                    const f = panel.querySelector('#sh-smb-form');
-                    f.style.display = '';
-                    f.innerHTML = `<div class="shr-form-section">
-                        <h4 class="shr-form-title">${s ? t('Edytuj') : t('Nowy udział')}</h4>
-                        <div class="shr-form-row">
-                            <input type="text" id="sh-sf-n" class="fm-input" placeholder="${t('Nazwa')}" value="${s?.name || ''}" style="width:140px" ${s ? 'readonly' : ''}>
-                            <div class="shr-input-group"><input type="text" id="sh-sf-p" class="fm-input" placeholder="${t('Ścieżka')}" value="${s?.path || ''}" style="width:200px;border-radius:6px 0 0 6px" readonly><button class="fm-toolbar-btn shr-input-group-btn" id="sh-sf-browse" title="${t('Przeglądaj')}"><i class="fas fa-folder-open"></i></button></div>
-                            <label class="shr-checkbox-label"><input type="checkbox" id="sh-sf-g" ${!s || s.guest_ok ? 'checked' : ''}> ${t('Gość')}</label>
-                            <label class="shr-checkbox-label"><input type="checkbox" id="sh-sf-w" ${!s || s.writable ? 'checked' : ''}> ${t('Zapis')}</label>
-                            <button class="fm-toolbar-btn btn-green" id="sh-sf-ok"><i class="fas fa-save"></i></button>
-                            <button class="fm-toolbar-btn" id="sh-sf-x"><i class="fas fa-times"></i></button>
-                        </div></div>`;
-                    panel.querySelector('#sh-sf-browse').onclick = () => openDirPicker(panel.querySelector('#sh-sf-p').value || '/home', t('Wybierz folder'), p => { panel.querySelector('#sh-sf-p').value = p; });
-                    panel.querySelector('#sh-sf-ok').onclick = async () => {
-                        const n = panel.querySelector('#sh-sf-n').value.trim(), p = panel.querySelector('#sh-sf-p').value.trim();
-                        if (!n || !p) { toast(t('Podaj nazwę i ścieżkę'), 'warning'); return; }
-                        try {
-                            const resp = await api('/storage/samba/share', { method: 'POST', body: { name: n, path: p, guest_ok: panel.querySelector('#sh-sf-g').checked, writable: panel.querySelector('#sh-sf-w').checked } });
-                            if (resp.error) { toast(t('Błąd: ') + resp.error, 'error'); return; }
-                            toast(t('Udział zapisany'), 'success'); f.style.display = 'none'; load();
-                        } catch (e) { toast(t('Błąd zapisu: ') + (e.message || 'nieznany'), 'error'); }
-                    };
-                    panel.querySelector('#sh-sf-x').onclick = () => { f.style.display = 'none'; };
-                }
-
-                async function showAclEditor(shareName) {
-                    let acl, users, groups;
-                    try {
-                        const [aclRes, usersRes, groupsRes] = await Promise.all([
-                            api('/storage/samba/share/acl?name=' + encodeURIComponent(shareName)),
-                            api('/users/list'), api('/users/groups'),
-                        ]);
-                        acl = aclRes.acl || { users: {}, groups: {} };
-                        users = (Array.isArray(usersRes) ? usersRes : []).map(u => u.username);
-                        groups = (groupsRes.groups || []).map(g => g.name);
-                    } catch (e) { toast(t('Błąd ładowania ACL'), 'error'); return; }
-                    const permOpts = (current) => ['rw', 'ro', 'none'].map(p =>
-                        `<option value="${p}" ${current === p ? 'selected' : ''}>${p === 'rw' ? t('Odczyt/Zapis') : p === 'ro' ? t('Tylko odczyt') : t('Brak dostępu')}</option>`
-                    ).join('');
-                    let userRows = users.map(u => `<tr><td style="padding:4px 8px">${_shEsc(u)}</td><td style="padding:4px"><select class="fm-input acl-u" data-name="${_shEscAttr(u)}" style="width:160px">${permOpts(acl.users[u] || '')}<option value="" ${!acl.users[u] ? 'selected' : ''}>—</option></select></td></tr>`).join('');
-                    let groupRows = groups.map(g => `<tr><td style="padding:4px 8px">@${_shEsc(g)}</td><td style="padding:4px"><select class="fm-input acl-g" data-name="${_shEscAttr(g)}" style="width:160px">${permOpts(acl.groups[g] || '')}<option value="" ${!acl.groups[g] ? 'selected' : ''}>—</option></select></td></tr>`).join('');
-                    showModal(t('Uprawnienia — ') + shareName, `
-                        <div style="max-height:400px;overflow-y:auto">
-                            <h4 style="margin:0 0 8px;font-size:13px;color:var(--text-secondary)"><i class="fas fa-user"></i> ${t('Użytkownicy')}</h4>
-                            <table style="width:100%;margin-bottom:12px">${userRows || '<tr><td style="color:var(--text-muted);padding:8px">' + t('Brak użytkowników') + '</td></tr>'}</table>
-                            <h4 style="margin:0 0 8px;font-size:13px;color:var(--text-secondary)"><i class="fas fa-users"></i> ${t('Grupy')}</h4>
-                            <table style="width:100%">${groupRows || '<tr><td style="color:var(--text-muted);padding:8px">' + t('Brak grup') + '</td></tr>'}</table>
-                            <p style="font-size:11px;color:var(--text-muted);margin-top:8px"><i class="fas fa-info-circle"></i> ${t('Puste = domyślnie (wszyscy mogą). Ustaw jawnie aby ograniczyć.')}</p>
-                        </div>
-                    `, [
-                        { label: t('Anuluj'), class: 'secondary' },
-                        { label: t('Resetuj ACL'), class: 'warning', action: async () => {
-                            if (!await confirmDialog(t('Usunąć wszystkie uprawnienia dla tego udziału?'))) return;
-                            await api('/storage/samba/share/acl', { method: 'DELETE', body: { name: shareName } });
-                            toast(t('ACL usunięte'), 'success');
-                        }},
-                        { label: t('Zapisz'), class: 'primary', action: async (modal) => {
-                            const newAcl = { users: {}, groups: {} };
-                            modal.querySelectorAll('.acl-u').forEach(sel => { if (sel.value) newAcl.users[sel.dataset.name] = sel.value; });
-                            modal.querySelectorAll('.acl-g').forEach(sel => { if (sel.value) newAcl.groups[sel.dataset.name] = sel.value; });
-                            try {
-                                const r = await api('/storage/samba/share/acl', { method: 'PUT', body: { name: shareName, ...newAcl } });
-                                if (r.error) { toast(r.error, 'error'); return; }
-                                toast(t('Uprawnienia zapisane'), 'success');
-                            } catch (e) { toast(e.message, 'error'); }
-                        }}
-                    ]);
-                }
-
-                panel.querySelector('#sh-smb-add').onclick = () => showForm(null);
-                panel.querySelector('#sh-smb-ref').onclick = () => load();
-                panel.querySelector('#sh-smb-pwb').onclick = async () => {
-                    const u = panel.querySelector('#sh-smb-pwu').value.trim(), p = panel.querySelector('#sh-smb-pwp').value;
-                    if (!u || !p) { toast(t('Podaj użytkownika i hasło'), 'warning'); return; }
-                    try {
-                        const resp = await api('/storage/samba/password', { method: 'POST', body: { username: u, password: p } });
-                        if (resp.error) { toast(t('Błąd: ') + resp.error, 'error'); return; }
-                        toast(t('Hasło ustawione'), 'success'); panel.querySelector('#sh-smb-pwp').value = '';
-                    } catch(e) { toast(t('Błąd ustawiania hasła: ') + e.message, 'error'); }
-                };
-                load();
-            }
+        async function startSmartTest(type) {
+            if (isRunning()) { toast('Inna operacja w toku', 'warning'); return; }
+            const d = state.selectedDisk;
+            try { const r = await api('/diskrepair/smart-test', { method: 'POST', body: { disk: d.name, type } }); toast(r.message || 'Test SMART uruchomiony', 'success'); } catch (e) { toast(t('Błąd: ') + e.message, 'error'); }
+        }
 

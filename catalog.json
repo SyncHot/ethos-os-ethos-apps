@@ -234,7 +234,7 @@
         {
             "id": "disk-repair",
             "name": "Disk Repair",
-            "version": "1.0.4",
+            "version": "1.0.5",
             "icon": "fa-wrench",
             "color": "#ef4444",
             "category": "Storage",
@@ -267,7 +267,7 @@
         {
             "id": "sharing-samba",
             "name": "File Sharing (Samba)",
-            "version": "1.0.4",
+            "version": "1.0.5",
             "icon": "fa-windows",
             "color": "#6366f1",
             "category": "Network",
@@ -284,7 +284,7 @@
         {
             "id": "sharing-nfs",
             "name": "NFS",
-            "version": "1.0.4",
+            "version": "1.0.5",
             "icon": "fa-network-wired",
             "color": "#6366f1",
             "category": "Network",
@@ -301,7 +301,7 @@
         {
             "id": "sharing-dlna",
             "name": "DLNA (MiniDLNA)",
-            "version": "1.0.4",
+            "version": "1.0.5",
             "icon": "fa-photo-video",
             "color": "#6366f1",
             "category": "Media",
@@ -318,7 +318,7 @@
         {
             "id": "sharing-webdav",
             "name": "WebDAV",
-            "version": "1.0.4",
+            "version": "1.0.5",
             "icon": "fa-globe",
             "color": "#6366f1",
             "category": "Network",
@@ -335,7 +335,7 @@
         {
             "id": "sharing-sftp",
             "name": "SFTP",
-            "version": "1.0.4",
+            "version": "1.0.5",
             "icon": "fa-lock",
             "color": "#6366f1",
             "category": "Network",
@@ -352,7 +352,7 @@
         {
             "id": "sharing-ftp",
             "name": "FTP",
-            "version": "1.0.4",
+            "version": "1.0.5",
             "icon": "fa-upload",
             "color": "#6366f1",
             "category": "Network",
@@ -416,7 +416,7 @@
         {
             "id": "raid-lvm",
             "name": "RAID / LVM",
-            "version": "1.0.3",
+            "version": "1.0.4",
             "icon": "fa-layer-group",
             "color": "#f59e0b",
             "category": "Storage",
