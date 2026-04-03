@@ -4167,1231 +4167,360 @@ function _smRender(body) {
     }
 
 } // end _smRender
-function renderStorageManager(body) {
-    let _cleanup = null;
+    // ─── Section: Volumes/LVM ────────────────────────────
+    function renderVolumesSection(el) {
+        const state = { vgs: [], lvs: [], disks: [] };
+        function _esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
-    /* ── Inline CSS for sidebar + raid + diagnostics ── */
-    body.innerHTML = `
-    <style>
-        /* ── Sidebar layout ── */
-        .sm-wrap { display:flex; height:100%; overflow:hidden; }
-        .sm-sidebar { width:210px; min-width:210px; background:var(--bg-secondary); border-right:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; }
-        .sm-sidebar-header { padding:16px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:10px; }
-        .sm-sidebar-icon { font-size:24px; color:var(--accent); }
-        .sm-sidebar-title { font-weight:700; font-size:14px; color:var(--text-primary); }
-        .sm-sidebar-sub { font-size:11px; color:var(--text-muted); }
-        .sm-nav { flex:1; overflow-y:auto; padding:8px; }
-        .sm-nav-item { display:flex; align-items:center; gap:10px; padding:9px 12px; border-radius:8px; cursor:pointer; color:var(--text-muted); font-size:13px; font-weight:500; transition:all .15s; text-decoration:none; margin-bottom:2px; }
-        .sm-nav-item:hover { background:var(--bg-card); color:var(--text-primary); }
-        .sm-nav-item.active { background:var(--accent); color:#fff; }
-        .sm-nav-item i { width:18px; text-align:center; font-size:14px; }
-        .sm-nav-sep { height:1px; background:var(--border); margin:8px 12px; }
-        .sm-content { flex:1; overflow-y:auto; overflow-x:hidden; }
-
-        /* ── RAID CSS ── */
-        .raid-wrap { display:flex; flex-direction:column; height:100%; overflow:hidden; }
-        .raid-tabs { display:flex; border-bottom:1px solid var(--border); padding:0 16px; background:var(--bg-secondary); flex-shrink:0; }
-        .raid-tab { padding:10px 18px; font-size:12px; font-weight:500; color:var(--text-muted); cursor:pointer; border-bottom:2px solid transparent; transition:color .15s, border-color .15s; white-space:nowrap; display:flex; align-items:center; gap:6px; }
-        .raid-tab:hover { color:var(--text-primary); }
-        .raid-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
-        .raid-content { flex:1; overflow-y:auto; padding:16px; }
-        .raid-toolbar { display:flex; align-items:center; gap:8px; margin-bottom:14px; flex-wrap:wrap; }
-        .raid-toolbar-right { margin-left:auto; display:flex; gap:8px; align-items:center; }
-        .raid-status-text { font-size:12px; color:var(--text-muted); }
-        .raid-cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:12px; }
-        .raid-card { background:var(--bg-card); border-radius:10px; border:1px solid var(--border); padding:16px; cursor:pointer; transition:all .15s; }
-        .raid-card:hover { border-color:rgba(79,140,255,.3); background:rgba(79,140,255,.03); }
-        .raid-card.selected { border-color:var(--accent)!important; box-shadow:0 0 0 1px var(--accent); }
-        .raid-card-head { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
-        .raid-card-icon { width:40px; height:40px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:18px; flex-shrink:0; }
-        .raid-card-title { font-weight:600; font-size:13px; color:var(--text-primary); }
-        .raid-card-sub { font-size:11px; color:var(--text-muted); }
-        .raid-card-body { font-size:12px; }
-        .raid-card-row { display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid var(--border); }
-        .raid-card-row:last-child { border-bottom:none; }
-        .raid-card-label { color:var(--text-muted); }
-        .raid-card-val { color:var(--text-primary); font-weight:500; }
-        .raid-badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.3px; }
-        .raid-badge-active { background:rgba(34,197,94,.15); color:#22c55e; }
-        .raid-badge-degraded { background:rgba(245,158,11,.15); color:#f59e0b; }
-        .raid-badge-rebuilding { background:rgba(59,130,246,.15); color:#3b82f6; }
-        .raid-badge-inactive { background:rgba(107,114,128,.15); color:#6b7280; }
-        .raid-badge-clean { background:rgba(34,197,94,.15); color:#22c55e; }
-        .raid-badge-spare { background:rgba(139,92,246,.15); color:#8b5cf6; }
-        .raid-badge-faulty { background:rgba(239,68,68,.15); color:#ef4444; }
-        .raid-progress { height:6px; background:var(--bg-primary); border-radius:3px; overflow:hidden; margin-top:6px; }
-        .raid-progress-bar { height:100%; background:linear-gradient(90deg, var(--accent), #6366f1); border-radius:3px; transition:width .5s; }
-        .raid-progress-label { font-size:10px; color:var(--text-muted); margin-top:4px; }
-        .raid-disk-map { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
-        .raid-disk-chip { display:inline-flex; align-items:center; gap:4px; padding:4px 10px; border-radius:6px; font-size:11px; font-weight:500; background:var(--bg-primary); border:1px solid var(--border); }
-        .raid-disk-chip .dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
-        .raid-disk-chip .dot.ok { background:#22c55e; }
-        .raid-disk-chip .dot.spare { background:#8b5cf6; }
-        .raid-disk-chip .dot.faulty { background:#ef4444; }
-        .raid-disk-chip .dot.rebuilding { background:#3b82f6; animation:raidPulse 1.5s infinite; }
-        @keyframes raidPulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-        .raid-detail { background:var(--bg-card); border-radius:10px; border:1px solid var(--border); padding:16px; margin-top:14px; }
-        .raid-detail-head { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
-        .raid-detail-title { font-weight:600; font-size:14px; color:var(--text-primary); flex:1; }
-        .raid-detail-actions { display:flex; gap:6px; }
-        .raid-table { width:100%; border-collapse:collapse; font-size:12px; }
-        .raid-table th { text-align:left; font-weight:600; padding:8px 10px; border-bottom:2px solid var(--border); color:var(--text-secondary); font-size:11px; text-transform:uppercase; letter-spacing:.3px; }
-        .raid-table td { padding:7px 10px; border-bottom:1px solid var(--border); color:var(--text-primary); }
-        .raid-table tr:last-child td { border-bottom:none; }
-        .raid-wizard { background:var(--bg-card); border-radius:10px; border:1px solid var(--border); padding:20px; margin-bottom:14px; }
-        .raid-wizard-title { font-weight:600; font-size:14px; color:var(--text-primary); margin-bottom:14px; display:flex; align-items:center; gap:8px; }
-        .raid-form-row { display:flex; gap:12px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
-        .raid-form-row label { font-size:12px; color:var(--text-muted); min-width:100px; }
-        .raid-form-row .fm-input { flex:1; min-width:120px; }
-        .raid-disk-select { display:flex; flex-wrap:wrap; gap:6px; }
-        .raid-disk-opt { display:flex; align-items:center; gap:6px; padding:8px 12px; border-radius:8px; background:var(--bg-primary); border:1px solid var(--border); cursor:pointer; font-size:12px; transition:all .15s; }
-        .raid-disk-opt:hover { border-color:var(--accent); }
-        .raid-disk-opt.checked { border-color:var(--accent); background:rgba(79,140,255,.08); }
-        .raid-disk-opt input { accent-color:var(--accent); }
-        .raid-disk-opt .dname { font-weight:600; color:var(--text-primary); }
-        .raid-disk-opt .dsize { color:var(--text-muted); margin-left:4px; }
-        .raid-form-actions { display:flex; gap:8px; margin-top:14px; }
-        .raid-level-info { font-size:11px; color:var(--text-muted); padding:6px 10px; background:var(--bg-primary); border-radius:6px; margin-bottom:10px; }
-        .raid-lvm-section { margin-bottom:20px; }
-        .raid-section-title { font-weight:600; font-size:13px; color:var(--text-primary); margin-bottom:10px; display:flex; align-items:center; gap:8px; }
-        .raid-empty { display:flex; align-items:center; justify-content:center; height:200px; color:var(--text-muted); font-size:14px; flex-direction:column; gap:8px; }
-        .raid-empty i { font-size:40px; opacity:.4; }
-        .raid-btn { padding:6px 14px; border-radius:6px; font-size:12px; font-weight:500; cursor:pointer; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); transition:all .15s; }
-        .raid-btn:hover { border-color:var(--accent); color:var(--accent); }
-        .raid-btn-primary { background:var(--accent); color:#fff; border-color:var(--accent); }
-        .raid-btn-primary:hover { opacity:.85; }
-        .raid-btn-danger { color:#ef4444; border-color:rgba(239,68,68,.3); }
-        .raid-btn-danger:hover { background:rgba(239,68,68,.1); border-color:#ef4444; }
-        .raid-btn-sm { padding:4px 10px; font-size:11px; }
-        .raid-btn:disabled { opacity:.4; cursor:not-allowed; }
-
-        /* ── Diagnostics CSS ── */
-        .dr-wrap { display:flex; height:100%; overflow:hidden; }
-        .dr-sidebar { width:250px; min-width:250px; background:var(--bg-secondary); border-right:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; }
-        .dr-sidebar-header { display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid var(--border); }
-        .dr-sidebar-header span { font-weight:600; font-size:13px; color:var(--text-primary); }
-        .dr-disk-list { flex:1; overflow-y:auto; padding:6px; }
-        .dr-disk-item { display:flex; align-items:center; gap:10px; padding:10px; border-radius:8px; cursor:pointer; margin-bottom:4px; transition:background .15s; }
-        .dr-disk-item:hover { background:var(--bg-card); }
-        .dr-disk-item.active { background:var(--accent); color:#fff; }
-        .dr-disk-item.active .dr-disk-model { color:#fff; }
-        .dr-disk-item.active .dr-disk-size { color:rgba(255,255,255,.7); }
-        .dr-disk-item.active .dr-temp-badge { background:rgba(255,255,255,.2); color:#fff; }
-        .dr-disk-icon { font-size:22px; width:28px; text-align:center; flex-shrink:0; }
-        .dr-disk-meta { flex:1; min-width:0; }
-        .dr-disk-model { font-size:12px; font-weight:600; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        .dr-disk-size { font-size:11px; color:var(--text-muted); }
-        .dr-health-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
-        .dr-temp-badge { font-size:10px; padding:2px 6px; border-radius:4px; background:var(--bg-primary); color:var(--text-muted); flex-shrink:0; }
-        .dr-main { flex:1; display:flex; flex-direction:column; overflow:hidden; }
-        .dr-banner { display:none; padding:10px 16px; background:var(--bg-card); border-bottom:1px solid var(--border); }
-        .dr-banner.active { display:flex; align-items:center; gap:12px; }
-        .dr-banner-info { flex:1; min-width:0; }
-        .dr-banner-title { font-size:12px; font-weight:600; color:var(--text-primary); }
-        .dr-banner-progress { height:8px; background:var(--bg-primary); border-radius:4px; overflow:hidden; margin-top:6px; }
-        .dr-banner-bar { height:100%; background:linear-gradient(90deg, var(--accent), #6366f1); border-radius:4px; transition:width .3s; width:0%; }
-        .dr-banner-detail { font-size:11px; color:var(--text-muted); margin-top:4px; }
-        .dr-tabs { display:flex; border-bottom:1px solid var(--border); padding:0 16px; background:var(--bg-secondary); flex-shrink:0; }
-        .dr-tab { padding:10px 16px; font-size:12px; font-weight:500; color:var(--text-muted); cursor:pointer; border-bottom:2px solid transparent; transition:color .15s, border-color .15s; white-space:nowrap; }
-        .dr-tab:hover { color:var(--text-primary); }
-        .dr-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
-        .dr-content { flex:1; overflow-y:auto; padding:16px; }
-        .dr-empty { display:flex; align-items:center; justify-content:center; height:100%; color:var(--text-muted); font-size:14px; flex-direction:column; gap:8px; }
-        .dr-empty i { font-size:40px; opacity:.4; }
-        .dr-card { background:var(--bg-card); border-radius:10px; padding:16px; margin-bottom:14px; }
-        .dr-card-title { font-weight:600; font-size:13px; color:var(--text-primary); margin-bottom:10px; display:flex; align-items:center; gap:8px; }
-        .dr-card-title i { width:18px; text-align:center; }
-        .dr-table { width:100%; border-collapse:collapse; font-size:12px; }
-        .dr-table th { text-align:left; font-weight:600; padding:8px 10px; border-bottom:2px solid var(--border); color:var(--text-secondary); font-size:11px; text-transform:uppercase; letter-spacing:.3px; }
-        .dr-table td { padding:7px 10px; border-bottom:1px solid var(--border); color:var(--text-primary); }
-        .dr-table tr:last-child td { border-bottom:none; }
-        .dr-kv { display:grid; grid-template-columns:140px 1fr; gap:6px 12px; font-size:12px; }
-        .dr-kv-label { color:var(--text-muted); }
-        .dr-kv-value { color:var(--text-primary); font-weight:500; }
-        .dr-metrics { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
-        .dr-metric { background:var(--bg-card); border-radius:10px; padding:14px 18px; flex:1; min-width:120px; text-align:center; }
-        .dr-metric-value { font-size:22px; font-weight:700; color:var(--text-primary); }
-        .dr-metric-label { font-size:11px; color:var(--text-muted); margin-top:2px; }
-        .dr-health-big { display:flex; align-items:center; gap:12px; padding:14px; background:var(--bg-primary); border-radius:10px; margin-bottom:14px; }
-        .dr-health-icon { font-size:32px; }
-        .dr-health-text { font-size:15px; font-weight:600; }
-        .dr-btn { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:8px 14px; cursor:pointer; font-size:12px; display:inline-flex; align-items:center; gap:6px; white-space:nowrap; }
-        .dr-btn:hover { filter:brightness(1.1); }
-        .dr-btn:disabled { opacity:.5; cursor:not-allowed; filter:none; }
-        .dr-btn-sm { padding:5px 10px; font-size:11px; }
-        .dr-btn-outline { background:transparent; border:1px solid var(--border); color:var(--text-secondary); }
-        .dr-btn-outline:hover { border-color:var(--accent); color:var(--accent); }
-        .dr-btn-danger { background:#ef4444; }
-        .dr-btn-danger:hover { background:#dc2626; }
-        .dr-btn-warn { background:#f59e0b; }
-        .dr-btn-warn:hover { background:#d97706; }
-        .dr-select { background:var(--bg-primary); border:1px solid var(--border); border-radius:6px; padding:8px 10px; color:var(--text-primary); font-size:12px; }
-        .dr-select option { background:var(--bg-primary); color:var(--text-primary); }
-        .dr-log { max-height:200px; overflow-y:auto; background:var(--bg-primary); border-radius:8px; padding:8px 10px; margin-top:10px; font-family:monospace; font-size:11px; color:var(--text-muted); }
-        .dr-log-line { padding:2px 0; border-bottom:1px solid var(--border); }
-        .dr-log-line:last-child { border:none; }
-        .dr-log-line.error { color:#ef4444; }
-        .dr-log-line.success { color:#10b981; }
-        .dr-progress-outer { height:20px; background:var(--bg-primary); border-radius:10px; overflow:hidden; position:relative; margin-top:10px; }
-        .dr-progress-inner { height:100%; background:linear-gradient(90deg, var(--accent), #6366f1); border-radius:10px; transition:width .3s; width:0%; }
-        .dr-progress-text { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:600; color:#fff; text-shadow:0 1px 2px rgba(0,0,0,.4); }
-        .dr-row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-        .dr-warning { background:#fef3c7; color:#92400e; border-radius:8px; padding:10px 14px; font-size:12px; display:flex; align-items:center; gap:8px; margin-bottom:12px; }
-        .dr-warning i { color:#f59e0b; }
-        .dr-smart-status { display:inline-block; width:8px; height:8px; border-radius:50%; }
-        .dr-hist-item { display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid var(--border); font-size:12px; }
-        .dr-hist-item:last-child { border:none; }
-        .dr-hist-icon { font-size:16px; width:20px; text-align:center; }
-        .dr-hist-meta { flex:1; min-width:0; }
-        .dr-hist-time { font-size:10px; color:var(--text-muted); white-space:nowrap; }
-        .dr-nodata { text-align:center; padding:30px; color:var(--text-muted); font-size:13px; }
-
-        /* ── Overview cards ── */
-        .sm-overview { padding:20px; }
-        .sm-summary { display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:12px; margin-bottom:20px; }
-        .sm-scard { background:var(--bg-card); border-radius:10px; border:1px solid var(--border); padding:16px; text-align:center; }
-        .sm-scard-icon { font-size:24px; margin-bottom:8px; }
-        .sm-scard-val { font-size:22px; font-weight:700; color:var(--text-primary); }
-        .sm-scard-label { font-size:11px; color:var(--text-muted); margin-top:4px; }
-        .sm-quick { display:flex; gap:8px; flex-wrap:wrap; margin-top:16px; }
-        .sm-ov-table { width:100%; border-collapse:collapse; font-size:12px; margin-top:12px; }
-        .sm-ov-table th { text-align:left; padding:8px 10px; border-bottom:2px solid var(--border); color:var(--text-secondary); font-size:11px; text-transform:uppercase; }
-        .sm-ov-table td { padding:7px 10px; border-bottom:1px solid var(--border); }
-    </style>
-
-    <div class="sm-wrap">
-        <div class="sm-sidebar">
-            <div class="sm-sidebar-header">
-                <div>
-                    <div style="display:flex;align-items:center;gap:8px"><span class="sm-sidebar-icon">💾</span><span class="sm-sidebar-title">Storage Manager</span></div>
-                    <div class="sm-sidebar-sub" id="sm-sidebar-sub"></div>
-                </div>
+        el.innerHTML = `<div style="padding:16px">
+            <div class="raid-toolbar">
+                <button class="raid-btn" id="lvm-refresh"><i class="fas fa-sync-alt"></i> ${t('Refresh')}</button>
+                <div class="raid-toolbar-right"><span class="raid-status-text" id="lvm-status"></span></div>
             </div>
-            <div class="sm-nav">
-                <a class="sm-nav-item active" data-section="overview"><i class="fas fa-chart-pie"></i> ${t('Przegląd')}</a>
-                <a class="sm-nav-item" data-section="disks"><i class="fas fa-hdd"></i> ${t('Dyski')}</a>
-                <a class="sm-nav-item" data-section="raid"><i class="fas fa-layer-group"></i> ${t('Pule / RAID')}</a>
-                <a class="sm-nav-item" data-section="volumes"><i class="fas fa-cubes"></i> ${t('Wolumeny')}</a>
-                <div class="sm-nav-sep"></div>
-                <a class="sm-nav-item" data-section="sharing"><i class="fas fa-share-alt"></i> ${t('Udostępnianie')}</a>
-                <div class="sm-nav-sep"></div>
-                <a class="sm-nav-item" data-section="diagnostics"><i class="fas fa-stethoscope"></i> ${t('Diagnostyka')}</a>
-                <a class="sm-nav-item" data-section="cache"><i class="fas fa-bolt"></i> SSD Cache</a>
-            </div>
-        </div>
-        <div class="sm-content" id="sm-content"></div>
-    </div>`;
+            <div id="lvm-vg-section"></div>
+            <div id="lvm-lv-section"></div>
+        </div>`;
 
-    const content = body.querySelector('#sm-content');
+        const $ = s => el.querySelector(s);
+        $('#lvm-refresh').onclick = loadLVM;
 
-    function switchSection(name) {
-        if (_cleanup) { _cleanup(); _cleanup = null; }
-        body.querySelectorAll('.sm-nav-item').forEach(n => n.classList.toggle('active', n.dataset.section === name));
-        switch (name) {
-            case 'overview': _cleanup = renderOverview(content); break;
-            case 'disks': _cleanup = renderDisksSection(content); break;
-            case 'raid': _cleanup = renderRaidSection(content); break;
-            case 'volumes': _cleanup = renderVolumesSection(content); break;
-            case 'sharing': _cleanup = renderSharingSection(content); break;
-            case 'diagnostics': _cleanup = renderDiagnosticsSection(content); break;
-            case 'cache': _cleanup = renderCacheSection(content); break;
+        async function loadLVM() {
+            const statusEl = el.querySelector('#lvm-status');
+            if (statusEl) statusEl.textContent = t('Loading...');
+            try {
+                const [vgs, lvs, disks] = await Promise.all([api('/raid/lvm/vgs'), api('/raid/lvm/lvs'), api('/raid/disks')]);
+                state.vgs = vgs || []; state.lvs = lvs || []; state.disks = disks || [];
+                if (statusEl) statusEl.textContent = `${state.vgs.length} VG, ${state.lvs.length} LV`;
+                renderVGSection(); renderLVSection();
+            } catch (e) { if (statusEl) statusEl.textContent = t('Error loading data'); }
         }
-    }
 
-    body.querySelectorAll('.sm-nav-item').forEach(item => {
-        item.onclick = (e) => { e.preventDefault(); switchSection(item.dataset.section); };
-    });
-
-    window.__smCleanup = () => { if (_cleanup) { _cleanup(); _cleanup = null; } };
-
-    switchSection('overview');
-
-
-    // ─── Section: Overview ────────────────────────────────
-    function renderOverview(el) {
-        el.innerHTML = `<div class="sm-overview"><div class="sto-center-lg"><i class="fas fa-spinner fa-spin sto-spinner"></i><div class="sto-load-text">${t('Ładowanie...')}</div></div></div>`;
-
-        (async () => {
-            let drives = [], arrays = [], healthDisks = [];
-            try { const d = await api('/storage/drives'); drives = Array.isArray(d) ? d : (d.drives || []); } catch (_) {}
-            try { arrays = await api('/raid/arrays'); if (!Array.isArray(arrays)) arrays = []; } catch (_) { arrays = []; }
-            try { healthDisks = await api('/diskrepair/disks') || []; } catch (_) { healthDisks = []; }
-
-            const mounted = drives.filter(d => d.mountpoint && d.type !== 'disk');
-            const physDisks = drives.filter(d => d.type === 'disk');
-
-            // Total capacity
-            let totalBytes = 0;
-            mounted.forEach(d => {
-                if (d.usage && d.usage.total) totalBytes += d.usage.total;
-            });
-            const totalGB = totalBytes > 0 ? (totalBytes / 1e9).toFixed(1) + ' GB' : '—';
-
-            // Health summary
-            const healthy = healthDisks.filter(d => d.smart_healthy === true).length;
-            const warnings = healthDisks.filter(d => d.smart_healthy === false || d.reallocated_sectors > 0 || d.pending_sectors > 0).length;
-            const healthText = healthDisks.length ? `${healthy} ${t('OK')} / ${warnings} ⚠️` : '—';
-            const healthColor = warnings > 0 ? '#f59e0b' : '#10b981';
-
-            // Update sidebar subtitle
-            const sub = body.querySelector('#sm-sidebar-sub');
-            if (sub) sub.textContent = `${physDisks.length} ${t('dysków')}, ${mounted.length} ${t('partycji')}`;
-
-            el.innerHTML = `<div class="sm-overview">
-                <div class="sm-summary">
-                    <div class="sm-scard">
-                        <div class="sm-scard-icon" style="color:#3b82f6"><i class="fas fa-database"></i></div>
-                        <div class="sm-scard-val">${totalGB}</div>
-                        <div class="sm-scard-label">${t('Pojemność zamontowana')}</div>
-                    </div>
-                    <div class="sm-scard">
-                        <div class="sm-scard-icon" style="color:#f59e0b"><i class="fas fa-hdd"></i></div>
-                        <div class="sm-scard-val">${physDisks.length}</div>
-                        <div class="sm-scard-label">${t('Dyski fizyczne')}</div>
-                    </div>
-                    <div class="sm-scard">
-                        <div class="sm-scard-icon" style="color:${healthColor}"><i class="fas fa-heartbeat"></i></div>
-                        <div class="sm-scard-val" style="color:${healthColor}">${healthText}</div>
-                        <div class="sm-scard-label">${t('Zdrowie SMART')}</div>
-                    </div>
-                    <div class="sm-scard">
-                        <div class="sm-scard-icon" style="color:#8b5cf6"><i class="fas fa-layer-group"></i></div>
-                        <div class="sm-scard-val">${arrays.length}</div>
-                        <div class="sm-scard-label">${t('Macierze RAID')}</div>
-                    </div>
+        function renderVGSection() {
+            const area = el.querySelector('#lvm-vg-section');
+            if (!area) return;
+            area.innerHTML = `<div class="raid-lvm-section">
+                <div class="raid-section-title"><i class="fas fa-archive"></i> ${t('Volume Groups')}
+                    <button class="raid-btn raid-btn-sm raid-btn-primary" id="lvm-create-vg" style="margin-left:auto"><i class="fas fa-plus"></i> ${t('Create VG')}</button>
                 </div>
+                <div id="lvm-vg-wizard"></div>
+                ${state.vgs.length ? `<div class="raid-cards">${state.vgs.map(vg => `<div class="raid-card">
+                    <div class="raid-card-head">
+                        <div class="raid-card-icon" style="background:rgba(139,92,246,.12);color:#8b5cf6;"><i class="fas fa-archive"></i></div>
+                        <div><div class="raid-card-title">${_esc(vg.vg_name)}</div><div class="raid-card-sub">${_esc(vg.vg_size || '')}</div></div>
+                        <button class="raid-btn raid-btn-sm raid-btn-danger lvm-del-vg" data-vg="${_esc(vg.vg_name)}" style="margin-left:auto" title="${t('Delete VG')}"><i class="fas fa-trash"></i></button>
+                    </div>
+                    <div class="raid-card-body">
+                        <div class="raid-card-row"><span class="raid-card-label">${t('Free')}</span><span class="raid-card-val">${_esc(vg.vg_free || '')}</span></div>
+                        <div class="raid-card-row"><span class="raid-card-label">${t('PV Count')}</span><span class="raid-card-val">${_esc(vg.pv_count || '')}</span></div>
+                        <div class="raid-card-row"><span class="raid-card-label">${t('LV Count')}</span><span class="raid-card-val">${_esc(vg.lv_count || '')}</span></div>
+                    </div>
+                    ${(vg.pvs || []).length ? `<div class="raid-disk-map">${vg.pvs.map(p =>
+                        `<span class="raid-disk-chip"><span class="dot ok"></span>${_esc((p.pv_name || '').replace('/dev/', ''))}</span>`
+                    ).join('')}</div>` : ''}
+                </div>`).join('')}</div>` : `<div class="raid-empty"><i class="fas fa-archive"></i><span>${t('No volume groups')}</span></div>`}
+            </div>`;
+            area.querySelector('#lvm-create-vg').onclick = showCreateVGWizard;
+            area.querySelectorAll('.lvm-del-vg').forEach(btn => {
+                btn.onclick = async (e) => {
+                    e.stopPropagation();
+                    const vgName = btn.dataset.vg;
+                    if (!await confirmDialog(t('Potwierdzenie'), t('Delete volume group ') + vgName + '?')) return;
+                    try { const res = await api(`/raid/lvm/vg/${encodeURIComponent(vgName)}`, { method: 'DELETE' }); if (res.error) throw new Error(res.error); loadLVM(); } catch (e) { toast(t('Failed to delete VG: ') + (e.message || e), 'error'); }
+                };
+            });
+        }
 
-                ${mounted.length ? `
-                <div class="dr-card">
-                    <div class="dr-card-title"><i class="fas fa-hdd"></i> ${t('Zamontowane wolumeny')}</div>
-                    <table class="sm-ov-table">
-                        <thead><tr><th>${t('Nazwa')}</th><th>${t('Rozmiar')}</th><th>${t('Użycie')}</th><th>${t('Punkt montowania')}</th></tr></thead>
-                        <tbody>${mounted.map(d => {
-                            const pct = d.usage?.percent || 0;
-                            const pctColor = pct > 90 ? '#ef4444' : pct > 70 ? '#eab308' : '#10b981';
-                            return `<tr>
-                                <td><strong>${d.label || d.name}</strong> <span style="color:var(--text-muted);font-size:11px">/dev/${d.name}</span></td>
-                                <td>${d.size || '—'}</td>
-                                <td><span style="color:${pctColor};font-weight:600">${Math.round(pct)}%</span></td>
-                                <td style="font-family:monospace;font-size:11px">${d.mountpoint}</td>
-                            </tr>`;
-                        }).join('')}</tbody>
-                    </table>
-                </div>` : ''}
-
-                <div class="sm-quick">
-                    <button class="fm-toolbar-btn" id="sm-go-disks"><i class="fas fa-hdd"></i> ${t('Zarządzaj dyskami')}</button>
-                    <button class="fm-toolbar-btn" id="sm-go-raid"><i class="fas fa-layer-group"></i> ${t('Macierze RAID')}</button>
-                    <button class="fm-toolbar-btn" id="sm-go-diag"><i class="fas fa-stethoscope"></i> ${t('Diagnostyka')}</button>
-                    <button class="fm-toolbar-btn" id="sm-go-sharing"><i class="fas fa-share-alt"></i> ${t('Udostępnianie')}</button>
+        function showCreateVGWizard() {
+            const wizard = el.querySelector('#lvm-vg-wizard');
+            if (!wizard) return;
+            const available = state.disks;
+            wizard.innerHTML = `<div class="raid-wizard">
+                <div class="raid-wizard-title"><i class="fas fa-plus-circle"></i> ${t('Create Volume Group')}</div>
+                <div class="raid-form-row"><label>${t('VG Name')}</label><input class="fm-input" id="lvm-vg-name" placeholder="vg0" style="max-width:200px"></div>
+                <div style="margin-top:8px;margin-bottom:4px;font-size:12px;color:var(--text-muted)"><i class="fas fa-hdd"></i> ${t('Select physical volumes')} (${available.length} ${t('available')}):</div>
+                ${available.length ? `<div class="raid-disk-select" id="lvm-vg-disks">
+                    ${available.map(d => `<label class="raid-disk-opt"><input type="checkbox" value="${_esc(d.device)}"><span class="dname">${_esc(d.name)}</span><span class="dsize">${_esc(d.size)}</span></label>`).join('')}
+                </div>` : `<div class="raid-status-text">${t('No available disks')}</div>`}
+                <div class="raid-form-actions">
+                    <button class="raid-btn raid-btn-primary" id="lvm-vg-confirm" ${!available.length ? 'disabled' : ''}>${t('Create')}</button>
+                    <button class="raid-btn" id="lvm-vg-cancel">${t('Cancel')}</button>
                 </div>
             </div>`;
+            wizard.querySelectorAll('.raid-disk-opt input[type="checkbox"]').forEach(cb => {
+                cb.onchange = () => cb.closest('.raid-disk-opt').classList.toggle('checked', cb.checked);
+            });
+            wizard.querySelector('#lvm-vg-cancel').onclick = () => { wizard.innerHTML = ''; };
+            wizard.querySelector('#lvm-vg-confirm').onclick = async () => {
+                const name = wizard.querySelector('#lvm-vg-name').value.trim();
+                const devices = [...wizard.querySelectorAll('#lvm-vg-disks input:checked')].map(cb => cb.value);
+                if (!name) { toast(t('VG name is required'), 'warning'); return; }
+                if (!devices.length) { toast(t('Select at least one device'), 'warning'); return; }
+                const btn = wizard.querySelector('#lvm-vg-confirm'); btn.disabled = true;
+                try { const res = await api('/raid/lvm/vg', { method: 'POST', body: { name, devices } }); if (res.error) throw new Error(res.error); wizard.innerHTML = ''; loadLVM(); } catch (e) { toast(t('Failed: ') + (e.message || e), 'error'); btn.disabled = false; }
+            };
+        }
 
-            el.querySelector('#sm-go-disks')?.addEventListener('click', () => switchSection('disks'));
-            el.querySelector('#sm-go-raid')?.addEventListener('click', () => switchSection('raid'));
-            el.querySelector('#sm-go-diag')?.addEventListener('click', () => switchSection('diagnostics'));
-            el.querySelector('#sm-go-sharing')?.addEventListener('click', () => switchSection('sharing'));
-        })();
+        function renderLVSection() {
+            const area = el.querySelector('#lvm-lv-section');
+            if (!area) return;
+            area.innerHTML = `<div class="raid-lvm-section">
+                <div class="raid-section-title"><i class="fas fa-cube"></i> ${t('Logical Volumes')}
+                    <button class="raid-btn raid-btn-sm raid-btn-primary" id="lvm-create-lv" style="margin-left:auto" ${!state.vgs.length ? 'disabled' : ''}><i class="fas fa-plus"></i> ${t('Create LV')}</button>
+                </div>
+                <div id="lvm-lv-wizard"></div>
+                ${state.lvs.length ? `<table class="raid-table">
+                    <thead><tr><th>${t('Name')}</th><th>${t('VG')}</th><th>${t('Size')}</th><th>${t('Path')}</th><th></th></tr></thead>
+                    <tbody>${state.lvs.map(lv => `<tr>
+                        <td><strong>${_esc(lv.lv_name)}</strong></td>
+                        <td>${_esc(lv.vg_name)}</td>
+                        <td>${_esc(lv.lv_size)}</td>
+                        <td><code style="font-size:11px">${_esc(lv.lv_path || `/dev/${lv.vg_name}/${lv.lv_name}`)}</code></td>
+                        <td><button class="raid-btn raid-btn-sm raid-btn-danger lvm-del-lv" data-vg="${_esc(lv.vg_name)}" data-lv="${_esc(lv.lv_name)}"><i class="fas fa-trash"></i></button></td>
+                    </tr>`).join('')}</tbody>
+                </table>` : `<div class="raid-empty" style="height:120px"><i class="fas fa-cube"></i><span>${t('No logical volumes')}</span></div>`}
+            </div>`;
+            area.querySelector('#lvm-create-lv').onclick = showCreateLVWizard;
+            area.querySelectorAll('.lvm-del-lv').forEach(btn => {
+                btn.onclick = async () => {
+                    const vg = btn.dataset.vg, lv = btn.dataset.lv;
+                    if (!await confirmDialog(t('Potwierdzenie'), t('Delete logical volume ') + vg + '/' + lv + '?')) return;
+                    try { const res = await api(`/raid/lvm/lv/${encodeURIComponent(vg)}/${encodeURIComponent(lv)}`, { method: 'DELETE' }); if (res.error) throw new Error(res.error); loadLVM(); } catch (e) { toast(t('Failed: ') + (e.message || e), 'error'); }
+                };
+            });
+        }
 
+        function showCreateLVWizard() {
+            const wizard = el.querySelector('#lvm-lv-wizard');
+            if (!wizard) return;
+            wizard.innerHTML = `<div class="raid-wizard">
+                <div class="raid-wizard-title"><i class="fas fa-plus-circle"></i> ${t('Create Logical Volume')}</div>
+                <div class="raid-form-row"><label>${t('Volume Group')}</label>
+                    <select class="fm-input" id="lvm-lv-vg" style="max-width:200px">
+                        ${state.vgs.map(vg => `<option value="${_esc(vg.vg_name)}">${_esc(vg.vg_name)} (${_esc(vg.vg_free || '')} ${t('free')})</option>`).join('')}
+                    </select>
+                </div>
+                <div class="raid-form-row"><label>${t('LV Name')}</label><input class="fm-input" id="lvm-lv-name" placeholder="lv0" style="max-width:200px"></div>
+                <div class="raid-form-row"><label>${t('Size')}</label>
+                    <input class="fm-input" id="lvm-lv-size" placeholder="${t('e.g. 10G, 500M')}" style="max-width:160px">
+                    <label class="raid-disk-opt" style="padding:6px 10px"><input type="checkbox" id="lvm-lv-useall"> <span class="dname">${t('Use all free space')}</span></label>
+                </div>
+                <div class="raid-form-actions">
+                    <button class="raid-btn raid-btn-primary" id="lvm-lv-confirm">${t('Create')}</button>
+                    <button class="raid-btn" id="lvm-lv-cancel">${t('Cancel')}</button>
+                </div>
+            </div>`;
+            const useAllCb = wizard.querySelector('#lvm-lv-useall');
+            const sizeInput = wizard.querySelector('#lvm-lv-size');
+            useAllCb.onchange = () => { sizeInput.disabled = useAllCb.checked; if (useAllCb.checked) sizeInput.value = ''; };
+            wizard.querySelector('#lvm-lv-cancel').onclick = () => { wizard.innerHTML = ''; };
+            wizard.querySelector('#lvm-lv-confirm').onclick = async () => {
+                const vg_name = wizard.querySelector('#lvm-lv-vg').value;
+                const name = wizard.querySelector('#lvm-lv-name').value.trim();
+                const size = sizeInput.value.trim();
+                const use_all = useAllCb.checked;
+                if (!name) { toast(t('LV name is required'), 'warning'); return; }
+                if (!use_all && !size) { toast(t('Specify size or use all free space'), 'warning'); return; }
+                const btn = wizard.querySelector('#lvm-lv-confirm'); btn.disabled = true;
+                try { const res = await api('/raid/lvm/lv', { method: 'POST', body: { vg_name, name, size, use_all } }); if (res.error) throw new Error(res.error); wizard.innerHTML = ''; loadLVM(); } catch (e) { toast(t('Failed: ') + (e.message || e), 'error'); btn.disabled = false; }
+            };
+        }
+
+        loadLVM();
         return null;
     }
 
-    // ─── Section: Disks ──────────────────────────────────
-    function renderDisksSection(el) {
-        const state = { drives: [], selected: null, systemVisible: false, keepalive: {} };
+    // ─── Section: Sharing ────────────────────────────────
+    function renderSharingSection(el) {
+        const $ = (s) => el.querySelector(s);
 
-        el.innerHTML = `
-        <div class="storage-app">
-            <div class="storage-toolbar">
-                <button class="fm-toolbar-btn" id="st-refresh" title="${t('Odśwież')}"><i class="fas fa-sync-alt"></i></button>
-                <div class="fm-toolbar-sep"></div>
-                <span class="storage-status" id="st-status">${t('Ładowanie...')}</span>
-            </div>
-            <div class="st-groups" id="st-groups">
-                <div class="sto-center-lg"><i class="fas fa-spinner fa-spin sto-spinner"></i><div class="sto-load-text">${t('Ładowanie dysków...')}</div></div>
-            </div>
-            <div class="st-actions" id="st-actions" style="display:none">
-                <div class="st-actions-header">
-                    <span class="st-actions-title" id="st-actions-title"></span>
-                    <button class="fm-toolbar-btn btn-sm" id="st-actions-close" title="Zamknij"><i class="fas fa-times"></i></button>
-                </div>
-                <div class="storage-form-row" id="st-mount-row">
-                    <label>Punkt montowania:</label>
-                    <input type="text" id="st-mountpoint" placeholder="/media/devmon/dysk" class="fm-input" list="st-mount-suggestions">
-                    <datalist id="st-mount-suggestions"></datalist>
-                </div>
-                <div class="st-actions-btns">
-                    <button class="fm-toolbar-btn btn-green" id="st-mount-btn"><i class="fas fa-link"></i> Montuj</button>
-                    <button class="fm-toolbar-btn btn-red" id="st-unmount-btn"><i class="fas fa-unlink"></i> Odmontuj</button>
-                    <button class="fm-toolbar-btn" id="st-label-btn"><i class="fas fa-tag"></i> Etykieta</button>
-                    <button class="fm-toolbar-btn btn-orange" id="st-format-btn"><i class="fas fa-eraser"></i> Formatuj</button>
-                    <button class="fm-toolbar-btn btn-purple" id="st-eject-btn"><i class="fas fa-eject"></i> ${t('Wysuń USB')}</button>
-                    <button class="fm-toolbar-btn" id="st-keepalive-btn"><i class="fas fa-heartbeat"></i> Utrzymuj</button>
-                    <button class="fm-toolbar-btn" id="st-smart-btn"><i class="fas fa-heartbeat"></i> SMART</button>
-                    <button class="fm-toolbar-btn btn-purple" id="st-merge-btn"><i class="fas fa-object-group"></i> ${t('Połącz')}</button>
-                    <button class="fm-toolbar-btn btn-cyan" id="st-split-btn"><i class="fas fa-columns"></i> Podziel</button>
-                    <button class="fm-toolbar-btn btn-red" id="st-encrypt-btn"><i class="fas fa-lock"></i> LUKS</button>
-                </div>
-            </div>
+        el.innerHTML = `<div class="shr-loading"><i class="fas fa-spinner fa-spin shr-spin-icon"></i>${t('Ładowanie…')}</div>`;
 
-            <!-- Format Modal -->
-            <div class="modal-overlay st-format-modal" id="st-format-modal" style="display:none">
-                <div class="modal sto-modal-lg">
-                    <div class="modal-header">
-                        <span><i class="fas fa-eraser sto-hdr-icon-orange"></i>Formatowanie dysku</span>
-                        <button class="btn sto-close-btn" id="st-fmt-close">&times;</button>
-                    </div>
-                    <div class="modal-body" id="st-fmt-body">
-                        <div class="st-fmt-loading"><i class="fas fa-spinner fa-spin sto-spinner"></i></div>
-                    </div>
-                    <div class="modal-footer" id="st-fmt-footer">
-                        <button class="btn" id="st-fmt-cancel">Anuluj</button>
-                        <button class="btn btn-danger" id="st-fmt-confirm"><i class="fas fa-eraser"></i> Formatuj</button>
-                    </div>
-                </div>
-            </div>
-
-            <!-- SMART Detail Modal -->
-            <div class="modal-overlay" id="st-smart-modal" style="display:none">
-                <div class="modal sto-modal-md">
-                    <div class="modal-header">
-                        <span><i class="fas fa-heartbeat sto-hdr-icon-green"></i>SMART — Zdrowie dysku</span>
-                        <button class="btn sto-close-btn" id="st-smart-close">&times;</button>
-                    </div>
-                    <div class="modal-body sto-smart-scroll" id="st-smart-body">
-                        <div class="sto-center-md"><i class="fas fa-spinner fa-spin sto-spinner"></i></div>
-                    </div>
-                    <div class="modal-footer"><button class="btn" id="st-smart-ok">Zamknij</button></div>
-                </div>
-            </div>
-        </div>`;
-
-        const $ = id => el.querySelector(id);
-        const statusEl = $('#st-status');
-
-        /* ─── SMART Detail Modal ─── */
-        const smartModal = $('#st-smart-modal');
-        const smartBody = $('#st-smart-body');
-        $('#st-smart-close').onclick = () => smartModal.style.display = 'none';
-        $('#st-smart-ok').onclick = () => smartModal.style.display = 'none';
-        smartModal.onclick = (e) => { if (e.target === smartModal) smartModal.style.display = 'none'; };
-
-        async function showSmartDetail(diskName) {
-            smartModal.style.display = '';
-            smartBody.innerHTML = '<div class="sto-center-md"><i class="fas fa-spinner fa-spin sto-spinner"></i></div>';
+        (async () => {
+            let installedProtos;
             try {
-                const [info, scoreData] = await Promise.all([
-                    api(`/storage/smart?disk=${encodeURIComponent(diskName)}`),
-                    api(`/diskrepair/smart/${encodeURIComponent(diskName)}/score`).catch(() => null),
-                ]);
-                if (!info.available) {
-                    smartBody.innerHTML = `<div class="sto-info-msg"><i class="fas fa-info-circle sto-icon-lg"></i><div class="sto-mt-sm">${t('SMART niedostępny dla tego dysku')}</div></div>`;
-                    return;
-                }
-                const hColor = info.health === 'PASSED' ? '#10b981' : '#ef4444';
-                const tColor = (info.temperature || 0) > 50 ? '#ef4444' : (info.temperature || 0) > 40 ? '#eab308' : '#10b981';
-                const rColor = (info.reallocated_sectors || 0) > 0 ? '#ef4444' : '#10b981';
-                const poh = info.power_on_hours ? `${Math.floor(info.power_on_hours / 24)} dni (${info.power_on_hours.toLocaleString()} godz.)` : '-';
-                const score = scoreData?.score ?? null;
-                const grade = scoreData?.grade || '';
-                const scoreColor = score >= 90 ? '#10b981' : score >= 70 ? '#3b82f6' : score >= 50 ? '#eab308' : '#ef4444';
-                const scoreGradient = score != null ? `conic-gradient(${scoreColor} ${score * 3.6}deg, rgba(255,255,255,0.06) 0deg)` : 'none';
-                const scoreHtml = score != null ? `
-                    <div class="sto-smart-card" style="background:rgba(${score >= 70 ? '16,185,129' : score >= 50 ? '234,179,8' : '239,68,68'},.08)">
-                        <div class="sto-stat-label">${t('Zdrowie')}</div>
-                        <div style="display:flex;align-items:center;gap:10px">
-                            <div style="width:48px;height:48px;border-radius:50%;background:${scoreGradient};display:flex;align-items:center;justify-content:center">
-                                <div style="width:38px;height:38px;border-radius:50%;background:var(--bg-card,#1e293b);display:flex;align-items:center;justify-content:center;font-size:16px;font-weight:700;color:${scoreColor}">${score}</div>
-                            </div>
-                            <div style="font-size:12px;color:var(--text-muted);text-transform:uppercase">${grade}</div>
-                        </div>
-                    </div>` : '';
-
-                smartBody.innerHTML = `
-                    <div class="sto-smart-grid" style="grid-template-columns:repeat(${score != null ? 3 : 2},1fr)">
-                        ${scoreHtml}
-                        <div class="sto-smart-card" style="background:rgba(${info.health === 'PASSED' ? '16,185,129' : '239,68,68'},.08)">
-                            <div class="sto-stat-label">Status</div>
-                            <div class="sto-stat-value" style="color:${hColor}">${info.health || '?'}</div>
-                        </div>
-                        <div class="sto-smart-card" style="background:rgba(${tColor === '#ef4444' ? '239,68,68' : tColor === '#eab308' ? '234,179,8' : '16,185,129'},.08)">
-                            <div class="sto-stat-label">Temperatura</div>
-                            <div class="sto-stat-value" style="color:${tColor}">${info.temperature != null ? info.temperature + '°C' : '-'}</div>
-                        </div>
-                    </div>
-                    <table class="sto-smart-table">
-                        <tr class="sto-tr-border"><td class="sto-td-label">Model</td><td class="sto-td-value">${info.model || '-'}</td></tr>
-                        <tr class="sto-tr-border"><td class="sto-td-label">Numer seryjny</td><td class="sto-td-mono">${info.serial || '-'}</td></tr>
-                        <tr class="sto-tr-border"><td class="sto-td-label">Firmware</td><td class="sto-td-right">${info.firmware || '-'}</td></tr>
-                        <tr class="sto-tr-border"><td class="sto-td-label">Czas pracy</td><td class="sto-td-right">${poh}</td></tr>
-                        <tr><td class="sto-td-label">Realokowane sektory</td><td class="sto-td-right-bold" style="color:${rColor}">${info.reallocated_sectors != null ? info.reallocated_sectors : '-'}</td></tr>
-                    </table>
-                    ${(info.reallocated_sectors || 0) > 0 ? `<div class="sto-alert-danger"><i class="fas fa-exclamation-triangle sto-mr-xs"></i>${t('Dysk ma realokowane sektory — rozważ wymianę!')}</div>` : ''}
-                    <div style="margin-top:12px;display:flex;gap:8px">
-                        <button class="fm-toolbar-btn btn-sm" id="st-smart-selftest"><i class="fas fa-vial"></i> ${t('Self-test')}</button>
-                        <button class="fm-toolbar-btn btn-sm" id="st-smart-detail"><i class="fas fa-list"></i> ${t('Atrybuty')}</button>
-                    </div>`;
-
-                smartBody.querySelector('#st-smart-selftest')?.addEventListener('click', async () => {
-                    try {
-                        const r = await api('/diskrepair/smart-test', { method: 'POST', body: { disk: diskName, type: 'short' } });
-                        if (r.error) { toast(r.error, 'error'); return; }
-                        toast(t('Self-test uruchomiony') + (r.estimated_minutes ? ` (~${r.estimated_minutes} min)` : ''), 'success');
-                    } catch (e) { toast(e.message, 'error'); }
-                });
-
-                smartBody.querySelector('#st-smart-detail')?.addEventListener('click', async () => {
-                    try {
-                        const detail = await api(`/diskrepair/smart/${encodeURIComponent(diskName)}`);
-                        if (detail.error) { toast(detail.error, 'error'); return; }
-                        const attrs = detail.attributes || [];
-                        if (!attrs.length) { toast(t('Brak atrybutów SMART'), 'info'); return; }
-                        showModal(t('Atrybuty SMART — ') + diskName, `
-                            <div style="max-height:400px;overflow-y:auto">
-                                <table style="width:100%;font-size:12px;border-collapse:collapse">
-                                    <tr style="background:var(--bg-card);font-weight:600;text-align:left">
-                                        <th style="padding:6px">ID</th><th style="padding:6px">${t('Atrybut')}</th>
-                                        <th style="padding:6px">Val</th><th style="padding:6px">Worst</th>
-                                        <th style="padding:6px">Thresh</th><th style="padding:6px">Raw</th>
-                                        <th style="padding:6px">Status</th>
-                                    </tr>
-                                    ${attrs.map(a => {
-                                        const sc = a.status === 'failing' ? 'color:#ef4444;font-weight:600' : a.status === 'warn' ? 'color:#eab308' : '';
-                                        return `<tr style="border-bottom:1px solid var(--border)">
-                                            <td style="padding:4px 6px">${a.id}</td><td style="padding:4px 6px">${a.name}</td>
-                                            <td style="padding:4px 6px">${a.value}</td><td style="padding:4px 6px">${a.worst}</td>
-                                            <td style="padding:4px 6px">${a.thresh}</td><td style="padding:4px 6px;font-family:monospace">${a.raw}</td>
-                                            <td style="padding:4px 6px;${sc}">${a.status}</td>
-                                        </tr>`;
-                                    }).join('')}
-                                </table>
-                            </div>
-                        `, [{ label: t('Zamknij'), class: 'secondary' }]);
-                    } catch (e) { toast(e.message, 'error'); }
-                });
+                const pkgs = await api('/ethos-packages');
+                const installed = new Set(pkgs.filter(p => p.installed).map(p => p.id));
+                installedProtos = _SH_ALL_PROTOS.filter(p => installed.has(p.pkgId));
             } catch (e) {
-                smartBody.innerHTML = `<div class="sto-error-msg">${t('Błąd:')} ${e.message}</div>`;
+                installedProtos = _SH_ALL_PROTOS;
             }
-        }
 
-        /* ─── Load & Render Drives ─── */
-        async function loadDrives() {
-            statusEl.textContent = t('Ładowanie...');
-            try {
-                const data = await api('/storage/drives');
-                state.drives = Array.isArray(data) ? data : (data.drives || []);
-                try {
-                    const ka = await api('/storage/keepalive');
-                    state.keepalive = ka.drives || {};
-                } catch(e) { state.keepalive = {}; }
-                renderDrives();
-                const partCount = state.drives.filter(d => d.type !== 'disk').length;
-                statusEl.textContent = `${partCount} partycji`;
-            } catch (e) { statusEl.textContent = t('Błąd ładowania'); }
-            const sl = $('#st-mount-suggestions');
-            if (sl) {
-                const paths = new Set(['/media/devmon/']);
-                state.drives.forEach(d => {
-                    if (d.label) paths.add(`/media/devmon/${d.label}`);
-                    if (d.mountpoint && d.mountpoint !== '/') paths.add(d.mountpoint);
+            if (!installedProtos.length) {
+                el.innerHTML = `
+                <div class="shr-empty">
+                    <i class="fas fa-share-alt shr-empty-icon"></i>
+                    <h3 class="shr-empty-title">${t('Brak zainstalowanych protokołów')}</h3>
+                    <p class="shr-empty-text">
+                        ${t('Zainstaluj protokoły udostępniania (Samba, NFS, DLNA, WebDAV, SFTP, FTP) w')}
+                        <a href="#" id="sh-goto-store" class="shr-link">${t('App Store')}</a>.
+                    </p>
+                </div>`;
+                const link = $('#sh-goto-store');
+                if (link) link.onclick = (e) => { e.preventDefault(); if (typeof openApp === 'function') openApp('app-store'); };
+                return;
+            }
+
+            el.style.cssText = 'display:flex;flex-direction:row;overflow:hidden;padding:0;height:100%';
+            el.innerHTML = `
+                <div class="sh-sidebar shr-sidebar">
+                    ${installedProtos.map(p => `
+                        <button class="sh-tab shr-tab-btn" data-tab="${p.id}"><i class="fas ${p.icon} shr-tab-icon"></i><span>${p.label}</span></button>
+                    `).join('')}
+                </div>
+                <div id="sh-panel" class="shr-panel"></div>`;
+
+            let activeTab = null;
+
+            function switchTab(id) {
+                activeTab = id;
+                el.querySelectorAll('.sh-tab').forEach(b => {
+                    const active = b.dataset.tab === id;
+                    b.style.borderLeftColor = active ? '#6366f1' : 'transparent';
+                    b.style.color = active ? 'var(--text)' : 'var(--text-muted)';
+                    b.style.fontWeight = active ? '600' : '400';
+                    b.style.background = active ? 'rgba(99,102,241,.06)' : 'none';
                 });
-                sl.innerHTML = [...paths].map(p => `<option value="${p}">`).join('');
+                const render = { samba: renderSamba, nfs: renderNFS, dlna: renderDLNA, webdav: renderWebDAV, sftp: renderSFTP, ftp: renderFTP };
+                (render[id] || render.samba)($('#sh-panel'));
             }
-        }
 
-        function renderDrives() {
-            const container = $('#st-groups');
-            const visible = state.drives.filter(d => !(d.type === 'disk' && d.children_count > 0));
-            const groupDefs = [
-                { key: 'usb',     icon: 'fa-usb',    color: '#a78bfa', label: 'USB' },
-                { key: 'storage', icon: 'fa-hdd',     color: '#f59e0b', label: t('Magazyn') },
-                { key: 'system',  icon: 'fa-server',  color: '#3b82f6', label: t('System') },
-            ];
-            let html = '';
-            for (const g of groupDefs) {
-                const items = visible.filter(d => d.category === g.key);
-                if (!items.length) continue;
-                const isSystem = g.key === 'system';
-                const collapsed = isSystem && !state.systemVisible;
-                html += `
-                <div class="st-group">
-                    <div class="st-group-header${isSystem ? ' st-group-toggle' : ''}">
-                        <i class="fas ${g.icon} sto-group-icon" style="color:${g.color}"></i>
-                        <span class="st-group-label">${g.label}</span>
-                        <span class="st-group-count">${items.length}</span>
-                        ${isSystem ? `<i class="fas fa-chevron-${collapsed ? 'right' : 'down'} st-group-chevron"></i>` : ''}
-                    </div>
-                    <div class="st-cards" ${collapsed ? 'style="display:none"' : ''}>
-                        ${items.map(d => renderCard(d)).join('')}
+            el.querySelectorAll('.sh-tab').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
+            switchTab(installedProtos[0].id);
+
+            /* ── SAMBA ── */
+            function renderSamba(panel) {
+                const st = { shares: [] };
+                panel.innerHTML = `
+                <div class="shr-header">
+                    <span class="shr-title"><i class="fab fa-windows shr-icon-accent"></i>Samba</span>
+                    <span id="sh-smb-status"></span>
+                    <div class="shr-spacer"></div>
+                    <button class="fm-toolbar-btn btn-green" id="sh-smb-add"><i class="fas fa-plus"></i> ${t('Dodaj')}</button>
+                    <button class="fm-toolbar-btn" id="sh-smb-ref" title="${t('Odśwież')}"><i class="fas fa-sync-alt"></i></button>
+                </div>
+                <div id="sh-smb-list"></div>
+                <div id="sh-smb-form" style="display:none"></div>
+                <div class="shr-pw-section">
+                    <h4 class="shr-form-title"><i class="fas fa-key shr-icon-warn"></i> ${t('Hasło Samba')}</h4>
+                    <div class="shr-pw-row">
+                        <input type="text" id="sh-smb-pwu" class="fm-input" placeholder="${t('Użytkownik')}" style="width:140px">
+                        <input type="password" id="sh-smb-pwp" class="fm-input" placeholder="${t('Hasło')}" style="width:160px">
+                        <button class="fm-toolbar-btn btn-green" id="sh-smb-pwb"><i class="fas fa-save"></i> ${t('Ustaw')}</button>
                     </div>
                 </div>`;
-            }
-            container.innerHTML = html;
-            bindCardEvents();
-        }
 
-        function renderCard(d) {
-            const parent = d.parent ? state.drives.find(x => x.name === d.parent) : null;
-            const model = parent?.model || d.model || '';
-            const label = d.label || d.name;
-            const sel = state.selected === d.name;
-            const pct = d.usage?.percent || 0;
-            const pctColor = pct > 90 ? '#ef4444' : pct > 70 ? '#eab308' : '#10b981';
-            const usageHtml = d.usage ? `
-                <div class="st-card-usage">
-                    <div class="st-card-bar"><div class="st-card-bar-fill" style="width:${pct}%;background:${pctColor}"></div></div>
-                    <span class="st-card-pct" style="color:${pctColor}">${Math.round(pct)}%</span>
-                </div>` : '';
-            const mountHtml = d.mountpoint
-                ? `<div class="st-card-mount"><i class="fas fa-folder-open"></i> ${d.mountpoint}</div>`
-                : `<div class="st-card-mount st-unmounted"><i class="fas fa-minus-circle"></i> Niezamontowany</div>`;
-            const badges = [];
-            if (d.mountpoint) badges.push('<span class="fm-badge fm-badge-green">Zamontowany</span>');
-            else badges.push('<span class="fm-badge fm-badge-dim">Odmontowany</span>');
-            if (state.keepalive[d.name]) {
-                badges.push('<span class="fm-badge sto-badge-keepalive"><i class="fas fa-shield-alt sto-badge-sm"></i> Utrzymywany</span>');
-            }
-            if (d.smart_temp != null) {
-                const sc = d.smart_temp > 50 ? '#ef4444' : d.smart_temp > 40 ? '#eab308' : '#10b981';
-                badges.push(`<span class="fm-badge st-smart-badge" data-smart-disk="${d.parent || d.name}" style="background:rgba(${d.smart_temp > 50 ? '239,68,68' : d.smart_temp > 40 ? '234,179,8' : '16,185,129'},.12);color:${sc};cursor:pointer" title="SMART: ${d.smart_health || '?'}"><i class="fas fa-thermometer-half sto-badge-sm"></i> ${d.smart_temp}°C</span>`);
-            }
-            const catIcon = d.category === 'system' ? 'fa-server' : d.category === 'usb' ? 'fa-usb' : 'fa-hdd';
-            const catColor = d.category === 'system' ? '#3b82f6' : d.category === 'usb' ? '#a78bfa' : '#f59e0b';
-            return `
-            <div class="st-card${sel ? ' st-card-selected' : ''}" data-dev="${d.name}">
-                <div class="st-card-header">
-                    <i class="fas ${catIcon}" style="color:${catColor}"></i>
-                    <div>
-                        <div class="st-card-name">${label}</div>
-                        <div class="st-card-sub">/dev/${d.name} · ${d.fstype || '—'} · ${d.size || '—'}</div>
-                        ${model ? `<div class="st-card-sub">${model}</div>` : ''}
-                    </div>
-                </div>
-                ${usageHtml}
-                ${mountHtml}
-                <div class="st-card-badges">${badges.join(' ')}</div>
-            </div>`;
-        }
-
-        function bindCardEvents() {
-            el.querySelectorAll('.st-card').forEach(card => {
-                card.onclick = (e) => {
-                    if (e.target.closest('.st-smart-badge')) {
-                        showSmartDetail(e.target.closest('.st-smart-badge').dataset.smartDisk);
-                        return;
-                    }
-                    const dev = card.dataset.dev;
-                    state.selected = state.selected === dev ? null : dev;
-                    renderDrives();
-                    updateActions();
-                };
-            });
-            el.querySelectorAll('.st-group-toggle').forEach(hdr => {
-                hdr.onclick = () => { state.systemVisible = !state.systemVisible; renderDrives(); updateActions(); };
-            });
-        }
-
-        /* ─── Action Panel ─── */
-        function updateActions() {
-            const panel = $('#st-actions');
-            if (!state.selected) { panel.style.display = 'none'; return; }
-            const drive = state.drives.find(d => d.name === state.selected);
-            if (!drive) { panel.style.display = 'none'; return; }
-            panel.style.display = '';
-            const parent = drive.parent ? state.drives.find(d => d.name === drive.parent) : null;
-            const isDisk = drive.type === 'disk';
-            const isSystem = drive.category === 'system';
-            const isUsb = drive.category === 'usb' || parent?.category === 'usb';
-            const parentDisk = parent || (isDisk ? drive : null);
-            const siblings = parentDisk ? state.drives.filter(d => d.parent === parentDisk.name) : [];
-            const hasSmart = drive.smart_health || parent?.smart_health;
-
-            $('#st-actions-title').innerHTML = `<i class="fas fa-hdd sto-action-icon"></i>${drive.label || drive.name} <span class="sto-action-sub">/dev/${drive.name}</span>`;
-            $('#st-mount-row').style.display = (isDisk || isSystem) ? 'none' : '';
-            if (!isDisk && !isSystem) {
-                $('#st-mountpoint').value = drive.mountpoint || `/media/devmon/${drive.label || drive.name}`;
-            }
-            const kaActive = !!state.keepalive[drive.name];
-            $('#st-mount-btn').style.display = (!isDisk && !isSystem && !drive.mountpoint) ? '' : 'none';
-            $('#st-unmount-btn').style.display = (!isDisk && !isSystem && drive.mountpoint) ? '' : 'none';
-            $('#st-format-btn').style.display = isSystem ? 'none' : '';
-            $('#st-label-btn').style.display = (isDisk || isSystem) ? 'none' : '';
-            $('#st-eject-btn').style.display = (isUsb && parentDisk) ? '' : 'none';
-            $('#st-keepalive-btn').style.display = (!isDisk && !isSystem && drive.mountpoint) ? '' : 'none';
-            const kaBtn = $('#st-keepalive-btn');
-            if (kaActive) {
-                kaBtn.className = 'fm-toolbar-btn btn-purple';
-                kaBtn.innerHTML = '<i class="fas fa-shield-alt"></i> Utrzymuj <span class="sto-ka-on">(ON)</span>';
-            } else {
-                kaBtn.className = 'fm-toolbar-btn';
-                kaBtn.innerHTML = '<i class="fas fa-shield-alt"></i> Utrzymuj';
-            }
-            $('#st-smart-btn').style.display = hasSmart ? '' : 'none';
-            $('#st-merge-btn').style.display = (parentDisk && siblings.length >= 2 && !isSystem) ? '' : 'none';
-            $('#st-split-btn').style.display = (parentDisk && !isSystem) ? '' : 'none';
-            $('#st-encrypt-btn').style.display = (!isDisk && !isSystem) ? '' : 'none';
-            const encBtn = $('#st-encrypt-btn');
-            if (drive.fstype === 'crypto_LUKS') {
-                encBtn.innerHTML = `<i class="fas fa-lock"></i> ${drive.mountpoint ? t('Zablokuj') : t('Odblokuj')}`;
-                encBtn.className = 'fm-toolbar-btn ' + (drive.mountpoint ? 'btn-orange' : 'btn-green');
-            } else {
-                encBtn.innerHTML = `<i class="fas fa-lock"></i> ${t('Szyfruj')}`;
-                encBtn.className = 'fm-toolbar-btn btn-red';
-            }
-        }
-
-        $('#st-actions-close').onclick = () => { state.selected = null; renderDrives(); updateActions(); };
-
-        // Mount / Unmount
-        $('#st-mount-btn').onclick = async () => {
-            if (!state.selected) return;
-            const mp = $('#st-mountpoint').value.trim();
-            if (!mp) { toast('Podaj punkt montowania', 'warning'); return; }
-            try {
-                await api('/storage/mount', { method: 'POST', body: { drive: state.selected, path: mp } });
-                toast('Zamontowano', 'success'); loadDrives();
-            } catch (e) { toast(t('Błąd montowania: ') + e.message, 'error'); }
-        };
-        $('#st-unmount-btn').onclick = async () => {
-            if (!state.selected) return;
-            const drive = state.drives.find(d => d.name === state.selected);
-            if (!drive?.mountpoint) { toast('Dysk nie jest zamontowany', 'warning'); return; }
-            if (!await confirmDialog(`${t('Odmontować')} ${drive.mountpoint}?`)) return;
-            try {
-                await api('/storage/unmount', { method: 'POST', body: { path: drive.mountpoint } });
-                toast('Odmontowano', 'success'); loadDrives();
-            } catch (e) { toast(t('Błąd odmontowywania: ') + e.message, 'error'); }
-        };
-
-        // Relabel
-        $('#st-label-btn').onclick = async () => {
-            if (!state.selected) return;
-            const drive = state.drives.find(d => d.name === state.selected);
-            if (!drive) return;
-            const current = drive.label || '';
-            const newLabel = prompt(`Nowa etykieta dla /dev/${drive.name}:`, current);
-            if (newLabel === null || newLabel === current) return;
-            if (!newLabel.trim()) { toast(t('Etykieta nie może być pusta'), 'error'); return; }
-            if (newLabel.includes('/') || newLabel.length > 32) { toast('Max 32 znaki, bez /', 'error'); return; }
-            try {
-                await api('/storage/relabel', { method: 'POST', body: { drive: drive.name, label: newLabel.trim() } });
-                toast(`Etykieta zmieniona na "${newLabel.trim()}"`, 'success'); loadDrives();
-            } catch (e) { toast(t('Błąd: ') + e.message, 'error'); }
-        };
-
-        // Eject USB
-        $('#st-eject-btn').onclick = async () => {
-            if (!state.selected) return;
-            const drive = state.drives.find(d => d.name === state.selected);
-            const parent = drive?.parent ? state.drives.find(d => d.name === drive.parent) : drive;
-            const diskName = parent?.name || drive?.name;
-            if (!await confirmDialog(`${t('Bezpiecznie wysunąć')} /dev/${diskName}?\n${t('Wszystkie partycje zostaną odmontowane.')}`)) return;
-            try {
-                await api('/storage/eject', { method: 'POST', body: { disk: diskName } });
-                toast(t('Dysk bezpiecznie wysunięty'), 'success');
-                state.selected = null; loadDrives();
-            } catch (e) { toast(t('Błąd wysuwania: ') + e.message, 'error'); }
-        };
-
-        // Keepalive toggle
-        $('#st-keepalive-btn').onclick = async () => {
-            if (!state.selected) return;
-            const drive = state.drives.find(d => d.name === state.selected);
-            if (!drive || !drive.mountpoint) return;
-            const isActive = !!state.keepalive[drive.name];
-            const enable = !isActive;
-            if (enable) {
-                if (!await confirmDialog(`${t('Włączyć auto-remount dla')} ${drive.label || drive.name}?\n${t('Dysk będzie automatycznie montowany ponownie jeśli się odmontuje, a USB autosuspend zostanie wyłączony.')}`)) return;
-            }
-            try {
-                await api('/storage/keepalive', { method: 'POST', body: {
-                    drive: drive.name, mountpoint: drive.mountpoint, fstype: drive.fstype || 'auto',
-                    label: drive.label || drive.name, disk: drive.parent || drive.name, enable,
-                }});
-                toast(enable ? t('Utrzymywanie włączone') : t('Utrzymywanie wyłączone'), 'success');
-                if (enable) state.keepalive[drive.name] = { mountpoint: drive.mountpoint };
-                else delete state.keepalive[drive.name];
-                renderDrives(); updateActions();
-            } catch (e) { toast(t('Błąd: ') + e.message, 'error'); }
-        };
-
-        // SMART from action panel
-        $('#st-smart-btn').onclick = () => {
-            if (!state.selected) return;
-            const drive = state.drives.find(d => d.name === state.selected);
-            showSmartDetail(drive?.parent || drive?.name);
-        };
-
-        /* ─── Format Modal ─── */
-        const fmtModal = $('#st-format-modal');
-        const fmtBody  = $('#st-fmt-body');
-        const fmtFooter = $('#st-fmt-footer');
-        let fmtOptions = [];
-        let fmtSystemFs = 'ext4';
-
-        function closeFmtModal() { fmtModal.style.display = 'none'; }
-        $('#st-fmt-close').onclick  = closeFmtModal;
-        $('#st-fmt-cancel').onclick = closeFmtModal;
-        fmtModal.onclick = (e) => { if (e.target === fmtModal) closeFmtModal(); };
-
-        $('#st-format-btn').onclick = async () => {
-            if (!state.selected) return;
-            const drive = state.drives.find(d => d.name === state.selected);
-            if (!drive) return;
-            if (drive.category === 'system') { toast(t('Nie można formatować dysku systemowego!'), 'error'); return; }
-            if (drive.mountpoint) { toast('Odmontuj dysk przed formatowaniem!', 'warning'); return; }
-            fmtModal.style.display = '';
-            fmtBody.innerHTML = `<div class="sto-center-sm"><i class="fas fa-spinner fa-spin sto-spinner"></i><div class="sto-load-text">${t('Ładowanie opcji...')}</div></div>`;
-            fmtFooter.style.display = '';
-            $('#st-fmt-confirm').disabled = false;
-            $('#st-fmt-confirm').style.display = '';
-            try {
-                const data = await api('/storage/format/options');
-                fmtOptions = data.options || [];
-                fmtSystemFs = data.system_fs || 'ext4';
-                renderFmtForm(drive);
-            } catch (e) {
-                fmtBody.innerHTML = `<div class="sto-error-msg"><i class="fas fa-exclamation-triangle sto-icon-lg"></i><div class="sto-mt-sm">${t('Błąd:')} ${e.message}</div></div>`;
-            }
-        };
-
-        function renderFmtForm(drive) {
-            const recommended = fmtOptions.find(o => o.recommended);
-            const defaultFs = recommended ? recommended.value : 'ext4';
-            fmtBody.innerHTML = `
-                <div class="st-fmt-drive-info">
-                    <i class="fas fa-hdd sto-drive-icon-orange"></i>
-                    <div>
-                        <div class="sto-bold">/dev/${drive.name}</div>
-                        <div class="sto-subtitle">${drive.size || '?'} ${drive.model ? '· ' + drive.model : ''} ${drive.fstype ? '· Aktualnie: ' + drive.fstype : ''}</div>
-                    </div>
-                </div>
-                <div class="st-fmt-field">
-                    <label class="modal-label">${t('System plików')}</label>
-                    <div class="st-fmt-fs-list" id="st-fmt-fs-list">
-                        ${fmtOptions.map(fs => {
-                            const disabled = !fs.available;
-                            const osIcons = [fs.linux ? '<i class="fab fa-linux sto-os-linux" title="Linux"></i>' : '', fs.windows ? '<i class="fab fa-windows sto-os-windows" title="Windows"></i>' : '', fs.mac ? '<i class="fab fa-apple sto-os-mac" title="macOS"></i>' : ''].filter(Boolean).join(' ');
-                            return `
-                            <div class="st-fmt-fs-option ${disabled ? 'disabled' : ''} ${fs.value === defaultFs ? 'selected' : ''}" data-fs="${fs.value}" ${disabled ? `title="${t('Niedostępne')}"` : ''}>
-                                <div class="st-fmt-fs-radio"><div class="st-fmt-fs-radio-dot"></div></div>
-                                <div class="st-fmt-fs-info">
-                                    <div class="st-fmt-fs-label">${fs.label}${fs.recommended ? ' <span class="st-fmt-badge-rec"><i class="fas fa-star"></i> ' + t('Rekomendowany') + '</span>' : ''}${disabled ? ` <span class="st-fmt-badge-na">${t('Niedostępny')}</span>` : ''}</div>
-                                    <div class="st-fmt-fs-desc">${fs.desc}</div>
-                                    <div class="st-fmt-fs-os">${osIcons}</div>
-                                </div>
-                            </div>`;
-                        }).join('')}
-                    </div>
-                </div>
-                <div class="st-fmt-field">
-                    <label class="modal-label">Etykieta dysku <span class="sto-optional">(opcjonalnie)</span></label>
-                    <input type="text" class="modal-input" id="st-fmt-label" placeholder="np. Dane, Backup, Media" maxlength="16">
-                </div>
-                <div class="st-fmt-system-info">
-                    <i class="fas fa-info-circle sto-icon-accent"></i>
-                    <span>${t('System używa:')} <b>${fmtSystemFs}</b></span>
-                </div>`;
-            fmtBody.querySelectorAll('.st-fmt-fs-option:not(.disabled)').forEach(opt => {
-                opt.onclick = () => {
-                    fmtBody.querySelectorAll('.st-fmt-fs-option').forEach(o => o.classList.remove('selected'));
-                    opt.classList.add('selected');
-                };
-            });
-        }
-
-        $('#st-fmt-confirm').onclick = async () => {
-            if (!state.selected) return;
-            const selectedOpt = fmtBody.querySelector('.st-fmt-fs-option.selected');
-            if (!selectedOpt) { toast(t('Wybierz system plików'), 'warning'); return; }
-            const fstype = selectedOpt.dataset.fs;
-            const label  = fmtBody.querySelector('#st-fmt-label')?.value.trim() || '';
-            const fsLabel = fmtOptions.find(o => o.value === fstype)?.label || fstype;
-            if (!await confirmDialog(`⚠️ ${t('UWAGA!')}\n\n${t('Czy na pewno sformatować')} /dev/${state.selected} ${t('na')} ${fsLabel}?\n\n${t('WSZYSTKIE DANE ZOSTANĄ UTRACONE!')}\n${t('Ta operacja jest NIEODWRACALNA!')}`)) return;
-            fmtFooter.style.display = 'none';
-            fmtBody.innerHTML = `
-                <div class="st-fmt-progress">
-                    <div class="st-fmt-progress-header">
-                        <i class="fas fa-cog fa-spin sto-progress-icon-orange"></i>
-                        <div><div class="sto-bold">Formatowanie /dev/${state.selected}</div><div class="sto-subtitle">${fsLabel} ${label ? '· ' + label : ''}</div></div>
-                    </div>
-                    <div class="st-fmt-log" id="st-fmt-log"></div>
-                    <div id="st-fmt-result" style="display:none"></div>
-                </div>`;
-            const logEl = fmtBody.querySelector('#st-fmt-log');
-            const resultEl = fmtBody.querySelector('#st-fmt-result');
-            function addLog(msg, type = 'info') {
-                const icon = type === 'error' ? 'fa-times-circle' : type === 'success' ? 'fa-check-circle' : 'fa-chevron-right';
-                const color = type === 'error' ? '#ef4444' : type === 'success' ? '#10b981' : 'var(--text-muted)';
-                logEl.innerHTML += `<div class="st-fmt-log-line"><i class="fas ${icon} sto-log-icon" style="color:${color}"></i><span>${msg}</span></div>`;
-                logEl.scrollTop = logEl.scrollHeight;
-            }
-            try {
-                const headers = {};
-                if (NAS.token) headers['Authorization'] = `Bearer ${NAS.token}`;
-                if (NAS.csrfToken) headers['X-CSRFToken'] = NAS.csrfToken;
-                headers['Content-Type'] = 'application/json';
-                const resp = await fetch('/api/storage/format', { method: 'POST', headers, body: JSON.stringify({ drive: state.selected, fstype, label }) });
-                if (!resp.ok) { const err = await resp.json().catch(() => ({})); addLog(err.error || t('Błąd formatowania'), 'error'); showFmtDone(false); return; }
-                const reader = resp.body.getReader();
-                const decoder = new TextDecoder();
-                let buf = '';
-                while (true) {
-                    const { done, value } = await reader.read();
-                    if (done) break;
-                    buf += decoder.decode(value, { stream: true });
-                    const lines = buf.split('\n'); buf = lines.pop();
-                    for (const line of lines) {
-                        if (!line.startsWith('data: ')) continue;
-                        try { const ev = JSON.parse(line.slice(6)); if (ev.type === 'step' || ev.type === 'log') addLog(ev.message); if (ev.type === 'done') showFmtDone(ev.success); } catch {}
-                    }
+                async function load() {
+                    try {
+                        const [shares, status] = await Promise.all([api('/storage/samba/shares'), api('/storage/samba/status')]);
+                        st.shares = shares || [];
+                        panel.querySelector('#sh-smb-status').innerHTML = _shBadge(status.running);
+                        renderList();
+                    } catch (e) { panel.querySelector('#sh-smb-list').innerHTML = `<div class="shr-error">${t('Błąd')}: ${e.message}</div>`; }
                 }
-            } catch (e) { addLog(t('Błąd: ') + e.message, 'error'); showFmtDone(false); }
-            function showFmtDone(success) {
-                resultEl.style.display = '';
-                const cog = fmtBody.querySelector('.fa-cog.fa-spin');
-                if (success) {
-                    resultEl.innerHTML = `<div class="st-fmt-result-ok"><i class="fas fa-check-circle sto-result-ok-icon"></i><div><div class="sto-result-ok-text">${t('Formatowanie zakończone!')}</div><div class="sto-result-sub">${t('Dysk gotowy do użycia.')}</div></div></div>`;
-                    if (cog) { cog.classList.remove('fa-cog','fa-spin'); cog.classList.add('fa-check-circle'); cog.style.color = '#10b981'; }
-                } else {
-                    resultEl.innerHTML = `<div class="st-fmt-result-err"><i class="fas fa-times-circle sto-result-err-icon"></i><div><div class="sto-result-err-text">${t('Formatowanie nie powiodło się')}</div><div class="sto-result-sub">${t('Sprawdź logi powyżej.')}</div></div></div>`;
-                    if (cog) { cog.classList.remove('fa-cog','fa-spin'); cog.classList.add('fa-exclamation-triangle'); cog.style.color = '#ef4444'; }
+
+                function renderList() {
+                    const w = panel.querySelector('#sh-smb-list');
+                    if (!st.shares.length) { w.innerHTML = `<div class="shr-empty-msg">${t('Brak udziałów')}</div>`; return; }
+                    w.innerHTML = `<table class="shr-table">
+                        <thead><tr class="shr-thead-row">
+                            <th class="shr-th">${t('Nazwa')}</th><th class="shr-th">${t('Ścieżka')}</th>
+                            <th class="shr-td-center">${t('Gość')}</th><th class="shr-td-center">${t('Zapis')}</th><th></th>
+                        </tr></thead><tbody>${st.shares.map(s => `<tr class="shr-tr">
+                            <td class="shr-td-name">${_shEsc(s.name)}</td>
+                            <td class="shr-td-sec">${_shEsc(s.path)}</td>
+                            <td class="shr-td-center">${s.guest_ok ? '<i class="fas fa-check shr-check-ok"></i>' : '<i class="fas fa-times shr-check-no"></i>'}</td>
+                            <td class="shr-td-center">${s.writable ? '<i class="fas fa-check shr-check-ok"></i>' : '<i class="fas fa-times shr-check-no"></i>'}</td>
+                            <td class="shr-td-actions">
+                                <button class="fm-toolbar-btn btn-sm sh-sma" data-name="${_shEscAttr(s.name)}" title="${t('Uprawnienia')}"><i class="fas fa-shield-alt"></i></button>
+                                <button class="fm-toolbar-btn btn-sm sh-sme" data-name="${_shEscAttr(s.name)}" data-path="${_shEscAttr(s.path)}" data-guest="${s.guest_ok}" data-writable="${s.writable}"><i class="fas fa-pen"></i></button>
+                                <button class="fm-toolbar-btn btn-sm btn-red sh-smd" data-name="${_shEscAttr(s.name)}"><i class="fas fa-trash"></i></button>
+                            </td></tr>`).join('')}</tbody></table>`;
+                    w.querySelectorAll('.sh-sma').forEach(b => b.onclick = () => showAclEditor(b.dataset.name));
+                    w.querySelectorAll('.sh-sme').forEach(b => b.onclick = () => showForm({ name: b.dataset.name, path: b.dataset.path, guest_ok: b.dataset.guest === 'true', writable: b.dataset.writable === 'true' }));
+                    w.querySelectorAll('.sh-smd').forEach(b => b.onclick = async () => { if (!await confirmDialog(t('Usunąć udział'), t('Usunąć') + ` "${b.dataset.name}"?`)) return; await api('/storage/samba/share', { method: 'DELETE', body: { name: b.dataset.name } }); toast(t('Usunięto'), 'success'); load(); });
                 }
-                fmtFooter.style.display = '';
-                fmtFooter.innerHTML = '<button class="btn btn-primary" id="st-fmt-done-btn"><i class="fas fa-check"></i> Zamknij</button>';
-                fmtFooter.querySelector('#st-fmt-done-btn').onclick = () => { closeFmtModal(); loadDrives(); };
-            }
-        };
 
-        /* ─── Merge Partitions ─── */
-        $('#st-merge-btn').onclick = async () => {
-            if (!state.selected) return;
-            const drive = state.drives.find(d => d.name === state.selected);
-            const parent = drive?.parent ? state.drives.find(d => d.name === drive.parent) : (drive?.type === 'disk' ? drive : null);
-            if (!parent) { toast(t('Nie znaleziono dysku nadrzędnego'), 'warning'); return; }
-            const childParts = state.drives.filter(d => d.parent === parent.name);
-            if (childParts.length < 2) { toast(t('Dysk ma tylko jedną partycję'), 'warning'); return; }
-            if (parent.category === 'system') { toast(t('Nie można łączyć partycji dysku systemowego!'), 'error'); return; }
-            const mountedParts = childParts.filter(d => d.mountpoint);
-            if (mountedParts.length) { toast(`Odmontuj najpierw: ${mountedParts.map(d => d.name).join(', ')}`, 'warning'); return; }
-
-            fmtModal.style.display = '';
-            fmtBody.innerHTML = '<div class="sto-center-sm"><i class="fas fa-spinner fa-spin sto-spinner"></i></div>';
-            fmtFooter.style.display = '';
-            fmtFooter.innerHTML = `<button class="btn" id="st-merge-cancel2">${t('Anuluj')}</button><button class="btn btn-danger" id="st-merge-confirm"><i class="fas fa-object-group"></i> ${t('Połącz i formatuj')}</button>`;
-            fmtFooter.querySelector('#st-merge-cancel2').onclick = closeFmtModal;
-
-            try {
-                const data = await api('/storage/format/options');
-                fmtOptions = data.options || [];
-                fmtSystemFs = data.system_fs || 'ext4';
-                const recommended = fmtOptions.find(o => o.recommended);
-                const defaultFs = recommended ? recommended.value : 'ext4';
-                fmtBody.innerHTML = `
-                    <div class="st-fmt-drive-info sto-drive-info-merge">
-                        <i class="fas fa-object-group sto-drive-icon-purple"></i>
-                        <div>
-                            <div class="sto-bold">/dev/${parent.name} — ${t('Łączenie partycji')}</div>
-                            <div class="sto-subtitle">${parent.size || '?'} ${parent.model ? '· ' + parent.model : ''}</div>
-                            <div class="sto-merge-parts"><i class="fas fa-exclamation-triangle"></i> Partycje: ${childParts.map(d => `<b>${d.name}</b> (${d.size})`).join(', ')}</div>
-                        </div>
-                    </div>
-                    <div class="st-fmt-field">
-                        <label class="modal-label">${t('System plików')}</label>
-                        <div class="st-fmt-fs-list" id="st-fmt-fs-list">
-                            ${fmtOptions.map(fs => {
-                                const disabled = !fs.available;
-                                const osIcons = [fs.linux ? '<i class="fab fa-linux sto-os-linux" title="Linux"></i>' : '', fs.windows ? '<i class="fab fa-windows sto-os-windows" title="Windows"></i>' : '', fs.mac ? '<i class="fab fa-apple sto-os-mac" title="macOS"></i>' : ''].filter(Boolean).join(' ');
-                                return `<div class="st-fmt-fs-option ${disabled ? 'disabled' : ''} ${fs.value === defaultFs ? 'selected' : ''}" data-fs="${fs.value}"><div class="st-fmt-fs-radio"><div class="st-fmt-fs-radio-dot"></div></div><div class="st-fmt-fs-info"><div class="st-fmt-fs-label">${fs.label}${fs.recommended ? ' <span class="st-fmt-badge-rec"><i class="fas fa-star"></i> Rek.</span>' : ''}${disabled ? ' <span class="st-fmt-badge-na">N/D</span>' : ''}</div><div class="st-fmt-fs-desc">${fs.desc}</div><div class="st-fmt-fs-os">${osIcons}</div></div></div>`;
-                            }).join('')}
-                        </div>
-                    </div>
-                    <div class="st-fmt-field">
-                        <label class="modal-label">Etykieta <span class="sto-optional">(opcjonalnie)</span></label>
-                        <input type="text" class="modal-input" id="st-fmt-label" placeholder="np. Dane" maxlength="16">
-                    </div>
-                    <div class="st-fmt-system-info sto-sys-info-danger">
-                        <i class="fas fa-exclamation-triangle sto-text-danger"></i>
-                        <span class="sto-text-danger"><b>${t('UWAGA:')}</b> ${t('Wszystkie partycje i dane na')} /dev/${parent.name} ${t('zostaną usunięte.')}</span>
-                    </div>`;
-                fmtBody.querySelectorAll('.st-fmt-fs-option:not(.disabled)').forEach(opt => {
-                    opt.onclick = () => { fmtBody.querySelectorAll('.st-fmt-fs-option').forEach(o => o.classList.remove('selected')); opt.classList.add('selected'); };
-                });
-            } catch (e) { fmtBody.innerHTML = `<div class="sto-error-msg">${t('Błąd:')} ${e.message}</div>`; return; }
-
-            fmtFooter.querySelector('#st-merge-confirm').onclick = async () => {
-                const selectedOpt = fmtBody.querySelector('.st-fmt-fs-option.selected');
-                if (!selectedOpt) { toast(t('Wybierz system plików'), 'warning'); return; }
-                const fstype = selectedOpt.dataset.fs;
-                const label = fmtBody.querySelector('#st-fmt-label')?.value.trim() || '';
-                const fsLabel = fmtOptions.find(o => o.value === fstype)?.label || fstype;
-                if (!await confirmDialog(`⚠️ ${t('UWAGA!')}\n\n${t('Połączyć partycje na')} /dev/${parent.name}?\n\n${t('Partycje')} ${childParts.map(d => d.name).join(', ')} ${t('zostaną USUNIĘTE.')}\n${t('WSZYSTKIE DANE ZOSTANĄ UTRACONE!')}`)) return;
-
-                fmtFooter.style.display = 'none';
-                fmtBody.innerHTML = `<div class="st-fmt-progress"><div class="st-fmt-progress-header"><i class="fas fa-cog fa-spin sto-progress-icon-purple"></i><div><div class="sto-bold">${t('Łączenie')} /dev/${parent.name}</div><div class="sto-subtitle">${fsLabel}</div></div></div><div class="st-fmt-log" id="st-fmt-log"></div><div id="st-fmt-result" style="display:none"></div></div>`;
-                const logEl = fmtBody.querySelector('#st-fmt-log');
-                const resultEl = fmtBody.querySelector('#st-fmt-result');
-                function addLog(msg, type = 'info') {
-                    const icon = type === 'error' ? 'fa-times-circle' : type === 'success' ? 'fa-check-circle' : 'fa-chevron-right';
-                    const color = type === 'error' ? '#ef4444' : type === 'success' ? '#10b981' : 'var(--text-muted)';
-                    logEl.innerHTML += `<div class="st-fmt-log-line"><i class="fas ${icon} sto-log-icon" style="color:${color}"></i><span>${msg}</span></div>`;
-                    logEl.scrollTop = logEl.scrollHeight;
-                }
-                try {
-                    const headers = {}; if (NAS.token) headers['Authorization'] = `Bearer ${NAS.token}`; if (NAS.csrfToken) headers['X-CSRFToken'] = NAS.csrfToken; headers['Content-Type'] = 'application/json';
-                    const resp = await fetch('/api/storage/merge', { method: 'POST', headers, body: JSON.stringify({ disk: parent.name, fstype, label }) });
-                    if (!resp.ok) { const err = await resp.json().catch(() => ({})); addLog(err.error || t('Błąd'), 'error'); showDone(false); return; }
-                    const reader = resp.body.getReader(); const decoder = new TextDecoder(); let buf = '';
-                    while (true) { const { done, value } = await reader.read(); if (done) break; buf += decoder.decode(value, { stream: true }); const lines = buf.split('\n'); buf = lines.pop(); for (const line of lines) { if (!line.startsWith('data: ')) continue; try { const ev = JSON.parse(line.slice(6)); if (ev.type === 'step' || ev.type === 'log') addLog(ev.message); if (ev.type === 'done') showDone(ev.success); } catch {} } }
-                } catch (e) { addLog(t('Błąd: ') + e.message, 'error'); showDone(false); }
-                function showDone(success) {
-                    resultEl.style.display = ''; const cog = fmtBody.querySelector('.fa-cog.fa-spin');
-                    resultEl.innerHTML = success
-                        ? `<div class="st-fmt-result-ok"><i class="fas fa-check-circle sto-result-ok-icon"></i><div><div class="sto-result-ok-text">${t('Partycje połączone!')}</div></div></div>`
-                        : `<div class="st-fmt-result-err"><i class="fas fa-times-circle sto-result-err-icon"></i><div><div class="sto-result-err-text">${t('Łączenie nie powiodło się')}</div></div></div>`;
-                    if (cog) { cog.classList.remove('fa-cog','fa-spin'); cog.classList.add(success ? 'fa-check-circle' : 'fa-exclamation-triangle'); cog.style.color = success ? '#10b981' : '#ef4444'; }
-                    fmtFooter.style.display = '';
-                    fmtFooter.innerHTML = '<button class="btn btn-primary" id="st-merge-done">Zamknij</button>';
-                    fmtFooter.querySelector('#st-merge-done').onclick = () => { closeFmtModal(); loadDrives(); };
-                }
-            };
-        };
-
-        /* ─── Split / Partition Disk ─── */
-        $('#st-split-btn').onclick = async () => {
-            if (!state.selected) return;
-            const drive = state.drives.find(d => d.name === state.selected);
-            const parentDisk = drive?.parent ? state.drives.find(d => d.name === drive.parent) : (drive?.type === 'disk' ? drive : null);
-            if (!parentDisk) { toast('Nie znaleziono dysku', 'warning'); return; }
-            if (parentDisk.category === 'system') { toast(t('Nie można partycjonować dysku systemowego!'), 'error'); return; }
-            const childParts = state.drives.filter(d => d.parent === parentDisk.name);
-            const mountedParts = childParts.filter(d => d.mountpoint);
-            if (mountedParts.length) { toast(`Odmontuj najpierw: ${mountedParts.map(d => d.name).join(', ')}`, 'warning'); return; }
-
-            let diskSizeMB = 0;
-            const sizeStr = parentDisk.size || '0';
-            const m = sizeStr.match(/([\d.]+)\s*([KMGTP]?)/i);
-            if (m) {
-                let val = parseFloat(m[1]);
-                const unit = (m[2] || '').toUpperCase();
-                if (unit === 'T') val *= 1024 * 1024; else if (unit === 'G') val *= 1024; else if (unit === 'M') val *= 1; else if (unit === 'K') val /= 1024;
-                diskSizeMB = Math.floor(val);
-            }
-            if (!diskSizeMB) diskSizeMB = 1024;
-
-            fmtModal.style.display = '';
-            fmtBody.innerHTML = '<div class="sto-center-sm"><i class="fas fa-spinner fa-spin sto-spinner"></i></div>';
-            fmtFooter.style.display = '';
-
-            let splitFsOptions = [];
-            try {
-                const data = await api('/storage/format/options');
-                splitFsOptions = (data.options || []).filter(o => o.available);
-                fmtSystemFs = data.system_fs || 'ext4';
-            } catch (e) { fmtBody.innerHTML = `<div class="sto-error-msg">${t('Błąd:')} ${e.message}</div>`; return; }
-
-            const splitParts = [{ size_mb: 0, fstype: fmtSystemFs, label: '' }];
-
-            function renderSplitModal() {
-                const usedMB = splitParts.reduce((s, p) => s + (p.size_mb || 0), 0);
-                const freeMB = Math.max(0, diskSizeMB - usedMB - 1);
-                const fsSelectHtml = (idx, selected) => splitFsOptions.map(fs => `<option value="${fs.value}" ${fs.value === selected ? 'selected' : ''}>${fs.label}${fs.recommended ? ' ★' : ''}</option>`).join('');
-                const colors = ['#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6','#ec4899','#06b6d4','#84cc16'];
-                fmtBody.innerHTML = `
-                    <div class="st-fmt-drive-info sto-drive-info-split">
-                        <i class="fas fa-columns sto-drive-icon-cyan"></i>
-                        <div>
-                            <div class="sto-bold">/dev/${parentDisk.name} — ${t('Podział na partycje')}</div>
-                            <div class="sto-subtitle">${parentDisk.size || '?'} (${diskSizeMB.toLocaleString()} MB) ${parentDisk.model ? '· ' + parentDisk.model : ''}</div>
-                        </div>
-                    </div>
-                    <div class="st-split-bar">
-                        ${splitParts.map((p, i) => {
-                            const pctW = p.size_mb ? Math.max(2, (p.size_mb / diskSizeMB) * 100) : Math.max(2, (freeMB / diskSizeMB) * 100);
-                            return `<div class="st-split-bar-seg" style="width:${pctW}%;background:${colors[i % colors.length]}" title="Part ${i+1}: ${p.size_mb ? p.size_mb + ' MB' : t('Reszta')}"></div>`;
-                        }).join('')}
-                    </div>
-                    <div class="st-split-parts" id="st-split-parts">
-                        ${splitParts.map((p, i) => `
-                        <div class="st-split-part" data-idx="${i}">
-                            <div class="st-split-part-num">${i + 1}</div>
-                            <div class="st-split-part-fields">
-                                <div class="st-split-row">
-                                    <label>Rozmiar:</label>
-                                    <input type="number" class="modal-input st-split-size" data-idx="${i}" value="${p.size_mb || ''}" placeholder="Reszta" min="1" max="${diskSizeMB}" style="width:120px">
-                                    <span class="sto-free-label">MB</span>
-                                    <label class="storage-check sto-ml-sm"><input type="checkbox" class="st-split-rest" data-idx="${i}" ${!p.size_mb ? 'checked' : ''}> Reszta</label>
-                                </div>
-                                <div class="st-split-row">
-                                    <label>FS:</label>
-                                    <select class="modal-input st-split-fs" data-idx="${i}" style="width:140px">${fsSelectHtml(i, p.fstype)}</select>
-                                    <label>Etykieta:</label>
-                                    <input type="text" class="modal-input st-split-label" data-idx="${i}" value="${p.label}" placeholder="opcjonalnie" maxlength="16" style="width:120px">
-                                    ${splitParts.length > 1 ? `<button class="fm-toolbar-btn btn-red btn-sm st-split-del" data-idx="${i}" title="${t('Usuń')}"><i class="fas fa-times"></i></button>` : ''}
-                                </div>
-                            </div>
-                        </div>`).join('')}
-                    </div>
-                    <div class="sto-split-footer">
-                        <button class="fm-toolbar-btn btn-green" id="st-split-add" ${splitParts.length >= 8 ? 'disabled' : ''}><i class="fas fa-plus"></i> ${t('Dodaj partycję')}</button>
-                        <span class="sto-free-label">Wolne: <b>${freeMB.toLocaleString()}</b> MB</span>
-                    </div>
-                    <div class="st-fmt-system-info sto-sys-info-danger sto-mt-md">
-                        <i class="fas fa-exclamation-triangle sto-text-danger"></i>
-                        <span class="sto-text-danger"><b>${t('UWAGA:')}</b> ${t('Istniejące partycje i dane zostaną usunięte!')}</span>
-                    </div>`;
-                fmtBody.querySelectorAll('.st-split-size').forEach(inp => {
-                    inp.oninput = () => { splitParts[+inp.dataset.idx].size_mb = parseInt(inp.value) || 0; const cb = fmtBody.querySelector(`.st-split-rest[data-idx="${inp.dataset.idx}"]`); if (cb && inp.value) cb.checked = false; };
-                });
-                fmtBody.querySelectorAll('.st-split-rest').forEach(cb => {
-                    cb.onchange = () => {
-                        const idx = +cb.dataset.idx;
-                        if (cb.checked) { splitParts.forEach((p, i) => { if (i !== idx) p.size_mb = p.size_mb || 1024; }); splitParts[idx].size_mb = 0; renderSplitModal(); }
-                        else { splitParts[idx].size_mb = Math.floor(freeMB / 2) || 1024; renderSplitModal(); }
+                function showForm(s) {
+                    const f = panel.querySelector('#sh-smb-form');
+                    f.style.display = '';
+                    f.innerHTML = `<div class="shr-form-section">
+                        <h4 class="shr-form-title">${s ? t('Edytuj') : t('Nowy udział')}</h4>
+                        <div class="shr-form-row">
+                            <input type="text" id="sh-sf-n" class="fm-input" placeholder="${t('Nazwa')}" value="${s?.name || ''}" style="width:140px" ${s ? 'readonly' : ''}>
+                            <div class="shr-input-group"><input type="text" id="sh-sf-p" class="fm-input" placeholder="${t('Ścieżka')}" value="${s?.path || ''}" style="width:200px;border-radius:6px 0 0 6px" readonly><button class="fm-toolbar-btn shr-input-group-btn" id="sh-sf-browse" title="${t('Przeglądaj')}"><i class="fas fa-folder-open"></i></button></div>
+                            <label class="shr-checkbox-label"><input type="checkbox" id="sh-sf-g" ${!s || s.guest_ok ? 'checked' : ''}> ${t('Gość')}</label>
+                            <label class="shr-checkbox-label"><input type="checkbox" id="sh-sf-w" ${!s || s.writable ? 'checked' : ''}> ${t('Zapis')}</label>
+                            <button class="fm-toolbar-btn btn-green" id="sh-sf-ok"><i class="fas fa-save"></i></button>
+                            <button class="fm-toolbar-btn" id="sh-sf-x"><i class="fas fa-times"></i></button>
+                        </div></div>`;
+                    panel.querySelector('#sh-sf-browse').onclick = () => openDirPicker(panel.querySelector('#sh-sf-p').value || '/home', t('Wybierz folder'), p => { panel.querySelector('#sh-sf-p').value = p; });
+                    panel.querySelector('#sh-sf-ok').onclick = async () => {
+                        const n = panel.querySelector('#sh-sf-n').value.trim(), p = panel.querySelector('#sh-sf-p').value.trim();
+                        if (!n || !p) { toast(t('Podaj nazwę i ścieżkę'), 'warning'); return; }
+                        try {
+                            const resp = await api('/storage/samba/share', { method: 'POST', body: { name: n, path: p, guest_ok: panel.querySelector('#sh-sf-g').checked, writable: panel.querySelector('#sh-sf-w').checked } });
+                            if (resp.error) { toast(t('Błąd: ') + resp.error, 'error'); return; }
+                            toast(t('Udział zapisany'), 'success'); f.style.display = 'none'; load();
+                        } catch (e) { toast(t('Błąd zapisu: ') + (e.message || 'nieznany'), 'error'); }
                     };
-                });
-                fmtBody.querySelectorAll('.st-split-fs').forEach(sel => { sel.onchange = () => { splitParts[+sel.dataset.idx].fstype = sel.value; }; });
-                fmtBody.querySelectorAll('.st-split-label').forEach(inp => { inp.oninput = () => { splitParts[+inp.dataset.idx].label = inp.value; }; });
-                fmtBody.querySelectorAll('.st-split-del').forEach(btn => { btn.onclick = () => { splitParts.splice(+btn.dataset.idx, 1); renderSplitModal(); }; });
-                const addBtn = fmtBody.querySelector('#st-split-add');
-                if (addBtn) addBtn.onclick = () => {
-                    if (splitParts.length >= 8) return;
-                    const hasRest = splitParts.some(p => !p.size_mb);
-                    splitParts.push({ size_mb: hasRest ? Math.floor(freeMB / 2) || 1024 : 0, fstype: fmtSystemFs, label: '' });
-                    renderSplitModal();
-                };
-            }
-
-            renderSplitModal();
-            fmtFooter.innerHTML = '<button class="btn" id="st-split-cancel2">Anuluj</button><button class="btn btn-danger" id="st-split-confirm"><i class="fas fa-columns"></i> Podziel i formatuj</button>';
-            fmtFooter.querySelector('#st-split-cancel2').onclick = closeFmtModal;
-
-            fmtFooter.querySelector('#st-split-confirm').onclick = async () => {
-                fmtBody.querySelectorAll('.st-split-size').forEach(inp => { splitParts[+inp.dataset.idx].size_mb = parseInt(inp.value) || 0; });
-                fmtBody.querySelectorAll('.st-split-fs').forEach(sel => { splitParts[+sel.dataset.idx].fstype = sel.value; });
-                fmtBody.querySelectorAll('.st-split-label').forEach(inp => { splitParts[+inp.dataset.idx].label = inp.value; });
-                const hasRest = splitParts.filter(p => !p.size_mb).length;
-                if (hasRest > 1) { toast(t('Tylko jedna partycja może być "Reszta"'), 'warning'); return; }
-                const totalMB = splitParts.reduce((s, p) => s + (p.size_mb || 0), 0);
-                if (totalMB > diskSizeMB) { toast('Suma przekracza rozmiar dysku!', 'error'); return; }
-                const descs = splitParts.map((p, i) => `  ${i+1}. ${p.size_mb ? p.size_mb + ' MB' : t('Reszta')} (${p.fstype})`).join('\n');
-                if (!await confirmDialog(`⚠️ ${t('UWAGA!')}\n\n${t('Podzielić')} /dev/${parentDisk.name} ${t('na')} ${splitParts.length} ${t('partycji?')}\n\n${descs}\n\n${t('WSZYSTKIE DANE ZOSTANĄ UTRACONE!')}`)) return;
-                fmtFooter.style.display = 'none';
-                fmtBody.innerHTML = `<div class="st-fmt-progress"><div class="st-fmt-progress-header"><i class="fas fa-cog fa-spin sto-progress-icon-cyan"></i><div><div class="sto-bold">Partycjonowanie /dev/${parentDisk.name}</div><div class="sto-subtitle">${splitParts.length} partycji</div></div></div><div class="st-fmt-log" id="st-fmt-log"></div><div id="st-fmt-result" style="display:none"></div></div>`;
-                const logEl = fmtBody.querySelector('#st-fmt-log');
-                const resultEl = fmtBody.querySelector('#st-fmt-result');
-                function addLog(msg, type = 'info') {
-                    const icon = type === 'error' ? 'fa-times-circle' : type === 'success' ? 'fa-check-circle' : 'fa-chevron-right';
-                    const color = type === 'error' ? '#ef4444' : type === 'success' ? '#10b981' : 'var(--text-muted)';
-                    logEl.innerHTML += `<div class="st-fmt-log-line"><i class="fas ${icon} sto-log-icon" style="color:${color}"></i><span>${msg}</span></div>`;
-                    logEl.scrollTop = logEl.scrollHeight;
+                    panel.querySelector('#sh-sf-x').onclick = () => { f.style.display = 'none'; };
                 }
-                try {
-                    const headers = {}; if (NAS.token) headers['Authorization'] = `Bearer ${NAS.token}`; if (NAS.csrfToken) headers['X-CSRFToken'] = NAS.csrfToken; headers['Content-Type'] = 'application/json';
-                    const resp = await fetch('/api/storage/partition', { method: 'POST', headers, body: JSON.stringify({ disk: parentDisk.name, partitions: splitParts }) });
-                    if (!resp.ok) { const err = await resp.json().catch(() => ({})); addLog(err.error || t('Błąd'), 'error'); showDone(false); return; }
-                    const reader = resp.body.getReader(); const decoder = new TextDecoder(); let buf = '';
-                    while (true) { const { done, value } = await reader.read(); if (done) break; buf += decoder.decode(value, { stream: true }); const lines = buf.split('\n'); buf = lines.pop(); for (const line of lines) { if (!line.startsWith('data: ')) continue; try { const ev = JSON.parse(line.slice(6)); if (ev.type === 'step' || ev.type === 'log') addLog(ev.message); if (ev.type === 'done') showDone(ev.success); } catch {} } }
-                } catch (e) { addLog(t('Błąd: ') + e.message, 'error'); showDone(false); }
-                function showDone(success) {
-                    resultEl.style.display = ''; const cog = fmtBody.querySelector('.fa-cog.fa-spin');
-                    resultEl.innerHTML = success
-                        ? `<div class="st-fmt-result-ok"><i class="fas fa-check-circle sto-result-ok-icon"></i><div><div class="sto-result-ok-text">${t('Partycjonowanie zakończone!')}</div></div></div>`
-                        : `<div class="st-fmt-result-err"><i class="fas fa-times-circle sto-result-err-icon"></i><div><div class="sto-result-err-text">${t('Partycjonowanie nie powiodło się')}</div></div></div>`;
-                    if (cog) { cog.classList.remove('fa-cog','fa-spin'); cog.classList.add(success ? 'fa-check-circle' : 'fa-exclamation-triangle'); cog.style.color = success ? '#10b981' : '#ef4444'; }
-                    fmtFooter.style.display = '';
-                    fmtFooter.innerHTML = '<button class="btn btn-primary" id="st-split-done">Zamknij</button>';
-                    fmtFooter.querySelector('#st-split-done').onclick = () => { closeFmtModal(); loadDrives(); };
-                }
-            };
-        };
 
-        /* ─── LUKS Encryption ─── */
-        $('#st-encrypt-btn').onclick = async () => {
-            if (!state.selected) return;
-            const drive = state.drives.find(d => d.name === state.selected);
-            if (!drive) return;
-            const dev = `/dev/${drive.name}`;
-
-            if (drive.fstype === 'crypto_LUKS') {
-                const info = await api(`/encryption/status?device=${encodeURIComponent(dev)}`);
-                if (info.unlocked) {
-                    if (!await confirmDialog(t('Zablokować zaszyfrowany wolumen?'))) return;
+                async function showAclEditor(shareName) {
+                    let acl, users, groups;
                     try {
-                        const r = await api('/encryption/lock', { method: 'POST', body: { device: dev } });
-                        if (r.error) { toast(r.error, 'error'); return; }
-                        toast(t('Wolumen zablokowany'), 'success'); loadDrives();
-                    } catch (e) { toast(e.message, 'error'); }
-                } else {
-                    showModal(t('Odblokuj wolumen'), `
-                        <div class="usr-form">
-                            <label>${t('Hasło szyfrowania')}</label>
-                            <input type="password" id="st-luks-pw" class="modal-input" autofocus>
-                            <label style="margin-top:8px">${t('Punkt montowania (opcjonalnie)')}</label>
-                            <input type="text" id="st-luks-mp" class="modal-input" placeholder="/mnt/encrypted" value="/mnt/encrypted">
-                        </div>`, [
+                        const [aclRes, usersRes, groupsRes] = await Promise.all([
+                            api('/storage/samba/share/acl?name=' + encodeURIComponent(shareName)),
+                            api('/users/list'), api('/users/groups'),
+                        ]);
+                        acl = aclRes.acl || { users: {}, groups: {} };
+                        users = (Array.isArray(usersRes) ? usersRes : []).map(u => u.username);
+                        groups = (groupsRes.groups || []).map(g => g.name);
+                    } catch (e) { toast(t('Błąd ładowania ACL'), 'error'); return; }
+                    const permOpts = (current) => ['rw', 'ro', 'none'].map(p =>
+                        `<option value="${p}" ${current === p ? 'selected' : ''}>${p === 'rw' ? t('Odczyt/Zapis') : p === 'ro' ? t('Tylko odczyt') : t('Brak dostępu')}</option>`
+                    ).join('');
+                    let userRows = users.map(u => `<tr><td style="padding:4px 8px">${_shEsc(u)}</td><td style="padding:4px"><select class="fm-input acl-u" data-name="${_shEscAttr(u)}" style="width:160px">${permOpts(acl.users[u] || '')}<option value="" ${!acl.users[u] ? 'selected' : ''}>—</option></select></td></tr>`).join('');
+                    let groupRows = groups.map(g => `<tr><td style="padding:4px 8px">@${_shEsc(g)}</td><td style="padding:4px"><select class="fm-input acl-g" data-name="${_shEscAttr(g)}" style="width:160px">${permOpts(acl.groups[g] || '')}<option value="" ${!acl.groups[g] ? 'selected' : ''}>—</option></select></td></tr>`).join('');
+                    showModal(t('Uprawnienia — ') + shareName, `
+                        <div style="max-height:400px;overflow-y:auto">
+                            <h4 style="margin:0 0 8px;font-size:13px;color:var(--text-secondary)"><i class="fas fa-user"></i> ${t('Użytkownicy')}</h4>
+                            <table style="width:100%;margin-bottom:12px">${userRows || '<tr><td style="color:var(--text-muted);padding:8px">' + t('Brak użytkowników') + '</td></tr>'}</table>
+                            <h4 style="margin:0 0 8px;font-size:13px;color:var(--text-secondary)"><i class="fas fa-users"></i> ${t('Grupy')}</h4>
+                            <table style="width:100%">${groupRows || '<tr><td style="color:var(--text-muted);padding:8px">' + t('Brak grup') + '</td></tr>'}</table>
+                            <p style="font-size:11px;color:var(--text-muted);margin-top:8px"><i class="fas fa-info-circle"></i> ${t('Puste = domyślnie (wszyscy mogą). Ustaw jawnie aby ograniczyć.')}</p>
+                        </div>
+                    `, [
                         { label: t('Anuluj'), class: 'secondary' },
-                        { label: t('Odblokuj'), class: 'primary', action: async (m) => {
-                            const pw = m.querySelector('#st-luks-pw').value;
-                            const mp = m.querySelector('#st-luks-mp').value.trim();
-                            if (!pw) { toast(t('Podaj hasło'), 'warning'); return; }
+                        { label: t('Resetuj ACL'), class: 'warning', action: async () => {
+                            if (!await confirmDialog(t('Usunąć wszystkie uprawnienia dla tego udziału?'))) return;
+                            await api('/storage/samba/share/acl', { method: 'DELETE', body: { name: shareName } });
+                            toast(t('ACL usunięte'), 'success');
+                        }},
+                        { label: t('Zapisz'), class: 'primary', action: async (modal) => {
+                            const newAcl = { users: {}, groups: {} };
+                            modal.querySelectorAll('.acl-u').forEach(sel => { if (sel.value) newAcl.users[sel.dataset.name] = sel.value; });
+                            modal.querySelectorAll('.acl-g').forEach(sel => { if (sel.value) newAcl.groups[sel.dataset.name] = sel.value; });
                             try {
-                                const r = await api('/encryption/unlock', { method: 'POST', body: { device: dev, passphrase: pw, mount: mp } });
+                                const r = await api('/storage/samba/share/acl', { method: 'PUT', body: { name: shareName, ...newAcl } });
                                 if (r.error) { toast(r.error, 'error'); return; }
-                                toast(t('Wolumen odblokowany'), 'success'); loadDrives();
+                                toast(t('Uprawnienia zapisane'), 'success');
                             } catch (e) { toast(e.message, 'error'); }
                         }}
                     ]);
                 }
-            } else {
-                if (drive.mountpoint) { toast(t('Odmontuj dysk przed szyfrowaniem'), 'warning'); return; }
-                showModal(t('Szyfruj LUKS2 — ') + dev, `
-                    <div class="usr-form">
-                        <div class="st-fmt-system-info sto-sys-info-danger" style="margin-bottom:12px">
-                            <i class="fas fa-exclamation-triangle sto-text-danger"></i>
-                            <span class="sto-text-danger"><b>${t('UWAGA:')}</b> ${t('Wszystkie dane na urządzeniu zostaną usunięte!')}</span>
-                        </div>
-                        <label>${t('Hasło szyfrowania (min 8 znaków)')}</label>
-                        <input type="password" id="st-luks-pw1" class="modal-input">
-                        <label>${t('Powtórz hasło')}</label>
-                        <input type="password" id="st-luks-pw2" class="modal-input">
-                        <label>${t('Etykieta')}</label>
-                        <input type="text" id="st-luks-label" class="modal-input" value="encrypted" maxlength="32">
-                        <label>${t('System plików')}</label>
-                        <select id="st-luks-fs" class="modal-input">
-                            <option value="btrfs">Btrfs</option>
-                            <option value="ext4">ext4</option>
-                            <option value="xfs">XFS</option>
-                        </select>
-                        <label style="margin-top:8px"><input type="checkbox" id="st-luks-auto"> ${t('Auto-odblokuj przy starcie (keyfile)')}</label>
-                    </div>`, [
-                    { label: t('Anuluj'), class: 'secondary' },
-                    { label: t('Szyfruj'), class: 'danger', action: async (m) => {
-                        const pw1 = m.querySelector('#st-luks-pw1').value;
-                        const pw2 = m.querySelector('#st-luks-pw2').value;
-                        const label = m.querySelector('#st-luks-label').value.trim() || 'encrypted';
-                        const fs = m.querySelector('#st-luks-fs').value;
-                        const autoUnlock = m.querySelector('#st-luks-auto').checked;
-                        if (!pw1 || pw1.length < 8) { toast(t('Hasło min 8 znaków'), 'warning'); return; }
-                        if (pw1 !== pw2) { toast(t('Hasła nie pasują'), 'warning'); return; }
-                        try {
-                            const r = await api('/encryption/encrypt', { method: 'POST', body: { device: dev, passphrase: pw1, label, filesystem: fs } });
-                            if (r.error) { toast(r.error, 'error'); return; }
-                            toast(t('Wolumen zaszyfrowany!'), 'success');
-                            if (autoUnlock) {
-                                await api('/encryption/auto-unlock', { method: 'PUT', body: { device: dev, passphrase: pw1, mount: `/mnt/${label}` } });
-                            }
-                            loadDrives();
-                        } catch (e) { toast(e.message, 'error'); }
-                    }}
-                ]);
+
+                panel.querySelector('#sh-smb-add').onclick = () => showForm(null);
+                panel.querySelector('#sh-smb-ref').onclick = () => load();
+                panel.querySelector('#sh-smb-pwb').onclick = async () => {
+                    const u = panel.querySelector('#sh-smb-pwu').value.trim(), p = panel.querySelector('#sh-smb-pwp').value;
+                    if (!u || !p) { toast(t('Podaj użytkownika i hasło'), 'warning'); return; }
+                    try {
+                        const resp = await api('/storage/samba/password', { method: 'POST', body: { username: u, password: p } });
+                        if (resp.error) { toast(t('Błąd: ') + resp.error, 'error'); return; }
+                        toast(t('Hasło ustawione'), 'success'); panel.querySelector('#sh-smb-pwp').value = '';
+                    } catch(e) { toast(t('Błąd ustawiania hasła: ') + e.message, 'error'); }
+                };
+                load();
             }
-        };
-
-        /* ─── Init Disks Section ─── */
-        $('#st-refresh').onclick = () => loadDrives();
-        loadDrives();
-
-        return null;
-    }
 
