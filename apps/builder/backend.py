@@ -1,7 +1,29 @@
 """
 EthOS — Builder Blueprint
-Build releases and system images from the EthOS web panel.
+Build releases, system images, and publish optional apps to GitHub.
 All heavy operations run on the host and stream progress via SSE.
+
+Endpoints:
+  GET  /api/builder/info                  -> version info, existing releases
+  GET  /api/builder/status                -> current build status
+  POST /api/builder/cancel                -> cancel running build
+  POST /api/builder/dismiss               -> dismiss build notification
+  GET  /api/builder/history               -> build history
+  POST /api/builder/history/clear         -> clear history
+  GET  /api/builder/cache                 -> cache info
+  DELETE /api/builder/cache               -> clear cache
+  GET/PUT/DELETE /api/builder/spec        -> build spec CRUD
+  GET  /api/builder/spec/defaults         -> default spec
+  POST /api/builder/release               -> build release (SSE)
+  POST /api/builder/image                 -> build image (SSE)
+  GET  /api/builder/publish-config        -> GitHub publish config (token masked)
+  PUT  /api/builder/publish-config        -> save GitHub publish config
+  GET  /api/builder/publish-diff          -> compare local apps with GitHub
+  POST /api/builder/publish-apps          -> publish changed apps to GitHub (SSE)
+  GET  /api/builder/logs                  -> build log
+  POST /api/builder/logs/clear            -> clear log
+  POST /api/builder/delete                -> delete artifact
+  GET  /api/builder/download              -> download artifact
 """
 
 import json
@@ -21,6 +43,8 @@ from host import host_run as _host_run_base, host_run_stream as _host_run_stream
     app_path, data_path, log_path, q as _q
 from utils import load_json as _load_json, save_json as _save_json, fmt_bytes, register_pkg_routes, \
     require_tools, check_tool
+from blueprints.builder_spec import load_spec, save_spec, generate_default_spec, \
+    spec_to_shell_vars, DEFAULT_SPEC
 
 builder_bp = Blueprint('builder', __name__, url_prefix='/api/builder')
 
@@ -416,6 +440,56 @@ def cache_clear():
 
 
 # ═══════════════════════════════════════════════════════════
+#  API — Build Spec (Declarative YAML configuration)
+# ═══════════════════════════════════════════════════════════
+
+@builder_bp.route('/spec', methods=['GET'])
+def get_build_spec():
+    """Return current build spec (merged defaults + user overrides)."""
+    spec = load_spec()
+    return jsonify({'ok': True, 'spec': spec})
+
+
+@builder_bp.route('/spec', methods=['PUT'])
+def update_build_spec():
+    """Update build spec with provided values."""
+    data = request.json
+    if not data:
+        return jsonify({'error': 'No spec data provided'}), 400
+    try:
+        # Load current, merge updates, save
+        spec = load_spec()
+        for section, values in data.items():
+            if section in spec and isinstance(spec[section], dict) and isinstance(values, dict):
+                spec[section].update(values)
+            else:
+                spec[section] = values
+        save_spec(spec)
+        return jsonify({'ok': True, 'spec': spec})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@builder_bp.route('/spec', methods=['DELETE'])
+def reset_build_spec():
+    """Reset build spec to defaults."""
+    try:
+        import os as _os
+        path = data_path('build-spec.yaml')
+        if _os.path.isfile(path):
+            _os.unlink(path)
+        return jsonify({'ok': True, 'spec': DEFAULT_SPEC})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@builder_bp.route('/spec/defaults', methods=['GET'])
+def get_default_spec():
+    """Return the default build spec (unmodified)."""
+    return jsonify({'ok': True, 'spec': DEFAULT_SPEC})
+
+
+# ═══════════════════════════════════════════════════════════
 #  API — Build Release (SSE)
 # ═══════════════════════════════════════════════════════════
 
@@ -539,7 +613,7 @@ cp "$NASOS/frontend/manifest.json" "$BUILD_DIR/$PKG/frontend/" 2>/dev/null || tr
 cp "$NASOS/frontend/css/"*.css "$BUILD_DIR/$PKG/frontend/css/"
 cp "$NASOS/frontend/js/"*.js "$BUILD_DIR/$PKG/frontend/js/"
 # Copy only CORE app JS files — optional apps are installed via Package Center
-OPTIONAL_JS="{' '.join(sorted(optional_js))}"
+OPTIONAL_JS="{optional_js}"
 for js in "$NASOS/frontend/js/apps/"*.js; do
   fname=$(basename "$js")
   if echo "$OPTIONAL_JS" | grep -qw "$fname"; then
@@ -713,12 +787,20 @@ def _x86_wrapper_script(nasos: str) -> str:
     """Return bash wrapper script for building x86 image."""
     optional_js_list = ' '.join(_OPTIONAL_JS)
     optional_py_list = ' '.join(_OPTIONAL_PY)
+
+    # Load declarative build spec
+    spec = load_spec()
+    spec_vars = spec_to_shell_vars(spec)
+
     return f"""
 set -e
 set -o pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 NASOS="{nasos}"
+
+# ── Declarative build spec (from data/build-spec.yaml) ──
+{spec_vars}
 
 # Check dependencies
 echo "STEP:2:Checking dependencies..."
@@ -727,8 +809,8 @@ for cmd in debootstrap parted mkfs.ext4 mkfs.vfat grub-install; do
         echo "STEP:3:Installing dependencies..."
         apt-get update -qq
         apt-get install -y -qq debootstrap parted dosfstools e2fsprogs \\
-            grub-pc-bin grub-efi-amd64-bin grub-common grub2-common \\
-            mtools xorriso isolinux debian-archive-keyring 2>/dev/null || true
+            grub-efi-amd64-bin grub-common grub2-common \\
+            mtools xorriso isolinux debian-archive-keyring squashfs-tools zstd cryptsetup-bin 2>/dev/null || true
         break
     fi
 done
@@ -742,23 +824,15 @@ fi
 
 echo "STEP:5:Preparing environment..."
 
-# Source config from the script but override with our values
+# Version from version.json (not overridden by spec)
 VERSION=$(python3 -c "import json; print(json.load(open('$NASOS/backend/version.json'))['version'])" 2>/dev/null || echo '2.4.0')
-BRAND_NAME=$(grep '^ETHOS_BRAND_NAME=' "$NASOS/install.conf" 2>/dev/null | cut -d'"' -f2)
-BRAND_NAME=${{BRAND_NAME:-EthOS}}
 FINAL_IMG="$NASOS/installer/images/ethos-x86.img"
 WORK_DIR="/tmp/ethos-x86-build-web"
-IMG_SIZE_GB=8
-DEBIAN_RELEASE="bookworm"
-DEFAULT_USER="nasadmin"
-DEFAULT_HOSTNAME="ethos"
-USER_PASS="ethos"
-NAS_PORT="9000"
 
 # ── Performance: use tmpfs (RAM) for build if enough memory ──
 TOTAL_RAM_MB=$(awk '/MemAvailable/{{print int($2/1024)}}' /proc/meminfo 2>/dev/null || echo 0)
 USE_TMPFS=0
-if [ "$TOTAL_RAM_MB" -gt 10000 ]; then
+if [ "$TOTAL_RAM_MB" -gt "$TMPFS_MIN_RAM_MB" ]; then
     USE_TMPFS=1
     echo "LOG:Available RAM: ${{TOTAL_RAM_MB}}MB — building in tmpfs (RAM) for speed"
     mkdir -p "$WORK_DIR"
@@ -808,17 +882,15 @@ LOOP_DEV=$(losetup --find --show --partscan "$OUTPUT_IMG")
 echo "LOG:Loop device: $LOOP_DEV"
 
 parted -s "$LOOP_DEV" mklabel gpt
-parted -s "$LOOP_DEV" mkpart ESP fat32 1MiB 257MiB
+parted -s "$LOOP_DEV" mkpart ESP fat32 1MiB ${{ESP_SIZE_MB}}MiB
 parted -s "$LOOP_DEV" set 1 esp on
-parted -s "$LOOP_DEV" mkpart primary 257MiB 258MiB
-parted -s "$LOOP_DEV" set 2 bios_grub on
-parted -s "$LOOP_DEV" mkpart primary ext4 258MiB 100%
+parted -s "$LOOP_DEV" mkpart primary ext4 ${{ESP_SIZE_MB}}MiB $((${{ESP_SIZE_MB}} + ${{ROOT_SIZE_MB}}))MiB
 partprobe "$LOOP_DEV"; sleep 1
 
 mkfs.vfat -F32 "${{LOOP_DEV}}p1"
-mkfs.ext4 -q -L "ethos-root" "${{LOOP_DEV}}p3"
+mkfs.ext4 -q -L "ethos-root" "${{LOOP_DEV}}p2"
 
-mount "${{LOOP_DEV}}p3" "$WORK_DIR/root"
+mount "${{LOOP_DEV}}p2" "$WORK_DIR/root"
 mkdir -p "$WORK_DIR/root/boot/efi"
 mount "${{LOOP_DEV}}p1" "$WORK_DIR/root/boot/efi"
 
@@ -831,20 +903,7 @@ if [ -d "$DEBOOTSTRAP_CACHE" ] && [ "$(ls -A "$DEBOOTSTRAP_CACHE" 2>/dev/null)" 
     echo "LOG:Using debootstrap cache ($(du -sh "$DEBOOTSTRAP_CACHE" | cut -f1))"
 fi
 debootstrap --cache-dir="$DEBOOTSTRAP_CACHE" --variant=minbase --include=\\
-systemd,systemd-sysv,dbus,\\
-linux-image-amd64,\\
-grub-pc-bin,grub-efi-amd64-bin,grub-efi-amd64,grub-common,grub2-common,\\
-efibootmgr,\\
-sudo,openssh-server,curl,ca-certificates,gnupg,lsb-release,fail2ban,\\
-iproute2,iputils-ping,wireguard-tools,qrencode,\\
-bash,locales,console-setup,\\
-python3,python3-minimal,\\
-dosfstools,e2fsprogs,parted,util-linux,\\
-rsync,smartmontools,ethtool,hdparm,cpufrequtils,\\
-cryptsetup,\\
-usbutils,pciutils,lm-sensors,nut,\\
-avahi-daemon,libnss-mdns,\\
-kmod,udev \\
+$DEBOOTSTRAP_INCLUDE \\
     "$DEBIAN_RELEASE" "$WORK_DIR/root" http://deb.debian.org/debian 2>&1 | \\
     while IFS= read -r line; do
         if echo "$line" | grep -qE "^I: Retrieving"; then
@@ -913,11 +972,11 @@ chroot "$ROOT" apt-get update -qq 2>&1 | tail -3 || true
 chroot "$ROOT" bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq network-manager dbus-user-session' 2>&1 | tail -5 || echo "LOG:network-manager install issue"
 
 echo "LOG:Creating fstab, hostname, locale..."
-ROOT_UUID=$(blkid -s UUID -o value "${{LOOP_DEV}}p3")
+ROOT_UUID=$(blkid -s UUID -o value "${{LOOP_DEV}}p2")
 EFI_UUID=$(blkid -s UUID -o value "${{LOOP_DEV}}p1")
 
 if [ -z "$ROOT_UUID" ]; then
-    echo "LOG:ERROR: Failed to read root partition UUID (${{LOOP_DEV}}p3)"
+    echo "LOG:ERROR: Failed to read root partition UUID (${{LOOP_DEV}}p2)"
     exit 1
 fi
 if [ -z "$EFI_UUID" ]; then
@@ -928,16 +987,13 @@ fi
 cat > "$ROOT/etc/fstab" <<FSTAB
 UUID=$ROOT_UUID  /          ext4  noatime,errors=remount-ro  0 1
 UUID=$EFI_UUID   /boot/efi  vfat  umask=0077         0 1
-/swapfile        none       swap  sw                 0 0
 FSTAB
 
 echo "$DEFAULT_HOSTNAME" > "$ROOT/etc/hostname"
 
-# ── Swap file (4 GB) ──
-echo "LOG:Creating swap file..."
-fallocate -l 4G "$ROOT/swapfile"
-chmod 600 "$ROOT/swapfile"
-mkswap "$ROOT/swapfile" >/dev/null
+# NOTE: Swap is intentionally NOT created in the build image.
+# The installer generates its own fstab with swap on the data partition.
+# Keeping the root partition small allows dd-based fast cloning.
 
 # ── I/O tuning for low-power NAS hardware ──
 echo "LOG:Konfiguracja I/O tuning..."
@@ -972,7 +1028,7 @@ UDEV
 cat > "$ROOT/etc/udev/rules.d/60-ethos-scheduler.rules" <<'UDEV_SCHED'
 ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{{queue/rotational}}=="1", ATTR{{queue/scheduler}}="bfq"
 ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{{queue/rotational}}=="0", ATTR{{queue/scheduler}}="none"
-ACTION=="add|change", KERNEL=="nvme*", ATTR{{queue/scheduler}}="none"
+ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", TEST=="queue/scheduler", ATTR{{queue/scheduler}}="none"
 UDEV_SCHED
 
 # Logrotate policy for EthOS logs
@@ -1149,9 +1205,11 @@ chroot "$ROOT" ufw default allow outgoing 2>/dev/null || true
 chroot "$ROOT" ufw allow from $LAN to any port 22 proto tcp comment 'SSH' 2>/dev/null || true
 chroot "$ROOT" ufw allow from $LAN to any port 9000 proto tcp comment 'EthOS Web UI' 2>/dev/null || true
 chroot "$ROOT" ufw allow from $LAN to any port 80,443 proto tcp comment 'HTTP / HTTPS' 2>/dev/null || true
-# Enable UFW non-interactively
-chroot "$ROOT" bash -c 'echo "y" | ufw enable' 2>/dev/null || true
-chroot "$ROOT" systemctl enable ufw 2>/dev/null || true
+# NOTE: Do NOT enable UFW here — during installer mode (USB boot) there is
+# no firewall needed (open hotspot). UFW is enabled by the installer when
+# it writes the system to the target disk (system_ops.configure_services).
+# Enabling UFW in chroot can also produce broken iptables state.
+echo "LOG:UFW rules configured (will be enabled after installation)"
 
 # ── SSH Hardening ──
 echo "LOG:SSH hardening..."
@@ -1244,17 +1302,13 @@ GRUBDEF
 echo "STEP:52:System configured"
 
 # ── Step 4: GRUB ──
-echo "STEP:53:Installing GRUB (BIOS + UEFI)..."
+echo "STEP:53:Installing GRUB (UEFI)..."
 
 echo "LOG:apt-get update in chroot..."
 chroot "$ROOT" apt-get update -qq 2>&1 | tail -3 || true
-echo "LOG:Installing GRUB packages..."
-chroot "$ROOT" bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq grub-efi-amd64 grub-pc-bin grub-common efibootmgr' 2>&1 | tail -5 || true
-
-echo "LOG:GRUB BIOS install..."
-chroot "$ROOT" grub-install --target=i386-pc --boot-directory=/boot "$LOOP_DEV" 2>/dev/null || \\
-    grub-install --target=i386-pc --boot-directory="$ROOT/boot" "$LOOP_DEV" 2>/dev/null || \\
-    echo "LOG:BIOS grub-install warning (UEFI ok)"
+echo "LOG:Installing GRUB packages (from backports for UEFI compatibility)..."
+DEBIAN_FRONTEND=noninteractive chroot "$ROOT" apt-get install -y -qq -t ${{DEBIAN_RELEASE}}-backports grub-efi-amd64 grub-efi-amd64-bin grub-common grub2-common 2>&1 | tail -5 || true
+DEBIAN_FRONTEND=noninteractive chroot "$ROOT" apt-get install -y -qq efibootmgr 2>&1 | tail -5 || true
 
 mkdir -p "$ROOT/boot/efi/EFI/BOOT"
 echo "LOG:GRUB UEFI install..."
@@ -1286,6 +1340,12 @@ menuentry "EthOS v${{VERSION}} (recovery)" {{
 GRUBCFG
 
 cp "$ROOT/boot/grub/grub.cfg" "$ROOT/boot/efi/EFI/BOOT/grub.cfg"
+
+# Copy kernel + initrd to ESP recovery directory
+mkdir -p "$ROOT/boot/efi/EFI/recovery"
+cp "$ROOT/boot/${{KERN##*/}}" "$ROOT/boot/efi/EFI/recovery/vmlinuz" 2>/dev/null || true
+cp "$ROOT/boot/${{INITRD##*/}}" "$ROOT/boot/efi/EFI/recovery/initrd.img" 2>/dev/null || true
+echo "LOG:Recovery kernel copied to ESP"
 
 echo "STEP:60:GRUB installed"
 
@@ -1320,7 +1380,7 @@ chroot "$ROOT" apt-get install -y -qq \
 echo "LOG:Installing builder tools..."
 chroot "$ROOT" apt-get install -y -qq \
     debootstrap squashfs-tools xorriso isolinux \
-    parted dosfstools e2fsprogs mtools \
+    parted dosfstools e2fsprogs btrfs-progs mtools \
     2>&1 | tail -5 || echo "LOG:Some builder tools skipped"
 
 echo "STEP:73:Installing kernel and firmware from backports..."
@@ -1344,6 +1404,36 @@ if [[ -n "$OLD_KERN" && -n "$NEW_KERN" && "$OLD_KERN" != "$NEW_KERN" ]]; then
     echo "LOG:Old kernel removed"
 fi
 
+# Refresh grub.cfg + BOOTX64.EFI now that the backports kernel is active
+KERN=$(ls "$ROOT/boot/vmlinuz-"* 2>/dev/null | sort -V | tail -1 | sed "s|$ROOT||")
+INITRD=$(ls "$ROOT/boot/initrd.img-"* 2>/dev/null | sort -V | tail -1 | sed "s|$ROOT||")
+echo "LOG:Refreshing GRUB config for kernel: $KERN"
+cat > "$ROOT/boot/grub/grub.cfg" <<GRUBCFG
+set timeout=3
+set default=0
+insmod part_gpt
+insmod ext2
+insmod gzio
+menuentry "EthOS v${{VERSION}}" {{
+    search --no-floppy --fs-uuid --set=root ${{ROOT_UUID}}
+    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro quiet net.ifnames=0 biosdevname=0 fsck.repair=preen
+    initrd ${{INITRD}}
+}}
+menuentry "EthOS v${{VERSION}} (recovery)" {{
+    search --no-floppy --fs-uuid --set=root ${{ROOT_UUID}}
+    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro single nomodeset fsck.repair=preen
+    initrd ${{INITRD}}
+}}
+GRUBCFG
+cp "$ROOT/boot/grub/grub.cfg" "$ROOT/boot/efi/EFI/BOOT/grub.cfg"
+# Update recovery kernel on ESP
+cp "$ROOT/boot/${{KERN##*/}}" "$ROOT/boot/efi/EFI/recovery/vmlinuz" 2>/dev/null || true
+cp "$ROOT/boot/${{INITRD##*/}}" "$ROOT/boot/efi/EFI/recovery/initrd.img" 2>/dev/null || true
+# Re-run grub-install to refresh BOOTX64.EFI modules
+chroot "$ROOT" grub-install --target=x86_64-efi --efi-directory=/boot/efi \
+    --boot-directory=/boot --removable --no-nvram 2>/dev/null || echo "LOG:grub-install refresh skipped"
+echo "LOG:GRUB refreshed for backports kernel"
+
 echo "LOG:Installing firmware-iwlwifi from backports..."
 chroot "$ROOT" apt-get install -y -qq -t ${{DEBIAN_RELEASE}}-backports firmware-iwlwifi 2>&1 | tail -5 || echo "LOG:Backports iwlwifi skipped"
 echo "LOG:Installing firmware-realtek from backports..."
@@ -1364,7 +1454,100 @@ rm -rf "$ROOT/var/lib/apt/lists/"* 2>/dev/null || true
 echo "LOG:Disk usage before initramfs:"
 df -h "$ROOT" 2>/dev/null | tail -1 || true
 
-# Rebuild initramfs with firmware (only for the new kernel)
+# ── SquashFS + OverlayFS initramfs hooks ──
+# These hooks allow the installed system to boot from a read-only squashfs
+# with a persistent overlay on the ext4 root partition.
+echo "LOG:Adding SquashFS overlay boot support to initramfs..."
+mkdir -p "$ROOT/etc/initramfs-tools/hooks"
+mkdir -p "$ROOT/etc/initramfs-tools/scripts/local-bottom"
+
+cat > "$ROOT/etc/initramfs-tools/hooks/ethos-overlay" <<'HOOKEOF'
+#!/bin/sh
+PREREQ=""
+prereqs() {{ echo "$PREREQ"; }}
+case "$1" in prereqs) prereqs; exit 0 ;; esac
+. /usr/share/initramfs-tools/hook-functions
+manual_add_modules squashfs
+manual_add_modules overlay
+manual_add_modules loop
+manual_add_modules dm_verity
+manual_add_modules dm_mod
+copy_exec /sbin/losetup /sbin
+# dm-verity support (optional — only if veritysetup is installed)
+if [ -x /sbin/veritysetup ]; then
+    copy_exec /sbin/veritysetup /sbin
+fi
+HOOKEOF
+chmod +x "$ROOT/etc/initramfs-tools/hooks/ethos-overlay"
+
+cat > "$ROOT/etc/initramfs-tools/scripts/local-bottom/ethos-overlay" <<'OVERLAYEOF'
+#!/bin/sh
+# EthOS SquashFS + OverlayFS boot script with optional dm-verity integrity check
+# Converts ext4 root into: squashfs (read-only lower) + ext4 overlay (writable upper)
+# Activated by kernel cmdline: ethos.rootfs=squashfs
+PREREQ=""
+prereqs() {{ echo "$PREREQ"; }}
+case "$1" in prereqs) prereqs; exit 0 ;; esac
+grep -q "ethos.rootfs=squashfs" /proc/cmdline || exit 0
+[ -f "${{rootmnt}}/root.sqsh" ] || exit 0
+modprobe -q squashfs 2>/dev/null || true
+modprobe -q overlay 2>/dev/null || true
+modprobe -q loop 2>/dev/null || true
+mkdir -p /run/ethos-rootfs
+mount --move "${{rootmnt}}" /run/ethos-rootfs
+
+# dm-verity integrity check (optional — runs if roothash and verity data exist)
+VERITY_OK=0
+ROOTHASH_FILE="/run/ethos-rootfs/boot/efi/EFI/ethos/roothash"
+VERITY_FILE="/run/ethos-rootfs/root.sqsh.verity"
+SQSH_FILE="/run/ethos-rootfs/root.sqsh"
+if [ -f "$ROOTHASH_FILE" ] && [ -f "$VERITY_FILE" ] && command -v veritysetup >/dev/null 2>&1; then
+    modprobe -q dm_verity 2>/dev/null || true
+    modprobe -q dm_mod 2>/dev/null || true
+    ROOTHASH=$(cat "$ROOTHASH_FILE")
+    LOOP_DEV=$(losetup --find --show "$SQSH_FILE")
+    HASH_DEV=$(losetup --find --show "$VERITY_FILE")
+    if veritysetup open --hash-offset=0 "$LOOP_DEV" ethos-verity "$HASH_DEV" "$ROOTHASH" 2>/dev/null; then
+        # Verified! Mount from dm-verity device
+        mkdir -p /run/ethos-sqsh
+        if mount -t squashfs -o ro /dev/mapper/ethos-verity /run/ethos-sqsh 2>/dev/null; then
+            VERITY_OK=1
+        else
+            veritysetup close ethos-verity 2>/dev/null
+        fi
+    fi
+    if [ "$VERITY_OK" = "0" ]; then
+        losetup -d "$LOOP_DEV" 2>/dev/null
+        losetup -d "$HASH_DEV" 2>/dev/null
+        echo "ethos-overlay: dm-verity verification FAILED — falling back to unverified mount"
+    fi
+fi
+
+# Standard mount (no verity or verity unavailable)
+if [ "$VERITY_OK" = "0" ]; then
+    mkdir -p /run/ethos-sqsh
+    if ! mount -t squashfs -o ro,loop "$SQSH_FILE" /run/ethos-sqsh 2>/dev/null; then
+        mount --move /run/ethos-rootfs "${{rootmnt}}"
+        exit 0
+    fi
+fi
+
+mkdir -p /run/ethos-rootfs/overlay/upper /run/ethos-rootfs/overlay/work
+if ! mount -t overlay overlay \
+    -o "lowerdir=/run/ethos-sqsh,upperdir=/run/ethos-rootfs/overlay/upper,workdir=/run/ethos-rootfs/overlay/work" \
+    "${{rootmnt}}" 2>/dev/null; then
+    umount /run/ethos-sqsh 2>/dev/null
+    [ "$VERITY_OK" = "1" ] && veritysetup close ethos-verity 2>/dev/null
+    mount --move /run/ethos-rootfs "${{rootmnt}}"
+    exit 0
+fi
+mkdir -p "${{rootmnt}}/.squashfs" "${{rootmnt}}/.rootfs"
+mount --move /run/ethos-rootfs "${{rootmnt}}/.rootfs"
+mount --move /run/ethos-sqsh "${{rootmnt}}/.squashfs"
+OVERLAYEOF
+chmod +x "$ROOT/etc/initramfs-tools/scripts/local-bottom/ethos-overlay"
+
+# Rebuild initramfs with firmware + overlay hooks (only for the new kernel)
 echo "LOG:Przebudowa initramfs..."
 if [[ -n "$NEW_KERN" ]]; then
     chroot "$ROOT" update-initramfs -u -k "$NEW_KERN" 2>&1 | tail -5 || echo "LOG:initramfs update failed"
@@ -1625,16 +1808,17 @@ chroot "$ROOT" systemctl set-default multi-user.target 2>/dev/null || true
 cat > "$ROOT/etc/systemd/system/ethos.service" <<SVCETHOS
 [Unit]
 Description=EthOS NAS
-After=network.target
+After=network.target local-fs.target
 Wants=network.target
 Conflicts=ethos-preboot.service
+RequiresMountsFor=/mnt/data
 
 [Service]
 Type=notify
 NotifyAccess=all
 WorkingDirectory=/opt/ethos
 EnvironmentFile=/opt/ethos/ethos.env
-ExecStartPre=/bin/mkdir -p /opt/ethos/data /opt/ethos/logs /opt/ethos/backups /opt/ethos/uploads
+ExecStartPre=/bin/bash -c 'for d in data logs backups uploads venv; do p="/opt/ethos/\$d"; [ -L "\$p" ] && mkdir -p "\$(readlink "\$p")" || mkdir -p "\$p"; done'
 Environment=PYTHONPATH=/opt/ethos/backend
 ExecStart=/opt/ethos/venv/bin/python /opt/ethos/backend/app.py
 Restart=on-failure
@@ -1726,6 +1910,71 @@ echo "LOG:Wykorzystanie dysku w obrazie:"
 du -sh "$ROOT"/* 2>/dev/null | sort -rh | head -10 || true
 df -h "$ROOT" 2>/dev/null || true
 
+# ── Step 7a: Create SquashFS immutable root image ──
+# SquashFS = golden image of the installed system (NOT the installer USB state).
+# Data dirs are symlinked to /mnt/data/ethos/ for persistence across updates.
+if command -v mksquashfs >/dev/null 2>&1; then
+    echo "STEP:87:Creating SquashFS immutable root image..."
+
+    ETHOS_DIR_SQ="$ROOT/opt/ethos"
+    # Prepare clean installed-system state (squashfs should NOT contain installer artifacts)
+    for d in data logs backups uploads venv; do
+        rm -rf "$ETHOS_DIR_SQ/$d"
+        ln -s "/mnt/data/ethos/$d" "$ETHOS_DIR_SQ/$d"
+    done
+    rm -f "$ETHOS_DIR_SQ/.installer-mode" "$ETHOS_DIR_SQ/.installed"
+    mkdir -p "$ROOT/mnt/data"
+    mkdir -p "$ROOT/mnt/snapshots"
+
+    SQSH_OUT="$WORK_DIR/ethos-root.sqsh"
+    mksquashfs "$ROOT" "$SQSH_OUT" \
+        -comp zstd -Xcompression-level $SQSH_COMPRESSION_LEVEL \
+        -noappend -no-progress \
+        -e "$ROOT/proc" \
+        -e "$ROOT/sys" \
+        -e "$ROOT/dev" \
+        -e "$ROOT/run" \
+        -e "$ROOT/tmp" \
+        -e "$ROOT/media" \
+        -e "$ROOT/lost+found" \
+        -e "$ROOT/swapfile" \
+        -e "$ROOT/var/swap" \
+        -e "$ROOT/opt/ethos/installer/images" \
+        2>&1 | tail -10
+
+    SQSH_SIZE=$(stat -c%s "$SQSH_OUT" 2>/dev/null || echo 0)
+    echo "LOG:SquashFS image: $((SQSH_SIZE / 1048576))MB"
+
+    # Generate dm-verity hash tree for integrity verification
+    if command -v veritysetup >/dev/null 2>&1; then
+        echo "LOG:Generating dm-verity hash tree..."
+        VERITY_OUT="$WORK_DIR/ethos-root.sqsh.verity"
+        ROOTHASH_OUT="$WORK_DIR/ethos-root.sqsh.roothash"
+        veritysetup format "$SQSH_OUT" "$VERITY_OUT" 2>/dev/null | tee /tmp/verity-format.txt
+        ROOTHASH=$(grep "Root hash:" /tmp/verity-format.txt | awk '{{print $NF}}')
+        if [ -n "$ROOTHASH" ]; then
+            echo "$ROOTHASH" > "$ROOTHASH_OUT"
+            VERITY_SIZE=$(stat -c%s "$VERITY_OUT" 2>/dev/null || echo 0)
+            echo "LOG:dm-verity: root hash=$ROOTHASH, hash tree=$((VERITY_SIZE / 1024))KB"
+        else
+            echo "LOG:WARNING: dm-verity format failed — skipping"
+            rm -f "$VERITY_OUT" "$ROOTHASH_OUT"
+        fi
+        rm -f /tmp/verity-format.txt
+    else
+        echo "LOG:veritysetup not found — dm-verity disabled (install cryptsetup-bin for verified boot)"
+    fi
+
+    # Restore USB/installer state (so the USB can still boot the installer)
+    for d in data logs backups uploads venv; do
+        rm -f "$ETHOS_DIR_SQ/$d"
+        mkdir -p "$ETHOS_DIR_SQ/$d"
+    done
+    touch "$ETHOS_DIR_SQ/.installer-mode"
+else
+    echo "LOG:WARNING: mksquashfs not found — SquashFS image will not be created"
+fi
+
 sync
 
 for m in boot/efi run sys proc dev/shm dev/pts dev; do
@@ -1735,6 +1984,83 @@ done
 sleep 1
 umount "$ROOT" 2>/dev/null || \
     umount -l "$ROOT" 2>/dev/null || true
+
+# ── Step 7b: Inject install image(s) into filesystem ──
+ROOT_PART="${{LOOP_DEV}}p2"
+
+if [ -f "$WORK_DIR/ethos-root.sqsh" ]; then
+    # SquashFS available — inject as primary install method
+    echo "STEP:88:Injecting SquashFS image..."
+    mount "$ROOT_PART" "$WORK_DIR/root"
+    mkdir -p "$WORK_DIR/root/opt/ethos/installer/images"
+    cp "$WORK_DIR/ethos-root.sqsh" "$WORK_DIR/root/opt/ethos/installer/images/ethos-root.sqsh"
+    SQSH_FINAL=$(stat -c%s "$WORK_DIR/root/opt/ethos/installer/images/ethos-root.sqsh" 2>/dev/null || echo 0)
+    echo "LOG:SquashFS image injected: $((SQSH_FINAL / 1048576))MB"
+    rm -f "$WORK_DIR/ethos-root.sqsh"
+
+    # Inject dm-verity data alongside squashfs
+    if [ -f "$WORK_DIR/ethos-root.sqsh.verity" ] && [ -f "$WORK_DIR/ethos-root.sqsh.roothash" ]; then
+        cp "$WORK_DIR/ethos-root.sqsh.verity" "$WORK_DIR/root/opt/ethos/installer/images/ethos-root.sqsh.verity"
+        cp "$WORK_DIR/ethos-root.sqsh.roothash" "$WORK_DIR/root/opt/ethos/installer/images/ethos-root.sqsh.roothash"
+        # Also copy to boot/efi for the installed system
+        mkdir -p "$WORK_DIR/root/boot/efi/EFI/ethos"
+        cp "$WORK_DIR/ethos-root.sqsh.roothash" "$WORK_DIR/root/boot/efi/EFI/ethos/roothash"
+        echo "LOG:dm-verity data injected"
+        rm -f "$WORK_DIR/ethos-root.sqsh.verity" "$WORK_DIR/ethos-root.sqsh.roothash"
+    fi
+    sync
+    umount "$WORK_DIR/root" 2>/dev/null || \
+        umount -l "$WORK_DIR/root" 2>/dev/null || true
+else
+    # Fallback: create dd+zstd compressed root image for non-squashfs install
+    echo "STEP:88:Creating compressed root image (fallback)..."
+    COMPRESSED_IMG="$WORK_DIR/ethos-root.img.zst"
+
+    echo "LOG:Running e2fsck on root partition..."
+    e2fsck -f -y "$ROOT_PART" 2>&1 | tail -5 || true
+
+    echo "LOG:Shrinking root filesystem to minimum size..."
+    resize2fs -M "$ROOT_PART" 2>&1 | tail -5
+    BLOCK_COUNT=$(dumpe2fs -h "$ROOT_PART" 2>/dev/null | awk '/Block count:/ {{print $3}}')
+    BLOCK_SIZE=$(dumpe2fs -h "$ROOT_PART" 2>/dev/null | awk '/Block size:/ {{print $3}}')
+    if [ -n "$BLOCK_COUNT" ] && [ -n "$BLOCK_SIZE" ]; then
+        USED_BYTES=$((BLOCK_COUNT * BLOCK_SIZE))
+        SAFE_BYTES=$(( (USED_BYTES * 105 / 100 + 4194303) / 4194304 * 4194304 ))
+        DD_COUNT=$((SAFE_BYTES / 4194304))
+        echo "LOG:Root partition minimized: ${{BLOCK_COUNT}} blocks x ${{BLOCK_SIZE}}B = $((USED_BYTES / 1048576))MB, dd count=$DD_COUNT"
+        DECOMPRESSED_BYTES=$((DD_COUNT * 4194304))
+        set -o pipefail
+        dd if="$ROOT_PART" bs=4M count=$DD_COUNT status=none | zstd -3 -T0 -o "$COMPRESSED_IMG" 2>&1
+        DD_RC=$?
+        set +o pipefail
+        if [ $DD_RC -ne 0 ]; then
+            echo "LOG:WARNING: dd+zstd pipeline failed with code $DD_RC"
+        fi
+        if [ -f "$COMPRESSED_IMG" ]; then
+            COMP_SIZE=$(stat -c%s "$COMPRESSED_IMG" 2>/dev/null || echo 0)
+            echo "LOG:Compressed root image: $((COMP_SIZE / 1048576))MB (decompressed: $((DECOMPRESSED_BYTES / 1048576))MB)"
+            # Validate the compressed image
+            if ! zstd -t "$COMPRESSED_IMG" 2>/dev/null; then
+                echo "LOG:WARNING: Compressed image failed integrity check — removing"
+                rm -f "$COMPRESSED_IMG"
+            fi
+        fi
+    fi
+
+    echo "LOG:Expanding root filesystem back..."
+    resize2fs "$ROOT_PART" 2>&1 | tail -3
+
+    mount "$ROOT_PART" "$WORK_DIR/root"
+    if [ -f "$COMPRESSED_IMG" ]; then
+        mkdir -p "$WORK_DIR/root/opt/ethos/installer/images"
+        cp "$COMPRESSED_IMG" "$WORK_DIR/root/opt/ethos/installer/images/ethos-root.img.zst"
+        echo "LOG:Compressed root image injected into filesystem"
+        rm -f "$COMPRESSED_IMG"
+    fi
+    sync
+    umount "$WORK_DIR/root" 2>/dev/null || \
+        umount -l "$WORK_DIR/root" 2>/dev/null || true
+fi
 
 echo "STEP:90:Finalizacja obrazu IMG..."
 
@@ -1873,6 +2199,440 @@ def download_artifact():
 
 def _human_size(b):
     return fmt_bytes(b)
+
+
+# ═══════════════════════════════════════════════════════════
+#  Publish Apps to GitHub
+# ═══════════════════════════════════════════════════════════
+
+_PUBLISH_CONFIG_FILE = data_path('builder_github.json')
+_PUBLISH_REPO_DEFAULT = 'SyncHot/ethos-os-ethos-apps'
+
+
+def _load_publish_config():
+    try:
+        if os.path.isfile(_PUBLISH_CONFIG_FILE):
+            with open(_PUBLISH_CONFIG_FILE) as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_publish_config(cfg):
+    tmp = _PUBLISH_CONFIG_FILE + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, _PUBLISH_CONFIG_FILE)
+
+
+def _github_api(method, path, token, body=None, timeout=30):
+    """Call GitHub REST API. Returns (status_code, parsed_json)."""
+    import urllib.request, urllib.error
+    url = f'https://api.github.com{path}'
+    data = json.dumps(body).encode() if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header('Authorization', f'token {token}')
+    req.add_header('Accept', 'application/vnd.github+json')
+    req.add_header('User-Agent', 'EthOS-Builder/1.0')
+    if data:
+        req.add_header('Content-Type', 'application/json')
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            body_text = e.read().decode()
+            return e.code, json.loads(body_text)
+        except Exception:
+            return e.code, {'message': str(e)}
+
+
+def _bump_version(ver):
+    """Bump patch version: 1.0.0 -> 1.0.1"""
+    parts = ver.split('.')
+    while len(parts) < 3:
+        parts.append('0')
+    parts[2] = str(int(parts[2]) + 1)
+    return '.'.join(parts)
+
+
+def _get_app_files(app_id):
+    """Get local file paths for an optional app. Returns dict with 'backend' and 'frontend' paths."""
+    import importlib
+    am = importlib.import_module('blueprints.app_manager')
+
+    files = {}
+    bp_info = am._OPTIONAL_BLUEPRINTS.get(app_id)
+    if bp_info:
+        module_name = bp_info[0]
+        bp_path = os.path.join(app_path(), 'backend', 'blueprints', module_name + '.py')
+        if os.path.isfile(bp_path):
+            files['backend'] = bp_path
+
+    fn = am._get_frontend_filename(app_id)
+    if fn:
+        js_path = os.path.join(app_path(), 'frontend', 'js', 'apps', fn + '.js')
+        if os.path.isfile(js_path):
+            files['frontend'] = js_path
+
+    return files
+
+
+@builder_bp.route('/publish-config', methods=['GET'])
+def get_publish_config():
+    """Get GitHub publish config (token masked)."""
+    cfg = _load_publish_config()
+    token = cfg.get('token', '')
+    masked = token[:4] + '***' + token[-4:] if len(token) > 8 else ('***' if token else '')
+    return jsonify({
+        'ok': True,
+        'repo': cfg.get('repo', _PUBLISH_REPO_DEFAULT),
+        'token': masked,
+        'has_token': bool(token),
+    })
+
+
+@builder_bp.route('/publish-config', methods=['PUT'])
+def set_publish_config():
+    """Save GitHub publish config."""
+    data = request.json or {}
+    cfg = _load_publish_config()
+
+    token = data.get('token', '').strip()
+    if token and '***' not in token:
+        cfg['token'] = token
+    repo = data.get('repo', '').strip()
+    if repo:
+        cfg['repo'] = repo
+
+    _save_publish_config(cfg)
+    return jsonify({'ok': True})
+
+
+@builder_bp.route('/publish-diff', methods=['GET'])
+def publish_diff():
+    """Compare local optional app files with GitHub. Returns list of changed apps."""
+    import hashlib, base64, importlib, urllib.request, urllib.error
+
+    am = importlib.import_module('blueprints.app_manager')
+    cfg = _load_publish_config()
+    token = cfg.get('token', '')
+    repo = cfg.get('repo', _PUBLISH_REPO_DEFAULT)
+
+    # Fetch remote catalog
+    remote_catalog = {}
+    try:
+        catalog_url = f'https://raw.githubusercontent.com/{repo}/main/catalog.json'
+        req = urllib.request.Request(catalog_url, headers={'User-Agent': 'EthOS-Builder/1.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            cat_data = json.loads(resp.read().decode())
+        for a in (cat_data.get('apps', cat_data) if isinstance(cat_data, dict) else cat_data):
+            remote_catalog[a['id']] = a
+    except Exception:
+        pass
+
+    # Fetch remote tree to get file SHAs (for content comparison)
+    remote_tree = {}
+    if token:
+        try:
+            code, data = _github_api('GET', f'/repos/{repo}/git/trees/main?recursive=1', token)
+            if code == 200:
+                for item in data.get('tree', []):
+                    remote_tree[item['path']] = item['sha']
+        except Exception:
+            pass
+
+    results = []
+    for app_entry in am.BUILTIN_CATALOG:
+        app_id = app_entry['id']
+        if app_id in am.CORE_APPS:
+            continue
+
+        local_files = _get_app_files(app_id)
+        if not local_files:
+            continue
+
+        remote_ver = remote_catalog.get(app_id, {}).get('version', '—')
+        local_ver = app_entry.get('version', '1.0.0')
+
+        changes = []
+        for ftype, local_path in local_files.items():
+            remote_key = f'apps/{app_id}/{"backend.py" if ftype == "backend" else "frontend.js"}'
+            remote_sha = remote_tree.get(remote_key)
+
+            # Compute git blob SHA for local file
+            with open(local_path, 'rb') as f:
+                content = f.read()
+            blob_header = f'blob {len(content)}\0'.encode()
+            local_sha = hashlib.sha1(blob_header + content).hexdigest()
+
+            if remote_sha is None:
+                changes.append({'file': ftype, 'status': 'new'})
+            elif local_sha != remote_sha:
+                changes.append({'file': ftype, 'status': 'modified'})
+
+        results.append({
+            'id': app_id,
+            'name': app_entry.get('name', app_id),
+            'icon': app_entry.get('icon', 'fa-puzzle-piece'),
+            'color': app_entry.get('color', '#6366f1'),
+            'local_version': local_ver,
+            'remote_version': remote_ver,
+            'changes': changes,
+            'changed': len(changes) > 0,
+        })
+
+    results.sort(key=lambda x: (not x['changed'], x['name']))
+    return jsonify({'ok': True, 'apps': results, 'repo': repo, 'has_token': bool(token)})
+
+
+@builder_bp.route('/publish-apps', methods=['POST'])
+def publish_apps():
+    """Publish changed optional apps to GitHub. Streams progress via SSE."""
+    import hashlib, base64, importlib
+
+    cfg = _load_publish_config()
+    token = cfg.get('token', '')
+    repo = cfg.get('repo', _PUBLISH_REPO_DEFAULT)
+
+    if not token:
+        return jsonify({'error': 'GitHub token nie skonfigurowany'}), 400
+
+    data = request.json or {}
+    app_ids = data.get('app_ids', [])
+    if not app_ids:
+        return jsonify({'error': 'Brak aplikacji do opublikowania'}), 400
+
+    am = importlib.import_module('blueprints.app_manager')
+    catalog_by_id = {a['id']: a for a in am.BUILTIN_CATALOG}
+
+    def generate():
+        try:
+            yield _sse({'type': 'step', 'message': 'Pobieranie aktualnego stanu repozytorium...', 'percent': 5})
+
+            # Get current main branch ref
+            code, ref_data = _github_api('GET', f'/repos/{repo}/git/ref/heads/main', token)
+            if code != 200:
+                yield _sse({'type': 'done', 'success': False, 'message': f'Nie można pobrać ref main: {ref_data.get("message", code)}'})
+                return
+            current_sha = ref_data['object']['sha']
+
+            # Get current commit's tree
+            code, commit_data = _github_api('GET', f'/repos/{repo}/git/commits/{current_sha}', token)
+            if code != 200:
+                yield _sse({'type': 'done', 'success': False, 'message': 'Nie można pobrać commita'})
+                return
+            base_tree_sha = commit_data['tree']['sha']
+
+            # Fetch current catalog.json from repo
+            yield _sse({'type': 'step', 'message': 'Pobieranie katalogu aplikacji...', 'percent': 10})
+            import urllib.request, urllib.error
+            remote_catalog_apps = []
+            try:
+                cat_url = f'https://raw.githubusercontent.com/{repo}/main/catalog.json'
+                req = urllib.request.Request(cat_url, headers={'User-Agent': 'EthOS-Builder/1.0'})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    cat_data = json.loads(resp.read().decode())
+                if isinstance(cat_data, dict) and 'apps' in cat_data:
+                    remote_catalog_apps = cat_data['apps']
+                elif isinstance(cat_data, list):
+                    remote_catalog_apps = cat_data
+            except Exception:
+                pass
+            remote_by_id = {a['id']: a for a in remote_catalog_apps}
+
+            # Get remote tree for SHA comparison
+            code, tree_data = _github_api('GET', f'/repos/{repo}/git/trees/main?recursive=1', token)
+            remote_tree = {}
+            if code == 200:
+                for item in tree_data.get('tree', []):
+                    remote_tree[item['path']] = item['sha']
+
+            # Build list of blobs to create
+            tree_items = []
+            changed_apps = []
+            total = len(app_ids)
+
+            for idx, app_id in enumerate(app_ids):
+                pct = 15 + int((idx / max(total, 1)) * 60)
+                app_def = catalog_by_id.get(app_id)
+                if not app_def:
+                    yield _sse({'type': 'log', 'message': f'⚠ {app_id}: nie znaleziono w katalogu, pomijam'})
+                    continue
+
+                local_files = _get_app_files(app_id)
+                if not local_files:
+                    yield _sse({'type': 'log', 'message': f'⚠ {app_id}: brak plików lokalnych, pomijam'})
+                    continue
+
+                app_changed = False
+                for ftype, local_path in local_files.items():
+                    fname = 'backend.py' if ftype == 'backend' else 'frontend.js'
+                    remote_key = f'apps/{app_id}/{fname}'
+
+                    with open(local_path, 'rb') as f:
+                        content = f.read()
+
+                    # Compute git blob SHA
+                    blob_header = f'blob {len(content)}\0'.encode()
+                    local_sha = hashlib.sha1(blob_header + content).hexdigest()
+
+                    if remote_tree.get(remote_key) == local_sha:
+                        continue  # unchanged
+
+                    app_changed = True
+                    yield _sse({'type': 'log', 'message': f'📦 {app_id}/{fname} ({len(content)} bytes)'})
+
+                    # Create blob
+                    b64_content = base64.b64encode(content).decode('ascii')
+                    code, blob_data = _github_api('POST', f'/repos/{repo}/git/blobs', token, {
+                        'content': b64_content,
+                        'encoding': 'base64',
+                    })
+                    if code != 201:
+                        yield _sse({'type': 'done', 'success': False,
+                                    'message': f'Błąd tworzenia blob {app_id}/{fname}: {blob_data.get("message", code)}'})
+                        return
+
+                    tree_items.append({
+                        'path': remote_key,
+                        'mode': '100644',
+                        'type': 'blob',
+                        'sha': blob_data['sha'],
+                    })
+
+                if app_changed:
+                    changed_apps.append(app_id)
+
+                yield _sse({'type': 'step', 'message': f'Przetwarzanie: {app_def["name"]}...', 'percent': pct})
+
+            if not changed_apps:
+                yield _sse({'type': 'done', 'success': True, 'message': 'Wszystkie aplikacje są aktualne — brak zmian do opublikowania.'})
+                return
+
+            # Update catalog.json with bumped versions for changed apps
+            yield _sse({'type': 'step', 'message': 'Aktualizacja katalogu wersji...', 'percent': 78})
+
+            updated_catalog = list(remote_catalog_apps)  # copy
+            updated_by_id = {a['id']: a for a in updated_catalog}
+
+            version_bumps = []
+            for app_id in changed_apps:
+                local_def = catalog_by_id.get(app_id, {})
+                old_ver = remote_by_id.get(app_id, {}).get('version', '0.0.0')
+                new_ver = _bump_version(old_ver)
+                version_bumps.append(f'{app_id}: {old_ver} → {new_ver}')
+
+                if app_id in updated_by_id:
+                    # Update existing entry
+                    entry = updated_by_id[app_id]
+                    for k, v in local_def.items():
+                        entry[k] = v
+                    entry['version'] = new_ver
+                else:
+                    # Add new entry
+                    new_entry = dict(local_def)
+                    new_entry['version'] = new_ver
+                    updated_catalog.append(new_entry)
+
+            catalog_json = json.dumps(
+                {'version': '1.0', 'apps': updated_catalog},
+                indent=4, ensure_ascii=False,
+            ).encode('utf-8')
+
+            # Create blob for catalog.json
+            b64_catalog = base64.b64encode(catalog_json).decode('ascii')
+            code, cat_blob = _github_api('POST', f'/repos/{repo}/git/blobs', token, {
+                'content': b64_catalog,
+                'encoding': 'base64',
+            })
+            if code != 201:
+                yield _sse({'type': 'done', 'success': False, 'message': 'Błąd tworzenia blob catalog.json'})
+                return
+
+            tree_items.append({
+                'path': 'catalog.json',
+                'mode': '100644',
+                'type': 'blob',
+                'sha': cat_blob['sha'],
+            })
+
+            # Create tree
+            yield _sse({'type': 'step', 'message': 'Tworzenie commita...', 'percent': 85})
+            code, new_tree = _github_api('POST', f'/repos/{repo}/git/trees', token, {
+                'base_tree': base_tree_sha,
+                'tree': tree_items,
+            })
+            if code != 201:
+                yield _sse({'type': 'done', 'success': False,
+                            'message': f'Błąd tworzenia drzewa: {new_tree.get("message", code)}'})
+                return
+
+            # Create commit
+            app_names = ', '.join(changed_apps)
+            commit_msg = f'chore: publish apps [{app_names}]\n\n' + '\n'.join(version_bumps)
+
+            code, new_commit = _github_api('POST', f'/repos/{repo}/git/commits', token, {
+                'message': commit_msg,
+                'tree': new_tree['sha'],
+                'parents': [current_sha],
+            })
+            if code != 201:
+                yield _sse({'type': 'done', 'success': False,
+                            'message': f'Błąd tworzenia commita: {new_commit.get("message", code)}'})
+                return
+
+            # Update ref
+            yield _sse({'type': 'step', 'message': 'Pushowanie do GitHub...', 'percent': 92})
+            code, _ = _github_api('PATCH', f'/repos/{repo}/git/refs/heads/main', token, {
+                'sha': new_commit['sha'],
+            })
+            if code != 200:
+                yield _sse({'type': 'done', 'success': False, 'message': 'Błąd aktualizacji brancha main'})
+                return
+
+            # Also update local BUILTIN_CATALOG versions in app_manager.py
+            yield _sse({'type': 'step', 'message': 'Aktualizacja lokalnych wersji...', 'percent': 96})
+            _update_local_catalog_versions(changed_apps, updated_by_id)
+
+            yield _sse({'type': 'step', 'message': 'Gotowe!', 'percent': 100})
+            summary = f'Opublikowano {len(changed_apps)} aplikacji: ' + ', '.join(version_bumps)
+            yield _sse({'type': 'done', 'success': True, 'message': summary})
+
+        except Exception as e:
+            _logger.exception('publish_apps error')
+            yield _sse({'type': 'done', 'success': False, 'message': f'Wyjątek: {e}'})
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )
+
+
+def _update_local_catalog_versions(changed_app_ids, updated_by_id):
+    """Update version strings in the local app_manager.py BUILTIN_CATALOG."""
+    am_path = os.path.join(app_path(), 'backend', 'blueprints', 'app_manager.py')
+    try:
+        with open(am_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        for app_id in changed_app_ids:
+            new_ver = updated_by_id.get(app_id, {}).get('version')
+            if not new_ver:
+                continue
+            # Match: 'id': 'app-id', 'name': '...', 'version': 'X.Y.Z'
+            pattern = re.compile(
+                r"('id':\s*'" + re.escape(app_id) + r"'.*?'version':\s*')([^']+)(')",
+                re.DOTALL,
+            )
+            content = pattern.sub(r'\g<1>' + new_ver + r'\3', content)
+
+        with open(am_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+    except Exception as e:
+        _logger.warning('Failed to update local catalog versions: %s', e)
 
 
 # ── Package: install / uninstall / status ──

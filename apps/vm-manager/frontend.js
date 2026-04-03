@@ -250,9 +250,12 @@ function renderVMManager(body) {
                 else if (action === 'stop') await vmAction(id, 'stop');
                 else if (action === 'restart') await vmAction(id, 'restart');
                 else if (action === 'delete') {
-                    if (!confirm(t('Usunąć tę maszynę wirtualną i jej dyski?'))) return;
-                    try { await api(`/vm/machines/${id}`, { method: 'DELETE' }); toast(t('VM usunięta'), 'success'); }
-                    catch { toast(t('Błąd usuwania'), 'error'); }
+                    if (!await confirmDialog(t('Usunąć tę maszynę wirtualną i jej dyski?'))) return;
+                    try {
+                        const r = await api(`/vm/machines/${id}`, { method: 'DELETE' });
+                        if (r && r.error) { toast(r.error, 'error'); return; }
+                        toast(t('VM usunięta'), 'success');
+                    } catch { toast(t('Błąd usuwania'), 'error'); }
                 }
                 await loadMachines(); fillMachinesTable();
             });
@@ -746,7 +749,7 @@ function renderVMManager(body) {
         });
 
         main.querySelector('#vm-eject-boot')?.addEventListener('click', async () => {
-            if (!confirm(t('Odłączyć obraz boot? VM będzie bootować z dysku.'))) return;
+            if (!await confirmDialog(t('Odłączyć obraz boot? VM będzie bootować z dysku.'))) return;
             try {
                 await api(`/vm/machines/${vm.id}`, { method: 'PUT', body: { boot_image: '' } });
                 toast(t('Obraz odłączony — VM będzie bootować z dysku'), 'success');
@@ -846,7 +849,7 @@ function renderVMManager(body) {
                                     <i class="fas fa-redo"></i> Resetuj bridge
                                 </button>` : ''}`;
                             dc.querySelector('#vm-bridge-reset')?.addEventListener('click', async () => {
-                                if (!confirm(t('Resetować bridge? Połączenie zostanie chwilowo przerwane.'))) return;
+                                if (!await confirmDialog(t('Resetować bridge? Połączenie zostanie chwilowo przerwane.'))) return;
                                 try {
                                     const r1 = await api('/vm/bridge/teardown', { method: 'POST' });
                                     toast(r1.message || 'Bridge usunięty', 'info');
@@ -1127,7 +1130,7 @@ function renderVMManager(body) {
 
         dc.querySelectorAll('[data-restore]').forEach(btn => {
             btn.addEventListener('click', async () => {
-                if (!confirm(`${t('Przywrócić snapshot')} "${btn.dataset.restore}"?`)) return;
+                if (!await confirmDialog(`${t('Przywrócić snapshot')} "${btn.dataset.restore}"?`)) return;
                 try {
                     const r = await api(`/vm/machines/${vm.id}/snapshots/${encodeURIComponent(btn.dataset.restore)}`, { method: 'POST' });
                     toast(r.message || t('Snapshot przywrócony'), 'success');
@@ -1137,9 +1140,10 @@ function renderVMManager(body) {
 
         dc.querySelectorAll('[data-del-snap]').forEach(btn => {
             btn.addEventListener('click', async () => {
-                if (!confirm(`${t('Usunąć snapshot')} "${btn.dataset.delSnap}"?`)) return;
+                if (!await confirmDialog(`${t('Usunąć snapshot')} "${btn.dataset.delSnap}"?`)) return;
                 try {
-                    await api(`/vm/machines/${vm.id}/snapshots/${encodeURIComponent(btn.dataset.delSnap)}`, { method: 'DELETE' });
+                    const r = await api(`/vm/machines/${vm.id}/snapshots/${encodeURIComponent(btn.dataset.delSnap)}`, { method: 'DELETE' });
+                    if (r && r.error) { toast(r.error, 'error'); return; }
                     toast(t('Snapshot usunięty'), 'success');
                     renderSnapshotsPanel(dc);
                 } catch (e) { toast(e.message || t('Błąd'), 'error'); }
@@ -1147,37 +1151,90 @@ function renderVMManager(body) {
         });
     }
 
-    // Disk panel
+    // Disk panel — multi-disk table
     async function renderDiskPanel(dc) {
         const vm = S.selectedVM;
-        dc.innerHTML = `<div class="vm-loading"><i class="fas fa-spinner fa-spin"></i> ${t('Ładowanie info o dysku...')}</div>`;
+        dc.innerHTML = `<div class="vm-loading"><i class="fas fa-spinner fa-spin"></i> ${t('Ładowanie dysków...')}</div>`;
+        let disks;
         try {
-            S.diskInfo = await api(`/vm/machines/${vm.id}/disk-info`);
+            const r = await api(`/vm/machines/${vm.id}/disks`);
+            disks = r.disks || r.items || [];
         } catch (e) {
-            dc.innerHTML = `<div class="vm-empty">${esc(e.message || 'Brak danych o dysku')}</div>`;
+            dc.innerHTML = `<div class="vm-empty">${esc(e.message || t('Brak danych o dyskach'))}</div>`;
             return;
         }
-        const d = S.diskInfo;
+        if (!disks.length) {
+            dc.innerHTML = `<div class="vm-empty">${t('Brak dysków')}</div>`;
+            return;
+        }
 
-        dc.innerHTML = `
-            <div class="vm-info-card app-modal-lg">
-                <h4><i class="fas fa-hdd"></i> Informacje o dysku</h4>
-                <div class="vm-info-row"><span>Format:</span><span>${esc(d.format)}</span></div>
-                <div class="vm-info-row"><span>Rozmiar wirtualny:</span><span>${esc(d.virtual_size_human)}</span></div>
-                <div class="vm-info-row"><span>Rozmiar na dysku:</span><span>${esc(d.actual_size_human)}</span></div>
-                <div class="vm-info-row"><span>Plik:</span><span class="vm-mono app-text-xs">${esc(d.filename)}</span></div>
-            </div>
+        let html = `
+            <div class="vm-table-wrap">
+                <table class="vm-table">
+                    <thead><tr>
+                        <th>${t('ID')}</th>
+                        <th>${t('Format')}</th>
+                        <th>${t('Rozmiar wirtualny')}</th>
+                        <th>${t('Rozmiar na dysku')}</th>
+                        <th>${t('Plik')}</th>
+                        <th style="text-align:right">${t('Akcje')}</th>
+                    </tr></thead><tbody>`;
+
+        for (const d of disks) {
+            const isBoot = d.id === 'disk0';
+            html += `<tr>
+                <td>${esc(d.id)}${isBoot ? ' <i class="fas fa-boot" title="Boot"></i>' : ''}</td>
+                <td>${esc(d.format || '-')}</td>
+                <td>${esc(d.virtual_size_human || '-')}</td>
+                <td>${esc(d.actual_size_human || '-')}</td>
+                <td class="vm-mono" style="font-size:11px">${esc(d.filename || '-')}</td>
+                <td style="text-align:right;white-space:nowrap">
+                    <button class="vm-btn vm-btn-primary vm-btn-xs vm-disk-resize" data-id="${esc(d.id)}"><i class="fas fa-expand-arrows-alt"></i> ${t('Powiększ')}</button>
+                    ${!isBoot ? `<button class="vm-btn vm-btn-danger vm-btn-xs vm-disk-remove" data-id="${esc(d.id)}"><i class="fas fa-trash"></i></button>` : ''}
+                </td>
+            </tr>`;
+        }
+
+        html += `</tbody></table></div>
             <div class="app-mt-lg">
-                <button class="vm-btn vm-btn-primary vm-btn-sm" id="vm-disk-resize"><i class="fas fa-expand-arrows-alt"></i> ${t('Powiększ dysk')}</button>
-            </div>
-        `;
+                <button class="vm-btn vm-btn-success vm-btn-sm" id="vm-disk-add"><i class="fas fa-plus"></i> ${t('Dodaj dysk')}</button>
+            </div>`;
+        dc.innerHTML = html;
 
-        dc.querySelector('#vm-disk-resize')?.addEventListener('click', async () => {
-            const size = await promptDialog(t('Powiększ dysk'), t('Powiększ o (np. +10G, +512M):'), '+10G');
-            if (!size) return;
+        // Resize handlers
+        dc.querySelectorAll('.vm-disk-resize').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const diskId = btn.dataset.id;
+                const size = await promptDialog(t('Powiększ dysk'), t('Powiększ o (np. +10G, +512M):'), '+10G');
+                if (!size) return;
+                try {
+                    const r = await api(`/vm/machines/${vm.id}/disks/${diskId}/resize`, { method: 'POST', body: { size } });
+                    toast(r.message || t('Dysk powiększony'), 'success');
+                    renderDiskPanel(dc);
+                } catch (e) { toast(e.message || t('Błąd'), 'error'); }
+            });
+        });
+
+        // Remove handlers
+        dc.querySelectorAll('.vm-disk-remove').forEach(btn => {
+            btn.addEventListener('click', async () => {
+                const diskId = btn.dataset.id;
+                if (!await confirmDialog(t('Usuń dysk'), t('Czy na pewno usunąć dysk {id}? Dane zostaną utracone.', { id: diskId }))) return;
+                try {
+                    const r = await api(`/vm/machines/${vm.id}/disks/${diskId}`, { method: 'DELETE' });
+                    toast(r.message || t('Dysk usunięty'), 'success');
+                    renderDiskPanel(dc);
+                } catch (e) { toast(e.message || t('Błąd'), 'error'); }
+            });
+        });
+
+        // Add disk
+        dc.querySelector('#vm-disk-add')?.addEventListener('click', async () => {
+            const sizeStr = await promptDialog(t('Dodaj dysk'), t('Rozmiar nowego dysku (np. 20G, 500M):'), '20G');
+            if (!sizeStr) return;
             try {
-                const r = await api(`/vm/machines/${vm.id}/resize-disk`, { method: 'POST', body: { size } });
-                toast(r.message || t('Dysk powiększony'), 'success');
+                const r = await api(`/vm/machines/${vm.id}/disks`, { method: 'POST', body: { size: sizeStr, format: 'qcow2' } });
+                toast(r.message || t('Dysk dodany'), 'success');
                 renderDiskPanel(dc);
             } catch (e) { toast(e.message || t('Błąd'), 'error'); }
         });
@@ -1247,9 +1304,10 @@ function renderVMManager(body) {
 
         tbody.querySelectorAll('[data-del-img]').forEach(btn => {
             btn.addEventListener('click', async () => {
-                if (!confirm(`${t('Usunąć obraz')} "${btn.dataset.delImg}"?`)) return;
+                if (!await confirmDialog(`${t('Usunąć obraz')} "${btn.dataset.delImg}"?`)) return;
                 try {
-                    await api(`/vm/images/${encodeURIComponent(btn.dataset.delImg)}`, { method: 'DELETE' });
+                    const r = await api(`/vm/images/${encodeURIComponent(btn.dataset.delImg)}`, { method: 'DELETE' });
+                    if (r && r.error) { toast(r.error, 'error'); return; }
                     toast(t('Obraz usunięty'), 'success');
                     await loadImages(); fillImagesTable();
                 } catch (e) { toast(e.message || t('Błąd usuwania'), 'error'); }
@@ -1280,7 +1338,7 @@ function renderVMManager(body) {
         tbody.querySelectorAll('[data-copy-builder]').forEach(btn => {
             btn.addEventListener('click', async () => {
                 const name = btn.dataset.name;
-                if (!confirm(`${t('Skopiować')} "${name}" ${t('do obrazów VM?')}\n${t('Plik może być duży — to zajmie chwilę.')}`)) return;
+                if (!await confirmDialog(`${t('Skopiować')} "${name}" ${t('do obrazów VM?')}\n${t('Plik może być duży — to zajmie chwilę.')}`)) return;
                 btn.disabled = true;
                 btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Kopiowanie...';
                 try {

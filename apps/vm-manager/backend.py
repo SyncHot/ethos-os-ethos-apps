@@ -2,6 +2,28 @@
 EthOS — VM Manager (Virtual Machine Manager)
 Create and manage virtual machines using QEMU/KVM.
 Supports booting ISO, IMG, QCOW2 and VDI images.
+Supports multiple disks per VM (add, remove, resize).
+
+Endpoints:
+  GET    /api/vm/machines                               — list VMs
+  POST   /api/vm/machines                               — create VM
+  GET    /api/vm/machines/<id>                           — get VM
+  PUT    /api/vm/machines/<id>                           — update VM config
+  DELETE /api/vm/machines/<id>                           — delete VM
+  POST   /api/vm/machines/<id>/start                    — start VM
+  POST   /api/vm/machines/<id>/stop                     — stop VM
+  GET    /api/vm/machines/<id>/disk-info                 — boot disk info (compat)
+  POST   /api/vm/machines/<id>/resize-disk               — resize boot disk (compat)
+  GET    /api/vm/machines/<id>/disks                     — list all disks
+  POST   /api/vm/machines/<id>/disks                     — add disk
+  DELETE /api/vm/machines/<id>/disks/<disk_id>           — remove disk
+  POST   /api/vm/machines/<id>/disks/<disk_id>/resize   — resize specific disk
+  GET    /api/vm/machines/<id>/snapshots                 — list snapshots
+  POST   /api/vm/machines/<id>/snapshots                 — create snapshot
+  POST   /api/vm/machines/<id>/snapshots/<tag>           — restore snapshot
+  DELETE /api/vm/machines/<id>/snapshots/<tag>           — delete snapshot
+  POST   /api/vm/import-disk                             — import disk image
+  POST   /api/vm/convert                                 — convert disk format
 """
 
 import os
@@ -52,12 +74,26 @@ _running_vms = {}  # vm_id -> { 'proc': Popen, 'pid': int, 'started': float, 'vn
 
 
 def _load_vms():
-    """Load VM definitions from the state file."""
+    """Load VM definitions from the state file, auto-migrating legacy format."""
     try:
         with open(_STATE_FILE, 'r') as f:
-            return json.load(f)
+            vms = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
+    migrated = False
+    for vm_id, vm in vms.items():
+        if 'disks' not in vm and vm.get('disk_file'):
+            vm['disks'] = [{
+                'id': 'disk0',
+                'file': vm['disk_file'],
+                'format': vm.get('disk_format', 'qcow2'),
+                'size': vm.get('disk_size', ''),
+                'bus': 'virtio',
+            }]
+            migrated = True
+    if migrated:
+        _save_vms(vms)
+    return vms
 
 
 def _save_vms(vms):
@@ -65,6 +101,24 @@ def _save_vms(vms):
     os.makedirs(os.path.dirname(os.path.abspath(_STATE_FILE)), exist_ok=True)
     with open(_STATE_FILE, 'w') as f:
         json.dump(vms, f, indent=2)
+
+
+def _next_disk_id(vm):
+    """Return the next available disk ID (disk0, disk1, ...)."""
+    existing = {d['id'] for d in vm.get('disks', [])}
+    for i in range(100):
+        did = f'disk{i}'
+        if did not in existing:
+            return did
+    return f'disk{len(existing)}'
+
+
+def _get_disk(vm, disk_id):
+    """Find a disk entry by ID, or None."""
+    for d in vm.get('disks', []):
+        if d['id'] == disk_id:
+            return d
+    return None
 
 
 def _default_network(os_type='linux'):
@@ -95,15 +149,83 @@ def _validate_port_forwards(forwards):
     return clean
 
 
+_INTERNAL_PORT_BASE = 19000
+
+
+def _find_free_internal_port(host_port):
+    """Find a free localhost port for QEMU's internal hostfwd binding."""
+    import socket
+    # Try deterministic offset first for debuggability
+    candidate = _INTERNAL_PORT_BASE + (host_port % 1000)
+    for _ in range(100):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(('127.0.0.1', candidate))
+            s.close()
+            return candidate
+        except OSError:
+            candidate += 1
+        finally:
+            s.close()
+    raise RuntimeError(f'Cannot find free internal port for hostfwd (host_port={host_port})')
+
+
+_SOCAT_BIN = '/usr/bin/socat'
+
+
+def _start_socat_proxies(proxy_map):
+    """Start socat TCP proxies for QEMU user-mode port forwards.
+    proxy_map: {public_host_port: internal_localhost_port}.
+    Returns list of Popen objects.
+    """
+    procs = []
+    if not proxy_map or not os.path.isfile(_SOCAT_BIN):
+        return procs
+    for host_port, internal_port in proxy_map.items():
+        try:
+            proc = subprocess.Popen(
+                [_SOCAT_BIN,
+                 f'TCP-LISTEN:{host_port},fork,reuseaddr',
+                 f'TCP:127.0.0.1:{internal_port}'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            time.sleep(0.3)
+            if proc.poll() is not None:
+                log.error("socat proxy :%s→:%s exited early", host_port, internal_port)
+            else:
+                log.info("socat proxy :%s → 127.0.0.1:%s (pid %s)",
+                         host_port, internal_port, proc.pid)
+                procs.append(proc)
+        except Exception as e:
+            log.error("Failed to start socat proxy :%s: %s", host_port, e)
+    return procs
+
+
+def _stop_socat_proxies(info):
+    """Stop all socat proxy processes associated with a VM."""
+    for proc in info.get('socat_procs', []):
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except Exception:
+            pass
+
+
 def _build_net_opts(vm):
     """Build QEMU -netdev options string from VM network config.
-    Returns (netdev_args_list, tap_device_or_None).
+    Returns (netdev_args_list, tap_device_or_None, proxy_map).
+    proxy_map is {host_port: internal_port} for TCP proxies (user-mode only).
     """
     net = vm.get('network') or _default_network(vm.get('os_type', 'linux'))
     net_type = net.get('net_type', 'user')
 
     if net_type == 'none':
-        return None, None
+        return None, None, {}
 
     if net_type == 'bridge':
         bridge = net.get('bridge', 'br0')
@@ -117,10 +239,11 @@ def _build_net_opts(vm):
             net_type = 'user'
         else:
             return ['-netdev', f'tap,id=net0,ifname={tap},script=no,downscript=no',
-                    '-device', 'virtio-net-pci,netdev=net0'], tap
+                    '-device', 'virtio-net-pci,netdev=net0'], tap, {}
 
     # User-mode NAT — check port availability first
     opts = 'user,id=net0'
+    proxy_map = {}  # {public_host_port: internal_localhost_port}
     for rule in net.get('port_forwards', []):
         proto = rule.get('proto', 'tcp')
         host = rule.get('host', 0)
@@ -136,8 +259,14 @@ def _build_net_opts(vm):
                 raise RuntimeError(
                     f'Port {host} jest zajęty (inny proces go używa). '
                     f'Zmień port hosta w ustawieniach sieci VM lub zwolnij port.')
-            opts += f',hostfwd={proto}::{host}-:{guest}'
-    return ['-netdev', opts, '-device', 'virtio-net-pci,netdev=net0'], None
+            # QEMU user-mode networking has a tiny TCP backlog (1) and poor
+            # connection cleanup, causing CLOSE-WAIT accumulation that blocks
+            # new external connections.  Bind QEMU to localhost on an internal
+            # port and use a socat TCP proxy on the public port instead.
+            internal = _find_free_internal_port(int(host))
+            proxy_map[int(host)] = internal
+            opts += f',hostfwd={proto}:127.0.0.1:{internal}-:{guest}'
+    return ['-netdev', opts, '-device', 'virtio-net-pci,netdev=net0'], None, proxy_map
 
 
 # ─── Bridge Networking ────────────────────────────────────────
@@ -543,8 +672,9 @@ def _check_vm_process(vm_id):
     proc = info.get('proc')
     if proc and proc.poll() is None:
         return True
-    # Process is dead, clean up websockify too
+    # Process is dead, clean up websockify and socat proxies too
     _stop_websockify(info)
+    _stop_socat_proxies(info)
     _running_vms.pop(vm_id, None)
     return False
 
@@ -599,6 +729,7 @@ def list_vms():
             'created': vm.get('created', ''),
             'description': vm.get('description', ''),
             'disk_file': vm.get('disk_file', ''),
+            'disks': vm.get('disks', []),
             'network': vm.get('network') or _default_network(vm.get('os_type', 'linux')),
             'arch': 'raspi' if _is_rpi_image(vm.get('boot_image', ''), vm.get('name', ''))
                     else 'aarch64' if _is_arm_image(vm.get('boot_image', ''), vm.get('name', ''))
@@ -655,7 +786,7 @@ def create_vm():
     os.makedirs(vm_path, exist_ok=True)
 
     # Create virtual disk
-    disk_file = os.path.join(vm_path, f'disk.{disk_format}')
+    disk_file = os.path.join(vm_path, f'disk0.{disk_format}')
     try:
         r = host_run(
             f'qemu-img create -f {disk_format} "{disk_file}" {disk_size}',
@@ -675,6 +806,13 @@ def create_vm():
         'disk_size': disk_size,
         'disk_format': disk_format,
         'disk_file': disk_file,
+        'disks': [{
+            'id': 'disk0',
+            'file': disk_file,
+            'format': disk_format,
+            'size': disk_size,
+            'bus': 'virtio',
+        }],
         'os_type': os_type,
         'boot_image': boot_image,
         'description': description,
@@ -957,6 +1095,7 @@ def start_vm(vm_id):
 
     is_arm = _is_arm_image(boot_image, vm.get('name', ''))
     is_rpi = _is_rpi_image(boot_image, vm.get('name', ''))
+    proxy_map = {}  # populated by _build_net_opts for user-mode networking
 
     # Validate that the required QEMU system binary is available
     if is_arm or is_rpi:
@@ -1027,13 +1166,19 @@ def start_vm(vm_id):
         # SD card — main boot drive (RPi boots from SD)
         cmd += ['-drive', f'file={sd_copy},format=raw,if=sd']
 
-        # Additional data disk (qcow2) — attach via USB mass-storage
+        # Additional data disks — attach via USB mass-storage
         # NOTE: raspi3b USB emulation is limited; this may not work
-        disk_file = vm.get('disk_file', '')
-        if disk_file and os.path.exists(disk_file):
-            disk_format = vm.get('disk_format', 'qcow2')
-            cmd += ['-drive', f'file={disk_file},format={disk_format},if=none,id=usbdisk']
-            cmd += ['-device', 'usb-storage,drive=usbdisk']
+        disks = vm.get('disks', [])
+        if not disks and vm.get('disk_file'):
+            disks = [{'id': 'disk0', 'file': vm['disk_file'],
+                       'format': vm.get('disk_format', 'qcow2')}]
+        for disk in disks:
+            df = disk.get('file', '')
+            if df and os.path.exists(df):
+                dfmt = disk.get('format', 'qcow2')
+                did = disk.get('id', 'usbdisk')
+                cmd += ['-drive', f'file={df},format={dfmt},if=none,id={did}']
+                cmd += ['-device', f'usb-storage,drive={did}']
 
         # Serial console (more reliable than VNC for raspi3b)
         cmd += ['-serial', f'mon:tcp:127.0.0.1:{vnc_port},server=on,wait=off']
@@ -1066,11 +1211,16 @@ def start_vm(vm_id):
                 cmd += ['-bios', fw]
                 break
 
-        # Disk
-        disk_file = vm.get('disk_file', '')
-        if disk_file and os.path.exists(disk_file):
-            disk_format = vm.get('disk_format', 'qcow2')
-            cmd += ['-drive', f'file={disk_file},format={disk_format},if=virtio']
+        # Disks
+        disks = vm.get('disks', [])
+        if not disks and vm.get('disk_file'):
+            disks = [{'id': 'disk0', 'file': vm['disk_file'],
+                       'format': vm.get('disk_format', 'qcow2')}]
+        for disk in disks:
+            df = disk.get('file', '')
+            if df and os.path.exists(df):
+                dfmt = disk.get('format', 'qcow2')
+                cmd += ['-drive', f'file={df},format={dfmt},if=virtio']
 
         # Boot image — mount as second drive for generic ARM
         if boot_image and os.path.exists(boot_image):
@@ -1080,7 +1230,7 @@ def start_vm(vm_id):
 
         # Network — configurable per-VM
         try:
-            net_args, tap_dev = _build_net_opts(vm)
+            net_args, tap_dev, proxy_map = _build_net_opts(vm)
         except RuntimeError as e:
             return jsonify({'error': str(e)}), 409
         if net_args:
@@ -1131,18 +1281,23 @@ def start_vm(vm_id):
                 cmd += ['-drive', f'file={boot_image},format={img_fmt},if=none,id=bootimg,snapshot=on']
                 cmd += ['-device', 'virtio-blk-pci,drive=bootimg,bootindex=0']
 
-        # Disk — the VM's own virtual hard drive (install target)
-        disk_file = vm.get('disk_file', '')
-        if disk_file and os.path.exists(disk_file):
-            disk_format = vm.get('disk_format', 'qcow2')
-            if has_disk_boot_image:
-                # Lower boot priority so the boot image is tried first
-                cmd += ['-drive', f'file={disk_file},format={disk_format},if=none,id=maindisk']
-                cmd += ['-device', 'virtio-blk-pci,drive=maindisk,bootindex=1']
+        # Disks — loop over all VM disks
+        disks = vm.get('disks', [])
+        if not disks and vm.get('disk_file'):
+            disks = [{'id': 'disk0', 'file': vm['disk_file'],
+                       'format': vm.get('disk_format', 'qcow2')}]
+        for i, disk in enumerate(disks):
+            df = disk.get('file', '')
+            if not df or not os.path.exists(df):
+                continue
+            dfmt = disk.get('format', 'qcow2')
+            did = disk.get('id', f'disk{i}')
+            cmd += ['-drive', f'file={df},format={dfmt},if=none,id={did}']
+            if i == 0:
+                boot_idx = 1 if has_disk_boot_image else 0
+                cmd += ['-device', f'virtio-blk-pci,drive={did},bootindex={boot_idx}']
             else:
-                # Sole disk — explicit bootindex so UEFI/BIOS picks it up
-                cmd += ['-drive', f'file={disk_file},format={disk_format},if=none,id=maindisk']
-                cmd += ['-device', 'virtio-blk-pci,drive=maindisk,bootindex=0']
+                cmd += ['-device', f'virtio-blk-pci,drive={did}']
 
         # ISO boot image (CD-ROM)
         if boot_image and os.path.exists(boot_image):
@@ -1153,7 +1308,7 @@ def start_vm(vm_id):
 
         # Network — configurable per-VM
         try:
-            net_args, tap_dev = _build_net_opts(vm)
+            net_args, tap_dev, proxy_map = _build_net_opts(vm)
         except RuntimeError as e:
             return jsonify({'error': str(e)}), 409
         if net_args:
@@ -1162,25 +1317,16 @@ def start_vm(vm_id):
         # VNC display (for remote access through browser)
         cmd += ['-vnc', f':{vnc_display}']
 
-        # UEFI firmware — auto-detect GPT/EFI disks, also honor explicit os_type
+        # UEFI firmware — always enabled (EthOS images use GPT + EFI)
         ovmf_paths = [
             '/usr/share/OVMF/OVMF_CODE.fd',
             '/usr/share/ovmf/OVMF.fd',
             '/usr/share/qemu/OVMF.fd',
         ]
-        need_uefi = vm.get('os_type') in ('windows', 'uefi')
-        if not need_uefi:
-            # Auto-detect: check if any disk has GPT (EFI) partition table
-            for check_disk in [boot_image, disk_file]:
-                if check_disk and os.path.exists(check_disk):
-                    need_uefi = _disk_has_gpt(check_disk)
-                    if need_uefi:
-                        break
-        if need_uefi:
-            for ovmf in ovmf_paths:
-                if os.path.exists(ovmf):
-                    cmd += ['-bios', ovmf]
-                    break
+        for ovmf in ovmf_paths:
+            if os.path.exists(ovmf):
+                cmd += ['-bios', ovmf]
+                break
 
         # USB tablet for better mouse tracking in VNC
         cmd += ['-device', 'usb-ehci', '-device', 'usb-tablet']
@@ -1216,7 +1362,12 @@ def start_vm(vm_id):
             'ws_proc': None,
             'ws_port': None,
             'tap_dev': tap_dev,
+            'socat_procs': [],
         }
+
+        # Start socat TCP proxies for user-mode port forwards
+        if proxy_map:
+            _running_vms[vm_id]['socat_procs'] = _start_socat_proxies(proxy_map)
 
         # Start websockify for browser-based console (noVNC)
         ws_port = _next_ws_port()
@@ -1268,6 +1419,7 @@ def stop_vm(vm_id):
         pass
 
     _stop_websockify(info)
+    _stop_socat_proxies(info)
     _destroy_tap(info.get('tap_dev'))
     _running_vms.pop(vm_id, None)
     return jsonify({'status': 'ok'})
@@ -1289,6 +1441,7 @@ def restart_vm(vm_id):
             except subprocess.TimeoutExpired:
                 proc.kill()
             _stop_websockify(info)
+            _stop_socat_proxies(info)
             _destroy_tap(info.get('tap_dev'))
         _running_vms.pop(vm_id, None)
         time.sleep(1)
@@ -1525,6 +1678,9 @@ def import_disk():
             'disk_size':   disk_size,
             'disk_format': disk_format,
             'disk_file':   disk_file,
+            'disks':       [{'id': 'disk0', 'file': disk_file,
+                             'format': disk_format, 'size': disk_size,
+                             'bus': 'virtio'}],
             'os_type':     os_type,
             'boot_image':  '',
             'description': desc,
@@ -1603,6 +1759,163 @@ def resize_disk(vm_id):
         new_size = '+' + new_size
 
     disk_file = vm.get('disk_file', '')
+    if not disk_file or not os.path.exists(disk_file):
+        return jsonify({'error': 'Disk file not found'}), 404
+
+    try:
+        r = host_run(f'qemu-img resize "{disk_file}" {new_size}', timeout=30)
+        if r.returncode == 0:
+            return jsonify({'status': 'ok', 'new_size': new_size})
+        return jsonify({'error': r.stderr}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+def _disk_info_dict(disk_file):
+    """Return qemu-img info as a dict for a single disk file."""
+    r = host_run(f'qemu-img info --output=json "{disk_file}"', timeout=10)
+    if r.returncode != 0:
+        return None
+    info = json.loads(r.stdout)
+    return {
+        'filename': info.get('filename', ''),
+        'format': info.get('format', ''),
+        'virtual_size': info.get('virtual-size', 0),
+        'virtual_size_human': _human_size(info.get('virtual-size', 0)),
+        'actual_size': info.get('actual-size', 0),
+        'actual_size_human': _human_size(info.get('actual-size', 0)),
+    }
+
+
+@vm_bp.route('/machines/<vm_id>/disks')
+@admin_required
+@_require_qemu
+def list_disks(vm_id):
+    """List all disks attached to a VM with size info."""
+    err = require_tools('qemu-img')
+    if err:
+        return err
+    vms = _load_vms()
+    vm = vms.get(vm_id)
+    if not vm:
+        return jsonify({'error': 'VM not found'}), 404
+
+    result = []
+    for disk in vm.get('disks', []):
+        entry = {
+            'id': disk.get('id', ''),
+            'format': disk.get('format', 'qcow2'),
+            'size': disk.get('size', ''),
+            'bus': disk.get('bus', 'virtio'),
+            'bootable': disk.get('id') == 'disk0',
+        }
+        df = disk.get('file', '')
+        if df and os.path.exists(df):
+            info = _disk_info_dict(df)
+            if info:
+                entry.update(info)
+        result.append(entry)
+    return jsonify({'disks': result})
+
+
+@vm_bp.route('/machines/<vm_id>/disks', methods=['POST'])
+@admin_required
+@_require_qemu
+def add_disk(vm_id):
+    """Add a new disk to a VM (VM must be stopped)."""
+    err = require_tools('qemu-img')
+    if err:
+        return err
+    if _check_vm_process(vm_id):
+        return jsonify({'error': 'Stop VM before adding a disk'}), 409
+
+    vms = _load_vms()
+    vm = vms.get(vm_id)
+    if not vm:
+        return jsonify({'error': 'VM not found'}), 404
+
+    data = request.get_json(force=True) if request.data else {}
+    size = data.get('size', '20G')
+    fmt = data.get('format', 'qcow2')
+    if fmt not in ('qcow2', 'raw'):
+        return jsonify({'error': 'Format must be qcow2 or raw'}), 400
+    if not re.match(r'^\d+[GMK]$', size):
+        return jsonify({'error': 'Invalid size (e.g. 20G, 512M)'}), 400
+
+    disk_id = _next_disk_id(vm)
+    disk_file = os.path.join(_vm_dir(vm_id), f'{disk_id}.{fmt}')
+
+    try:
+        r = host_run(f'qemu-img create -f {fmt} "{disk_file}" {size}', timeout=60)
+        if r.returncode != 0:
+            return jsonify({'error': f'Disk creation failed: {r.stderr}'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    new_disk = {'id': disk_id, 'file': disk_file, 'format': fmt,
+                'size': size, 'bus': 'virtio'}
+    vm.setdefault('disks', []).append(new_disk)
+    _save_vms(vms)
+    return jsonify({'status': 'ok', 'disk': new_disk})
+
+
+@vm_bp.route('/machines/<vm_id>/disks/<disk_id>', methods=['DELETE'])
+@admin_required
+@_require_qemu
+def remove_disk(vm_id, disk_id):
+    """Remove a disk from a VM (VM must be stopped, cannot remove disk0)."""
+    if _check_vm_process(vm_id):
+        return jsonify({'error': 'Stop VM before removing a disk'}), 409
+
+    vms = _load_vms()
+    vm = vms.get(vm_id)
+    if not vm:
+        return jsonify({'error': 'VM not found'}), 404
+
+    if disk_id == 'disk0':
+        return jsonify({'error': 'Cannot remove the boot disk'}), 400
+
+    disk = _get_disk(vm, disk_id)
+    if not disk:
+        return jsonify({'error': f'Disk {disk_id} not found'}), 404
+
+    disk_file = disk.get('file', '')
+    if disk_file and os.path.isfile(disk_file):
+        os.remove(disk_file)
+
+    vm['disks'] = [d for d in vm['disks'] if d['id'] != disk_id]
+    _save_vms(vms)
+    return jsonify({'status': 'ok'})
+
+
+@vm_bp.route('/machines/<vm_id>/disks/<disk_id>/resize', methods=['POST'])
+@admin_required
+@_require_qemu
+def resize_specific_disk(vm_id, disk_id):
+    """Resize a specific disk (expand only, VM must be stopped)."""
+    err = require_tools('qemu-img')
+    if err:
+        return err
+    if _check_vm_process(vm_id):
+        return jsonify({'error': 'Stop VM before resizing disk'}), 409
+
+    vms = _load_vms()
+    vm = vms.get(vm_id)
+    if not vm:
+        return jsonify({'error': 'VM not found'}), 404
+
+    disk = _get_disk(vm, disk_id)
+    if not disk:
+        return jsonify({'error': f'Disk {disk_id} not found'}), 404
+
+    data = request.get_json(force=True) if request.data else {}
+    new_size = data.get('size', '')
+    if not re.match(r'^\+?\d+[GMK]$', new_size):
+        return jsonify({'error': 'Invalid size (e.g. +10G, +512M)'}), 400
+    if not new_size.startswith('+'):
+        new_size = '+' + new_size
+
+    disk_file = disk.get('file', '')
     if not disk_file or not os.path.exists(disk_file):
         return jsonify({'error': 'Disk file not found'}), 404
 
@@ -1791,11 +2104,12 @@ def convert_image():
 
 def _on_uninstall(wipe):
     """Cleanup when the VM Manager package is uninstalled."""
-    # Stop all running VMs and their websockify processes
+    # Stop all running VMs and their websockify/socat processes
     for vm_id in list(_running_vms.keys()):
         try:
             info = _running_vms[vm_id]
             _stop_websockify(info)
+            _stop_socat_proxies(info)
             proc = info.get('proc')
             if proc:
                 proc.kill()

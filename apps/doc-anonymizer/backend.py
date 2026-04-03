@@ -7,7 +7,9 @@ Endpoints:
   POST /api/doc-anonymizer/upload           -- upload and anonymize a file
   GET  /api/doc-anonymizer/jobs             -- list anonymization jobs
   GET  /api/doc-anonymizer/download/<job_id> -- download anonymized file
+  GET  /api/doc-anonymizer/preview/<job_id>/<which> -- inline preview (original|anonymized)
   DELETE /api/doc-anonymizer/job/<job_id>   -- delete a job
+  POST /api/doc-anonymizer/jobs/delete-batch -- batch-delete multiple jobs
   GET  /api/doc-anonymizer/status           -- app + AI dependency status
   POST /api/doc-anonymizer/install          -- install (via register_pkg_routes)
   POST /api/doc-anonymizer/uninstall        -- uninstall
@@ -484,8 +486,8 @@ _REGEX_PATTERNS = [
     (re.compile(r'REGON[\s:]*\d{9}(?:\d{5})?\b'), 'REGON'),
     # KRS: 10 digits (e.g. "KRS: 0000234567" or "KRS 0000234567")
     (re.compile(r'KRS[\s:]*\d{10}\b'), 'KRS'),
-    # PWZ number (e.g. "nr PWZ 4478123" or "PWZ: 1234567")
-    (re.compile(r'(?:nr\s+)?PWZ[\s:]*\d{7}'), 'NR_DOKUMENTU'),
+    # PWZ (prawo wykonywania zawodu) — NOT anonymized, it's a public
+    # professional license number for doctors, not personal data.
     # Dates: DD.MM.YYYY, DD-MM-YYYY, DD/MM/YYYY
     (re.compile(r'(?<!\d)\d{1,2}[./-]\d{1,2}[./-]\d{4}(?!\d)'), 'DATA'),
     # Written dates: "31 marca 2026" / "1 stycznia 2025 r."
@@ -1088,12 +1090,51 @@ _ICD_CODE_RE = re.compile(r'\b[A-Z]\d{2}(?:\.\d{1,2})?\b')
 
 # Medical terms that should NEVER be anonymized
 _MEDICAL_STOPWORDS = frozenset({
+    # General medical terms
     'rozpoznanie', 'epikryza', 'zalecenia', 'leczenie', 'badanie', 'wyniki',
     'dawkowanie', 'kontrola', 'skierowanie', 'zaswiadczenie', 'zaświadczenie',
     'pacjent', 'pacjentka', 'choroba', 'zapalenie', 'niedokrwienna',
     'nadcisnienie', 'cukrzyca', 'hipercholesterolemia', 'diagnostyka',
     'rehabilitacja', 'operacja', 'zabieg', 'terapia', 'recepta',
+    'objaw', 'zespol', 'skala', 'test', 'wynik', 'morfologia',
+    'hemoglobina', 'leukocyty', 'trombocyty', 'erytrocyty', 'kreatynina',
+    'bilirubina', 'glukoza', 'cholesterol', 'triglicerydy',
+    # Diseases and conditions
+    'niewydolnosc', 'migotanie', 'zatorowosc', 'zawal', 'udar',
+    'padaczka', 'epilepsja', 'miazdzyca', 'nowotwor', 'bialaczka',
+    'marskosc', 'niedokrwienie', 'zwezenie', 'torbiel', 'polip',
+    'remisja', 'nawrot', 'przerzut', 'arytmia', 'bradykardia',
+    'tachykardia', 'osteoporoza', 'reumatoidalne',
+    # Procedures
+    'gastroskopia', 'kolonoskopia', 'ultrasonografia', 'tomografia',
+    'rezonans', 'echokardiografia', 'koronarografia', 'endoskopia',
+    'biopsja', 'laparoskopia', 'hemodializa', 'chemioterapia',
+    'radioterapia', 'ablacja', 'angioplastyka', 'holter',
+    # Common medications (most frequent in Polish medical docs)
     'amlodypina', 'metformina', 'atorwastatyna', 'ramipril', 'bisoprolol',
+    'enalapryl', 'peryndopryl', 'walsartan', 'telmisartan', 'losartan',
+    'indapamid', 'torasemid', 'furosemid', 'spironolakton',
+    'hydrochlorotiazyd', 'klopidogrel', 'warfaryna', 'dabigatran',
+    'rywaroksaban', 'apiksaban', 'digoksyna', 'amiodaron',
+    'gliklazyd', 'empagliflozyna', 'dapagliflozyna', 'semaglutyd',
+    'insulina', 'ibuprofen', 'diklofenak', 'ketoprofen', 'paracetamol',
+    'tramadol', 'metamizol', 'amoksycylina', 'azytromycyna',
+    'ciprofloksacyna', 'doksycyklina', 'salbutamol', 'budezonid',
+    'montelukast', 'omeprazol', 'pantoprazol', 'lansoprazol',
+    'escytalopram', 'sertralina', 'wenlafaksyna', 'mirtazapina',
+    'olanzapina', 'kwetiapina', 'lewotyroksyna', 'prednizon',
+    'deksametazon', 'heparyna', 'acetylosalicylowy',
+    'tikagrelol', 'lacydypina', 'kandesartan', 'liraglutyd',
+    'cefaleksyna', 'teofilina', 'esomeprazol', 'alprazolam', 'diazepam',
+    'finasteryd', 'proscar',
+    # Medical abbreviations commonly misidentified as names
+    'triglicerydy', 'fizjoterapeuty', 'ordynator',
+    # Professional license numbers (public, not PII)
+    'pwz', 'prawo', 'wykonywania', 'zawodu',
+    # Anatomy
+    'serce', 'pluca', 'watroba', 'nerki', 'trzustka', 'jelito',
+    'zoladek', 'mozg', 'kregowy', 'przedsionek', 'komora',
+    'zastawka', 'aorta', 'tetnica', 'zyla',
 })
 
 
@@ -1206,6 +1247,15 @@ def _redact_pdf(src_path, output_path, entities):
         cat = _normalize_category(e.get('category', 'INNE_PII'))
         txt = e.get('text', '').strip()
         if txt and txt not in seen_texts:
+            # Skip multi-line entities — they produce huge blur rects
+            if '\n' in txt or '|' in txt:
+                # Try to salvage by taking just the first meaningful segment
+                parts = re.split(r'[|\n]+', txt)
+                parts = [p.strip() for p in parts if len(p.strip()) >= 4]
+                for p in parts:
+                    if p not in seen_texts:
+                        seen_texts[p] = (_PLACEHOLDER_MAP.get(cat, '[DANE]'), cat)
+                continue
             seen_texts[txt] = (_PLACEHOLDER_MAP.get(cat, '[DANE]'), cat)
 
     sorted_items = sorted(seen_texts.items(), key=lambda x: len(x[0]), reverse=True)
@@ -1224,9 +1274,17 @@ def _redact_pdf(src_path, output_path, entities):
 
     for page_idx, page in enumerate(doc):
         page_rects = []  # (rect, placeholder, category)
+        page_area = page.rect.width * page.rect.height
+        max_rect_area = page_area * 0.25  # Skip rects > 25% of page
+
         for original, (placeholder, category) in sorted_items:
             instances = page.search_for(original)
             for inst in instances:
+                rect_area = abs(inst.width * inst.height)
+                if rect_area > max_rect_area:
+                    log.debug('[doc_anonymizer] Skipping oversized rect (%.0f%% of page) for: %s',
+                              rect_area / page_area * 100, original[:40])
+                    continue
                 page_rects.append((inst, placeholder, category, original))
                 total_redactions.append({
                     'original': original,
@@ -1327,6 +1385,9 @@ def _redact_scanned_pdf(src_path, output_path, entities):
         log.error('[doc_anonymizer] OCR redaction requires pytesseract + Pillow')
         return []
 
+    # Clean entities (same filter as text-based path)
+    entities = _clean_entities(entities)
+
     # Build lookup of texts to redact
     seen_texts = {}
     for e in entities:
@@ -1353,7 +1414,7 @@ def _redact_scanned_pdf(src_path, output_path, entities):
     _SKIP_WORDS = {
         'lek', 'dr', 'med', 'prof', 'mgr', 'inz', 'hab', 'doc',
         'im', 'ul', 'al', 'os', 'pl', 'str', 'nr', 'tel', 'fax',
-        'sp', 'zoo', 'nip', 'regon', 'krs', 'www', 'com',
+        'sp', 'zoo', 'nip', 'regon', 'krs', 'www', 'com', 'pwz',
     }
 
     # Build targeted lookups
@@ -1470,7 +1531,7 @@ def _redact_scanned_pdf(src_path, output_path, entities):
                     matched_entities.add((ent_txt, ent_cat))
 
         # 4) Phrases (addresses, institutions) — require majority of words to match
-        # in a contiguous OCR window
+        # in a contiguous OCR window, but limit span to avoid full-page blur
         for phrase_words, ent_txt, ent_cat in phrase_entities:
             needed = max(2, len(phrase_words) * 2 // 3)  # at least 2/3 match
             pw_set = set(phrase_words)
@@ -1484,16 +1545,37 @@ def _redact_scanned_pdf(src_path, output_path, entities):
                         window_words.add(w)
                 hits = pw_set & window_words
                 if len(hits) >= needed:
-                    _add_span(i, end - i)
+                    # Check span doesn't cover too much of the page
+                    x0 = min(ocr_data['left'][j] for j in range(i, end))
+                    y0 = min(ocr_data['top'][j] for j in range(i, end))
+                    x1 = max(ocr_data['left'][j]+ocr_data['width'][j] for j in range(i, end))
+                    y1 = max(ocr_data['top'][j]+ocr_data['height'][j] for j in range(i, end))
+                    span_area = (x1 - x0) * (y1 - y0)
+                    page_area = img.width * img.height
+                    if span_area > page_area * 0.10:
+                        # Span too large — blur individual matching words instead
+                        for j in range(i, end):
+                            wl = ocr_data['text'][j].strip('.,;:!?()[]/-').lower()
+                            if wl in pw_set:
+                                _add_rect(j)
+                    else:
+                        _add_span(i, end - i)
                     matched_entities.add((ent_txt, ent_cat))
                     break
 
         if not blur_rects:
             continue
 
-        # Apply blur to all matched rectangles
+        # Apply blur to all matched rectangles, skip oversized ones
+        page_area = img.width * img.height
+        max_rect_area = page_area * 0.15
         for (x0, y0, x1, y1) in blur_rects:
             if x1 <= x0 or y1 <= y0:
+                continue
+            rect_area = (x1 - x0) * (y1 - y0)
+            if rect_area > max_rect_area:
+                log.debug('[doc_anonymizer] Skipping oversized scanned rect %.1f%% on page %d',
+                          rect_area / page_area * 100, page_idx + 1)
                 continue
             crop = img.crop((x0, y0, x1, y1))
             blurred = crop.filter(ImageFilter.GaussianBlur(radius=blur_radius))
@@ -1635,6 +1717,87 @@ def _emit_progress(job_id, stage, percent, message):
         })
 
 
+_GARBAGE_NAME_PATTERNS = re.compile(
+    r'^(?:Oun|Opl|Nmr|LVH|RBBB|LBBB|AoVmax|AcT|PG|GLTW|D\.S\.|EF|'
+    r'Fizjoterapeuty|Ordynator|Pielegniar|Rehabilitant|Technik|Lica|'
+    r'V+i*\s*i?\s*V*l*|VII+|VIII?|Vlll|'
+    r'bz|max|min|sp\.|Sp\.|Meen)$',
+    re.IGNORECASE
+)
+
+_MEDICAL_ABBREV_STOPWORDS = frozenset({
+    'lvh', 'rbbb', 'lbbb', 'af', 'ef', 'aovmax', 'act', 'pg',
+    'gltw', 'nmr', 'mri', 'ct', 'usg', 'ekg', 'emg', 'eeg',
+    'tsh', 'ft3', 'ft4', 'crp', 'opl', 'oun', 'ast', 'alt',
+    'bnp', 'gfr', 'hba1c', 'ldl', 'hdl', 'wbc', 'rbc', 'plt',
+    'hgb', 'mch', 'mchc', 'mcv', 'inr', 'aptt', 'd.s.', 'ds',
+    'lica', 'meen', 'pwz',
+})
+
+
+def _clean_entities(entities):
+    """Remove garbage entities before redaction."""
+    cleaned = []
+    for e in entities:
+        txt = e.get('text', '').strip()
+        cat = e.get('category', '')
+
+        # Strip trailing pipe/special chars from PDF extraction artifacts
+        txt = re.sub(r'[|¢©]+\s*$', '', txt).strip()
+        txt = re.sub(r'^[|¢©]+\s*', '', txt).strip()
+        if not txt:
+            continue
+        e = dict(e, text=txt)
+
+        # Skip empty or very short non-numeric entities
+        if len(txt) < 3 and cat in ('IMIE_NAZWISKO', 'IMIE', 'NAZWISKO', 'LEKARZ', 'NAZWA_PLACOWKI'):
+            continue
+
+        # Skip entities containing copyright symbols or URL patterns
+        if '©' in txt or 'www.' in txt or '.com' in txt or 'http' in txt:
+            continue
+
+        # Skip known garbage patterns
+        if _GARBAGE_NAME_PATTERNS.match(txt):
+            continue
+
+        # Skip medical abbreviations detected as names
+        if txt.lower().replace('.', '').replace(' ', '') in _MEDICAL_ABBREV_STOPWORDS:
+            continue
+
+        # Skip name entities that START with a medical stopword
+        if cat in ('IMIE_NAZWISKO', 'IMIE', 'NAZWISKO'):
+            first_word = txt.split()[0].lower() if txt.split() else ''
+            if first_word in _MEDICAL_STOPWORDS or first_word in _MEDICAL_ABBREV_STOPWORDS:
+                continue
+
+        # Skip entities that look like job titles, not names
+        title_words = {'fizjoterapeuty', 'ordynator', 'pielęgniarka', 'pielegniar',
+                       'rehabilitant', 'technik', 'dietetyk', 'logopeda', 'psycholog'}
+        if txt.lower() in title_words:
+            continue
+
+        # Skip PWZ (prawo wykonywania zawodu) — public professional license, not PII
+        if re.match(r'(?i)(?:nr\s+)?PWZ[\s:]*\d{5,7}', txt):
+            continue
+        if cat == 'NR_DOKUMENTU' and 'PWZ' in txt.upper():
+            continue
+
+        # Split multi-line/pipe entities into clean parts
+        if '\n' in txt or '|' in txt:
+            parts = re.split(r'[|\n]+', txt)
+            good_parts = [p.strip() for p in parts
+                          if len(p.strip()) >= 4 and '©' not in p and 'www.' not in p]
+            for p in good_parts:
+                cleaned.append({'text': p, 'category': cat})
+            continue
+
+        cleaned.append(e)
+
+    log.info('[doc_anonymizer] Entity cleanup: %d -> %d entities', len(entities), len(cleaned))
+    return cleaned
+
+
 def _run_anonymization(job_id, src_path, filename, file_ext, username):
     """Background: extract text -> LLM -> replace -> generate output."""
     job = _job_dir(job_id)
@@ -1714,6 +1877,9 @@ def _run_anonymization(job_id, src_path, filename, file_ext, username):
 
         _emit_progress(job_id, 'replacing', 85,
                        'Zastepowanie danych osobowych...')
+
+        # Clean up entities — remove garbage before redaction
+        all_entities = _clean_entities(all_entities)
 
         _emit_progress(job_id, 'generating', 90,
                        'Generowanie zanonimizowanego dokumentu...')
@@ -1960,6 +2126,217 @@ def anon_delete_job(job_id):
     with _jobs_lock:
         _active_jobs.pop(job_id, None)
     return jsonify({'ok': True})
+
+
+@doc_anonymizer_bp.route('/jobs/delete-batch', methods=['POST'])
+def anon_delete_batch():
+    """Delete multiple anonymization jobs at once."""
+    import shutil
+    data = request.get_json(silent=True) or {}
+    job_ids = data.get('job_ids', [])
+    if not isinstance(job_ids, list) or not job_ids:
+        return jsonify({'error': 'job_ids list required'}), 400
+    deleted = 0
+    for jid in job_ids:
+        if not isinstance(jid, str) or not jid:
+            continue
+        job = _job_dir(jid)
+        if os.path.isdir(job):
+            shutil.rmtree(job, ignore_errors=True)
+            deleted += 1
+        with _jobs_lock:
+            _active_jobs.pop(jid, None)
+    return jsonify({'ok': True, 'deleted': deleted})
+
+
+@doc_anonymizer_bp.route('/preview/<job_id>/<which>', methods=['GET'])
+def anon_preview(job_id, which):
+    """Serve original or anonymized file inline for preview.
+
+    ``which`` must be 'original' or 'anonymized'.
+    PDFs are served as raw files (for PDF.js rendering in the frontend).
+    DOCX text is extracted and returned as JSON.
+    """
+    if which not in ('original', 'anonymized'):
+        return jsonify({'error': 'Invalid preview type'}), 400
+
+    job = _job_dir(job_id)
+    meta_path = os.path.join(job, 'meta.json')
+    if not os.path.isfile(meta_path):
+        return jsonify({'error': 'Job not found'}), 404
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    file_ext = meta.get('file_ext', '.pdf')
+
+    if which == 'original':
+        file_path = os.path.join(job, 'original' + file_ext)
+    else:
+        if meta.get('status') != 'done':
+            return jsonify({'error': 'Anonymization not complete'}), 400
+        file_path = os.path.join(job, meta.get('output_filename', ''))
+
+    if not os.path.isfile(file_path):
+        return jsonify({'error': 'File not found'}), 404
+
+    # PDF: serve raw file for PDF.js rendering
+    if file_ext == '.pdf':
+        return send_file(file_path, mimetype='application/pdf',
+                         as_attachment=False)
+
+    # DOCX: extract text and return as JSON
+    try:
+        paragraphs = _extract_text_docx(file_path)
+        return jsonify({'ok': True, 'text': '\n\n'.join(paragraphs)})
+    except Exception as e:
+        log.warning('[doc_anonymizer] Preview text extraction failed: %s', e)
+        return jsonify({'error': 'Could not extract text: ' + str(e)}), 500
+
+
+@doc_anonymizer_bp.route('/regenerate/<job_id>', methods=['POST'])
+def anon_regenerate(job_id):
+    """Re-generate anonymized document excluding specified replacements.
+
+    Accepts JSON ``{"excluded": ["original text 1", "original text 2"]}``.
+    Items in *excluded* are treated as false positives — they will NOT be
+    redacted.  The false-positive feedback is stored for future model
+    retraining.
+    """
+    job = _job_dir(job_id)
+    meta_path = os.path.join(job, 'meta.json')
+    if not os.path.isfile(meta_path):
+        return jsonify({'error': 'Job not found'}), 404
+
+    with open(meta_path) as f:
+        meta = json.load(f)
+
+    if meta.get('status') != 'done':
+        return jsonify({'error': 'Job not finished yet'}), 400
+
+    data = request.get_json(silent=True) or {}
+    if isinstance(data, str):
+        try:
+            data = json.loads(data)
+        except Exception:
+            data = {}
+    excluded = set(data.get('excluded', []))
+    if not excluded:
+        return jsonify({'error': 'Nothing to exclude'}), 400
+
+    file_ext = meta.get('file_ext', '.pdf')
+    src_path = os.path.join(job, 'original' + file_ext)
+    if not os.path.isfile(src_path):
+        return jsonify({'error': 'Original file missing'}), 404
+
+    # Save false-positive feedback for model retraining
+    fb_path = os.path.join(job, 'feedback.json')
+    feedback = []
+    if os.path.isfile(fb_path):
+        try:
+            with open(fb_path) as f:
+                feedback = json.load(f)
+        except Exception:
+            feedback = []
+    for orig in excluded:
+        matching = [r for r in meta.get('replacements', [])
+                    if r.get('original') == orig]
+        for r in matching:
+            fb_entry = {
+                'original': orig,
+                'category': r.get('category', ''),
+                'action': 'false_positive',
+                'timestamp': time.time(),
+            }
+            if fb_entry not in feedback:
+                feedback.append(fb_entry)
+    with open(fb_path, 'w') as f:
+        json.dump(feedback, f, ensure_ascii=False, indent=2)
+
+    # Also save to global feedback file for model retraining
+    global_fb_path = os.path.join(os.path.dirname(job), 'false_positives.json')
+    global_fb = []
+    if os.path.isfile(global_fb_path):
+        try:
+            with open(global_fb_path) as f:
+                global_fb = json.load(f)
+        except Exception:
+            global_fb = []
+    for orig in excluded:
+        matching = [r for r in meta.get('replacements', [])
+                    if r.get('original') == orig]
+        for r in matching:
+            global_fb.append({
+                'original': orig,
+                'category': r.get('category', ''),
+                'job_id': job_id,
+                'filename': meta.get('filename', ''),
+                'timestamp': time.time(),
+            })
+    with open(global_fb_path, 'w') as f:
+        json.dump(global_fb, f, ensure_ascii=False, indent=2)
+
+    # Rebuild entity list from original replacements, minus excluded
+    all_repls = meta.get('replacements', [])
+    kept_entities = []
+    for r in all_repls:
+        if r.get('original') not in excluded:
+            kept_entities.append({
+                'text': r['original'],
+                'category': r.get('category', 'INNE_PII'),
+            })
+
+    # Re-generate the output document
+    out_filename = meta.get('output_filename', 'anonymized_' + meta.get('filename', 'doc'))
+    out_path = os.path.join(job, out_filename)
+
+    try:
+        if file_ext == '.pdf':
+            if _is_scanned_pdf(src_path):
+                redact_repls = _redact_scanned_pdf(src_path, out_path, kept_entities)
+            else:
+                redact_repls = _redact_pdf(src_path, out_path, kept_entities)
+            seen_repls = {}
+            for r in redact_repls:
+                key = r['original']
+                if key not in seen_repls:
+                    seen_repls[key] = r
+                else:
+                    seen_repls[key]['occurrences'] += r['occurrences']
+        elif file_ext in ('.docx', '.doc'):
+            _anonymize_docx_inplace(src_path, out_path, kept_entities)
+            seen_repls = {}
+            for e in kept_entities:
+                txt = e.get('text', '').strip()
+                if not txt or txt in seen_repls:
+                    continue
+                cat = _normalize_category(e.get('category', 'INNE_PII'))
+                seen_repls[txt] = {
+                    'original': txt,
+                    'placeholder': _PLACEHOLDER_MAP.get(cat, '[DANE]'),
+                    'category': cat,
+                    'occurrences': 1,
+                }
+        else:
+            return jsonify({'error': 'Unsupported format'}), 400
+
+        # Update meta
+        meta['replacements'] = list(seen_repls.values())
+        meta['entities_found'] = len(seen_repls)
+        meta['excluded'] = list(excluded)
+        meta['regenerated_at'] = time.time()
+        with open(meta_path, 'w') as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+        return jsonify({
+            'ok': True,
+            'entities_found': len(seen_repls),
+            'excluded_count': len(excluded),
+            'replacements': list(seen_repls.values()),
+        })
+    except Exception as e:
+        log.error('[doc_anonymizer] Regeneration failed for %s: %s', job_id, e)
+        return jsonify({'error': 'Regeneration failed: ' + str(e)}), 500
 
 
 @doc_anonymizer_bp.route('/status', methods=['GET'])

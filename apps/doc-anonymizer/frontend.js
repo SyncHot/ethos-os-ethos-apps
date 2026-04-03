@@ -57,7 +57,6 @@ AppRegistry['doc-anonymizer'] = function (appDef) {
             ringEl.style.strokeDashoffset = circumference;
         }
 
-        // Check dependency status
         checkDeps();
         loadJobs();
 
@@ -93,6 +92,12 @@ AppRegistry['doc-anonymizer'] = function (appDef) {
         fileInput.addEventListener('change', function () {
             if (fileInput.files.length) uploadFile(fileInput.files[0]);
         });
+
+        function resetProgress() {
+            pctEl.textContent = '0%';
+            msgEl.textContent = '';
+            if (ringEl) ringEl.style.strokeDashoffset = circumference;
+        }
 
         function setProgress(pct, msg) {
             statusDiv.style.display = '';
@@ -134,6 +139,7 @@ AppRegistry['doc-anonymizer'] = function (appDef) {
             }
 
             dropZone.style.display = 'none';
+            resetProgress();
             setProgress(5, t('Wysylanie pliku...'));
 
             var fd = new FormData();
@@ -167,6 +173,39 @@ AppRegistry['doc-anonymizer'] = function (appDef) {
             }
         }
 
+        /* ── Multi-select helpers ── */
+
+        function getSelectedIds() {
+            var checked = jobsDiv.querySelectorAll('.anon-job-cb:checked');
+            return Array.from(checked).map(function (cb) { return cb.value; });
+        }
+
+        function updateBatchBar() {
+            var bar = jobsDiv.querySelector('.anon-batch-bar');
+            var ids = getSelectedIds();
+            if (bar) bar.style.display = ids.length ? '' : 'none';
+            var countEl = bar && bar.querySelector('.anon-batch-count');
+            if (countEl) countEl.textContent = ids.length;
+        }
+
+        async function deleteBatch() {
+            var ids = getSelectedIds();
+            if (!ids.length) return;
+            confirmDialog(
+                t('Usunac zaznaczone dokumenty?') + ' (' + ids.length + ')',
+                async function () {
+                    await api('/doc-anonymizer/jobs/delete-batch', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ job_ids: ids }),
+                    });
+                    loadJobs();
+                }
+            );
+        }
+
+        /* ── Jobs list ── */
+
         async function loadJobs() {
             var data = await api('/doc-anonymizer/jobs');
             if (!data || !data.items) { jobsDiv.innerHTML = ''; return; }
@@ -176,7 +215,16 @@ AppRegistry['doc-anonymizer'] = function (appDef) {
                 return;
             }
 
-            var html = '<div class="anon-jobs-header">' + t('Historia') + '</div>';
+            var html = '<div class="anon-jobs-toolbar">' +
+                '<div class="anon-jobs-header">' + t('Historia') + '</div>' +
+                '<div class="anon-batch-bar" style="display:none">' +
+                    '<span class="anon-batch-count">0</span> ' + t('zaznaczonych') +
+                    '<button class="anon-btn anon-btn-batch-del" id="anon-batch-del">' +
+                        '<i class="fa fa-trash"></i> ' + t('Usun zaznaczone') +
+                    '</button>' +
+                '</div>' +
+            '</div>';
+
             data.items.forEach(function (job) {
                 var dateStr = job.created_at ? new Date(job.created_at * 1000).toLocaleString() : '';
                 var statusIcon = '';
@@ -193,6 +241,9 @@ AppRegistry['doc-anonymizer'] = function (appDef) {
                 }
 
                 html += '<div class="anon-job-row ' + statusClass + '" data-job="' + job.job_id + '">' +
+                    '<label class="anon-job-cb-label" onclick="event.stopPropagation()">' +
+                        '<input type="checkbox" class="anon-job-cb" value="' + job.job_id + '">' +
+                    '</label>' +
                     '<div class="anon-job-info">' +
                         statusIcon + ' ' +
                         '<span class="anon-job-name">' + (job.filename || '') + '</span>' +
@@ -216,6 +267,15 @@ AppRegistry['doc-anonymizer'] = function (appDef) {
             });
 
             jobsDiv.innerHTML = html;
+
+            // Checkbox change → update batch bar
+            jobsDiv.querySelectorAll('.anon-job-cb').forEach(function (cb) {
+                cb.addEventListener('change', updateBatchBar);
+            });
+
+            // Batch delete button
+            var batchBtn = jobsDiv.querySelector('#anon-batch-del');
+            if (batchBtn) batchBtn.addEventListener('click', deleteBatch);
 
             // Download buttons
             jobsDiv.querySelectorAll('[data-dl]').forEach(function (btn) {
@@ -241,35 +301,53 @@ AppRegistry['doc-anonymizer'] = function (appDef) {
                 });
             });
 
-            // Click row to show details
+            // Click row to show preview
             jobsDiv.querySelectorAll('.anon-job-row[data-job]').forEach(function (row) {
                 row.addEventListener('click', function () {
-                    showJobDetails(row.getAttribute('data-job'));
+                    showJobPreview(row.getAttribute('data-job'));
                 });
             });
         }
 
-        async function showJobDetails(jobId) {
+        /* ── Split-pane preview window ── */
+
+        async function showJobPreview(jobId) {
             var data = await api('/doc-anonymizer/jobs');
             if (!data || !data.items) return;
             var job = data.items.find(function (j) { return j.job_id === jobId; });
             if (!job) return;
 
-            var content = '<div class="anon-detail">';
-            content += '<h3>' + (job.filename || '') + '</h3>';
-            content += '<p>' + t('Status') + ': <b>' + (job.status || '') + '</b></p>';
-            content += '<p>' + t('Stron') + ': ' + (job.pages_analyzed || 0) + '</p>';
-            content += '<p>' + t('Znalezione PII') + ': ' + (job.entities_found || 0) + '</p>';
+            var isPdf = (job.file_ext === '.pdf');
+            var isDone = (job.status === 'done');
 
+            createWindow('anon-preview-' + jobId, {
+                title: (job.filename || '') + ' — ' + t('Porownanie'),
+                icon: 'fa-columns',
+                iconColor: '#0ea5e9',
+                width: 1100, height: 700,
+                onRender: function (b) { renderPreview(b, job, isPdf, isDone); },
+            });
+        }
+
+        function renderPreview(b, job, isPdf, isDone) {
+            var jobId = job.job_id;
+
+            // Build replacement table HTML with toggle switches
+            var tableHtml = '';
             if (job.replacements && job.replacements.length > 0) {
-                content += '<table class="anon-detail-table"><thead><tr>' +
+                tableHtml = '<table class="anon-detail-table"><thead><tr>' +
+                    '<th>' + t('Anonimizuj') + '</th>' +
                     '<th>' + t('Kategoria') + '</th>' +
-                    '<th>' + t('Oryginał') + '</th>' +
+                    '<th>' + t('Oryginal') + '</th>' +
                     '<th>' + t('Zamiennik') + '</th>' +
-                    '<th>' + t('Wystąpienia') + '</th>' +
+                    '<th>' + t('Wystapienia') + '</th>' +
                     '</tr></thead><tbody>';
-                job.replacements.forEach(function (r) {
-                    content += '<tr>' +
+                job.replacements.forEach(function (r, idx) {
+                    var rid = 'anon-toggle-' + jobId + '-' + idx;
+                    tableHtml += '<tr data-original="' + (r.original || '').replace(/"/g, '&quot;') + '">' +
+                        '<td><label class="anon-toggle"><input type="checkbox" checked id="' + rid + '" ' +
+                            'data-original="' + (r.original || '').replace(/"/g, '&quot;') + '">' +
+                            '<span class="anon-toggle-slider"></span></label></td>' +
                         '<td><span class="anon-cat anon-cat-' + (r.category || '').toLowerCase() + '">' +
                             (r.category || '') + '</span></td>' +
                         '<td>' + (r.original || '') + '</td>' +
@@ -277,22 +355,284 @@ AppRegistry['doc-anonymizer'] = function (appDef) {
                         '<td>' + (r.occurrences || 0) + '</td>' +
                         '</tr>';
                 });
-                content += '</tbody></table>';
+                tableHtml += '</tbody></table>' +
+                    '<div class="anon-regen-bar">' +
+                        '<span class="anon-regen-hint"><i class="fa fa-info-circle"></i> ' +
+                            t('Odznacz elementy ktore nie powinny byc anonimizowane (false positives)') + '</span>' +
+                        '<button class="anon-regen-btn" id="anon-regen-' + jobId + '" disabled>' +
+                            '<i class="fa fa-sync-alt"></i> ' + t('Regeneruj PDF') +
+                        '</button>' +
+                    '</div>';
             }
 
-            if (job.error) {
-                content += '<p class="anon-error-msg">' + job.error + '</p>';
+            // Meta + zoom toolbar
+            var metaHtml = '<div class="anon-preview-meta">' +
+                '<span><i class="fa fa-file"></i> ' + (job.filename || '') + '</span>' +
+                '<span><i class="fa fa-copy"></i> ' + (job.pages_analyzed || 0) + ' ' + t('stron') + '</span>' +
+                '<span><i class="fa fa-shield-alt"></i> ' + (job.entities_found || 0) + ' PII</span>' +
+                '<span class="anon-zoom-bar">' +
+                    '<button class="anon-zoom-btn" data-action="out" title="Zoom -"><i class="fa fa-search-minus"></i></button>' +
+                    '<span class="anon-zoom-level" id="anon-zoom-lbl-' + jobId + '">100%</span>' +
+                    '<button class="anon-zoom-btn" data-action="in" title="Zoom +"><i class="fa fa-search-plus"></i></button>' +
+                    '<button class="anon-zoom-btn" data-action="reset" title="Reset"><i class="fa fa-undo"></i></button>' +
+                '</span>' +
+                '</div>';
+
+            var content = '<div class="anon-preview">' + metaHtml;
+
+            if (!isDone) {
+                content += '<div class="anon-preview-pending">' +
+                    '<i class="fa fa-spinner fa-spin"></i> ' +
+                    t('Anonimizacja jeszcze nie zakonczona') +
+                    '</div>';
+                if (job.error) {
+                    content += '<p class="anon-error-msg">' + job.error + '</p>';
+                }
+                content += '</div>';
+                b.innerHTML = content;
+                return;
+            }
+
+            // Split pane
+            content += '<div class="anon-preview-split">' +
+                '<div class="anon-preview-pane">' +
+                    '<div class="anon-preview-pane-title">' +
+                        '<i class="fa fa-file-alt"></i> ' + t('Oryginal') +
+                    '</div>' +
+                    '<div class="anon-preview-content" id="anon-pv-orig-' + jobId + '">' +
+                        '<div class="anon-preview-loading"><i class="fa fa-spinner fa-spin"></i></div>' +
+                    '</div>' +
+                '</div>' +
+                '<div class="anon-preview-divider"></div>' +
+                '<div class="anon-preview-pane">' +
+                    '<div class="anon-preview-pane-title anon-preview-pane-title-anon">' +
+                        '<i class="fa fa-user-shield"></i> ' + t('Zanonimizowany') +
+                    '</div>' +
+                    '<div class="anon-preview-content" id="anon-pv-anon-' + jobId + '">' +
+                        '<div class="anon-preview-loading"><i class="fa fa-spinner fa-spin"></i></div>' +
+                    '</div>' +
+                '</div>' +
+            '</div>';
+
+            if (tableHtml) {
+                content += '<div class="anon-preview-table-wrap">' +
+                    '<div class="anon-preview-table-title">' +
+                        '<i class="fa fa-exchange-alt"></i> ' + t('Zamienniki') +
+                        ' <span class="anon-preview-table-count">(' + (job.replacements || []).length + ')</span>' +
+                    '</div>' +
+                    tableHtml +
+                '</div>';
             }
 
             content += '</div>';
+            b.innerHTML = content;
 
-            createWindow('anon-detail-' + jobId, {
-                title: t('Szczegoly anonimizacji'),
-                icon: 'fa-shield-alt',
-                iconColor: '#0ea5e9',
-                width: 600, height: 450,
-                onRender: function (b) { b.innerHTML = content; },
+            var origEl = b.querySelector('#anon-pv-orig-' + jobId);
+            var anonEl = b.querySelector('#anon-pv-anon-' + jobId);
+
+            // Load content into both panes
+            if (isPdf) {
+                loadPdfPreview(jobId, 'original', origEl);
+                loadPdfPreview(jobId, 'anonymized', anonEl);
+            } else {
+                loadDocxPreview(jobId, 'original', origEl);
+                loadDocxPreview(jobId, 'anonymized', anonEl);
+            }
+
+            // Synchronized scrolling
+            var syncing = false;
+            origEl.addEventListener('scroll', function () {
+                if (syncing) return;
+                syncing = true;
+                anonEl.scrollTop = origEl.scrollTop;
+                anonEl.scrollLeft = origEl.scrollLeft;
+                syncing = false;
             });
+            anonEl.addEventListener('scroll', function () {
+                if (syncing) return;
+                syncing = true;
+                origEl.scrollTop = anonEl.scrollTop;
+                origEl.scrollLeft = anonEl.scrollLeft;
+                syncing = false;
+            });
+
+            // Zoom controls — re-render PDF pages at new scale
+            var currentZoom = 1.0;
+            var zoomLabel = b.querySelector('#anon-zoom-lbl-' + jobId);
+
+            function applyZoom(level) {
+                currentZoom = Math.max(0.25, Math.min(3.0, level));
+                if (zoomLabel) zoomLabel.textContent = Math.round(currentZoom * 100) + '%';
+                if (isPdf) {
+                    renderAllPdfCanvases(origEl, currentZoom);
+                    renderAllPdfCanvases(anonEl, currentZoom);
+                } else {
+                    [origEl, anonEl].forEach(function (el) {
+                        var txt = el.querySelector('.anon-preview-text');
+                        if (txt) {
+                            txt.style.transform = 'scale(' + currentZoom + ')';
+                            txt.style.transformOrigin = 'top left';
+                            txt.style.width = (100 / currentZoom) + '%';
+                        }
+                    });
+                }
+            }
+
+            b.querySelectorAll('.anon-zoom-btn').forEach(function (btn) {
+                btn.addEventListener('click', function () {
+                    var action = btn.dataset.action;
+                    if (action === 'in') applyZoom(currentZoom + 0.15);
+                    else if (action === 'out') applyZoom(currentZoom - 0.15);
+                    else applyZoom(1.0);
+                });
+            });
+
+            var splitEl = b.querySelector('.anon-preview-split');
+            if (splitEl) {
+                splitEl.addEventListener('wheel', function (e) {
+                    if (e.ctrlKey || e.metaKey) {
+                        e.preventDefault();
+                        applyZoom(currentZoom + (e.deltaY < 0 ? 0.1 : -0.1));
+                    }
+                }, { passive: false });
+            }
+
+            // Toggle switches + regenerate button
+            var regenBtn = b.querySelector('#anon-regen-' + jobId);
+            var toggles = b.querySelectorAll('.anon-toggle input[type="checkbox"]');
+            if (regenBtn && toggles.length) {
+                toggles.forEach(function (cb) {
+                    cb.addEventListener('change', function () {
+                        var row = cb.closest('tr');
+                        if (row) row.classList.toggle('anon-row-excluded', !cb.checked);
+                        var anyUnchecked = Array.from(toggles).some(function (c) { return !c.checked; });
+                        regenBtn.disabled = !anyUnchecked;
+                    });
+                });
+
+                regenBtn.addEventListener('click', async function () {
+                    var excluded = [];
+                    toggles.forEach(function (cb) {
+                        if (!cb.checked) excluded.push(cb.dataset.original);
+                    });
+                    if (!excluded.length) return;
+
+                    regenBtn.disabled = true;
+                    regenBtn.innerHTML = '<i class="fa fa-spinner fa-spin"></i> ' + t('Regenerowanie...');
+
+                    try {
+                        var res = await api('/doc-anonymizer/regenerate/' + jobId, {
+                            method: 'POST',
+                            body: { excluded: excluded },
+                        });
+                        if (res.error) {
+                            toast(res.error, 'error');
+                            regenBtn.disabled = false;
+                            regenBtn.innerHTML = '<i class="fa fa-sync-alt"></i> ' + t('Regeneruj PDF');
+                            return;
+                        }
+                        toast(t('PDF zregenerowany') + ' — ' + res.excluded_count + ' ' + t('elementow przywroconych'), 'success');
+                        // Reload the anonymized pane
+                        var anonPane = b.querySelector('#anon-pv-anon-' + jobId);
+                        if (anonPane) {
+                            anonPane.innerHTML = '<div class="anon-preview-loading"><i class="fa fa-spinner fa-spin"></i></div>';
+                            if (isPdf) loadPdfPreview(jobId, 'anonymized', anonPane);
+                            else loadDocxPreview(jobId, 'anonymized', anonPane);
+                        }
+                        // Update replacement table with new data
+                        if (res.replacements) {
+                            job.replacements = res.replacements;
+                            job.entities_found = res.entities_found;
+                        }
+                        regenBtn.innerHTML = '<i class="fa fa-check"></i> ' + t('Gotowe');
+                        setTimeout(function () {
+                            regenBtn.innerHTML = '<i class="fa fa-sync-alt"></i> ' + t('Regeneruj PDF');
+                        }, 2000);
+                    } catch (e) {
+                        toast(t('Blad regeneracji') + ': ' + e.message, 'error');
+                        regenBtn.disabled = false;
+                        regenBtn.innerHTML = '<i class="fa fa-sync-alt"></i> ' + t('Regeneruj PDF');
+                    }
+                });
+            }
+        }
+
+        /* Re-render all PDF canvases in a container at the given zoom */
+        function renderAllPdfCanvases(container, zoom) {
+            container.querySelectorAll('canvas[data-page-idx]').forEach(function (canvas) {
+                var page = canvas._pdfPage;
+                if (!page) return;
+                var vp = page.getViewport({ scale: zoom * 1.5 });
+                canvas.width = vp.width;
+                canvas.height = vp.height;
+                canvas.style.width = vp.width / 1.5 + 'px';
+                canvas.style.height = vp.height / 1.5 + 'px';
+                page.render({ canvasContext: canvas.getContext('2d'), viewport: vp });
+            });
+        }
+
+        /* Load and render a PDF using PDF.js */
+        async function loadPdfPreview(jobId, which, container) {
+            try {
+                // Lazy-load PDF.js
+                if (!window.pdfjsLib) {
+                    await new Promise(function (resolve, reject) {
+                        var s = document.createElement('script');
+                        s.src = '/lib/pdf.min.js';
+                        s.onload = resolve;
+                        s.onerror = reject;
+                        document.head.appendChild(s);
+                    });
+                    pdfjsLib.GlobalWorkerOptions.workerSrc = '/lib/pdf.worker.min.js';
+                }
+
+                var url = '/api/doc-anonymizer/preview/' + jobId + '/' + which +
+                    '?token=' + encodeURIComponent(NAS.token);
+                var pdf = await pdfjsLib.getDocument(url).promise;
+
+                container.innerHTML = '';
+                var wrapper = document.createElement('div');
+                wrapper.className = 'anon-pdf-pages';
+                container.appendChild(wrapper);
+
+                for (var i = 1; i <= pdf.numPages; i++) {
+                    var page = await pdf.getPage(i);
+                    var vp = page.getViewport({ scale: 1.5 });
+                    var canvas = document.createElement('canvas');
+                    canvas.className = 'anon-pdf-canvas';
+                    canvas.dataset.pageIdx = i;
+                    canvas.width = vp.width;
+                    canvas.height = vp.height;
+                    canvas.style.width = vp.width / 1.5 + 'px';
+                    canvas.style.height = vp.height / 1.5 + 'px';
+                    canvas._pdfPage = page;
+                    wrapper.appendChild(canvas);
+                    page.render({ canvasContext: canvas.getContext('2d'), viewport: vp });
+                }
+            } catch (e) {
+                container.innerHTML = '<div class="anon-preview-error">' +
+                    t('Nie udalo sie zaladowac PDF') + ': ' + e.message + '</div>';
+            }
+        }
+
+        async function loadDocxPreview(jobId, which, container) {
+            try {
+                var data = await api('/doc-anonymizer/preview/' + jobId + '/' + which);
+                if (data && data.text) {
+                    var escaped = data.text
+                        .replace(/&/g, '&amp;')
+                        .replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;')
+                        .replace(/\n/g, '<br>');
+                    container.innerHTML = '<div class="anon-preview-text">' + escaped + '</div>';
+                } else {
+                    container.innerHTML = '<div class="anon-preview-error">' +
+                        (data && data.error ? data.error : t('Nie udalo sie zaladowac podgladu')) +
+                        '</div>';
+                }
+            } catch (e) {
+                container.innerHTML = '<div class="anon-preview-error">' + e.message + '</div>';
+            }
         }
     }
 };

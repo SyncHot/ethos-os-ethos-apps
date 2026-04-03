@@ -83,13 +83,29 @@ function renderBuilderApp(body) {
         .bl-download-links { display:flex; gap:10px; justify-content:center; margin-top:10px; }
         .bl-download-links a { display:inline-flex; align-items:center; gap:6px; background:var(--accent); color:#fff; padding:6px 14px; border-radius:6px; text-decoration:none; font-size:12px; }
         .bl-download-links a:hover { filter:brightness(1.1); }
+
+        .bl-spec-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+        .bl-spec-card { background:var(--bg-primary,#0f172a); border:1px solid var(--border); border-radius:8px; padding:14px; }
+        .bl-spec-card-title { font-size:12px; font-weight:600; color:var(--text-secondary); text-transform:uppercase; letter-spacing:.5px; margin-bottom:10px; display:flex; align-items:center; gap:6px; }
+        .bl-spec-card-title i { font-size:11px; color:var(--accent); }
+        .bl-spec-field { margin-bottom:8px; }
+        .bl-spec-field label { display:block; font-size:11px; color:var(--text-muted); margin-bottom:3px; }
+        .bl-spec-field input, .bl-spec-field select { width:100%; box-sizing:border-box; }
+        .bl-spec-pkgs { background:var(--bg-primary,#0f172a); border:1px solid var(--border); border-radius:6px; padding:8px 10px; font-family:monospace; font-size:11px; color:var(--text-secondary); max-height:140px; overflow-y:auto; line-height:1.6; white-space:pre-wrap; word-break:break-all; }
+        .bl-spec-actions { display:flex; gap:8px; justify-content:flex-end; margin-top:12px; }
+        .bl-spec-tag { display:inline-block; background:var(--bg-hover); border:1px solid var(--border); border-radius:4px; padding:2px 7px; font-size:11px; color:var(--text-secondary); margin:2px; }
+        .bl-spec-tag .remove { cursor:pointer; margin-left:4px; color:var(--text-muted); }
+        .bl-spec-tag .remove:hover { color:#ef4444; }
+        .bl-spec-info { font-size:11px; color:var(--text-muted); margin-top:6px; }
     </style>
 
     <div class="bl-wrap">
         <div class="bl-sidebar">
             <div class="bl-nav active" data-tab="release"><i class="fas fa-box"></i> Release</div>
             <div class="bl-nav" data-tab="image"><i class="fas fa-hdd"></i> Obraz systemu</div>
+            <div class="bl-nav" data-tab="publish"><i class="fas fa-cloud-upload-alt"></i> Publikuj apki</div>
             <div class="bl-nav" data-tab="artifacts"><i class="fas fa-archive"></i> Artefakty</div>
+            <div class="bl-nav" data-tab="spec"><i class="fas fa-file-code"></i> Build Spec</div>
         </div>
         <div class="bl-body" id="bl-body"></div>
     </div>`;
@@ -127,6 +143,8 @@ function renderBuilderApp(body) {
     function renderTab() {
         if (state.tab === 'release') renderRelease();
         else if (state.tab === 'image') renderImage();
+        else if (state.tab === 'publish') renderPublish();
+        else if (state.tab === 'spec') renderSpec();
         else renderArtifacts();
     }
 
@@ -256,6 +274,230 @@ function renderBuilderApp(body) {
     }
 
     /* ═══════════════════════════════════════════
+       Publish Apps Tab
+    ═══════════════════════════════════════════ */
+    function renderPublish() {
+        blBody.innerHTML = `
+            <div class="bl-section">
+                <div class="bl-section-title"><i class="fas fa-cloud-upload-alt"></i> Publikuj aplikacje do GitHub</div>
+                <div style="color:var(--text-secondary);font-size:12px;margin-bottom:12px;line-height:1.5">
+                    ${t('Porównaj lokalne pliki opcjonalnych aplikacji z repozytorium GitHub.')}
+                    ${t('Zmienione aplikacje zostaną opublikowane z automatycznym podbiciem wersji patch.')}
+                </div>
+                <div class="bl-row">
+                    <label>GitHub Token:</label>
+                    <input class="bl-input" id="bl-pub-token" type="password" placeholder="ghp_..." style="max-width:320px">
+                    <button class="bl-btn bl-btn-sm bl-btn-outline" id="bl-pub-save-token"><i class="fas fa-save"></i> Zapisz</button>
+                </div>
+                <div class="bl-row">
+                    <label>Repozytorium:</label>
+                    <input class="bl-input" id="bl-pub-repo" value="SyncHot/ethos-os-ethos-apps" style="max-width:320px" readonly>
+                </div>
+            </div>
+            <div class="bl-section" id="bl-pub-diff-section">
+                <div class="bl-section-title">
+                    <i class="fas fa-code-compare"></i> Zmiany do opublikowania
+                    <button class="bl-btn bl-btn-sm bl-btn-outline" id="bl-pub-refresh" style="margin-left:auto"><i class="fas fa-sync-alt"></i> Odśwież</button>
+                </div>
+                <div id="bl-pub-diff-body" style="font-size:12px;color:var(--text-muted)">Ładowanie...</div>
+            </div>
+            <div style="text-align:right;margin-top:6px">
+                <button class="bl-btn bl-btn-outline bl-btn-sm" id="bl-pub-select-all" style="margin-right:8px"><i class="fas fa-check-double"></i> Zaznacz zmienione</button>
+                <button class="bl-btn bl-btn-green" id="bl-pub-btn" disabled><i class="fas fa-cloud-upload-alt"></i> Opublikuj zaznaczone</button>
+            </div>
+            <div class="bl-progress-wrap" id="bl-pub-progress">
+                <div class="bl-progress-outer">
+                    <div class="bl-progress-inner" id="bl-pub-bar"></div>
+                    <div class="bl-progress-text" id="bl-pub-bar-text">0%</div>
+                </div>
+                <div class="bl-progress-detail" id="bl-pub-detail"></div>
+                <div class="bl-progress-timer" id="bl-pub-timer"></div>
+                <div class="bl-toggle-log" id="bl-pub-toggle-log">${t('Pokaż logi ▼')}</div>
+            </div>
+            <div class="bl-log" id="bl-pub-log"></div>
+            <div class="bl-result" id="bl-pub-result"></div>`;
+
+        const tokenEl = blBody.querySelector('#bl-pub-token');
+        const repoEl = blBody.querySelector('#bl-pub-repo');
+        let _pubApps = [];
+
+        // Load config
+        (async () => {
+            try {
+                const cfg = await api('/builder/publish-config');
+                if (cfg.has_token) tokenEl.value = cfg.token;
+                if (cfg.repo) repoEl.value = cfg.repo;
+            } catch {}
+            loadPublishDiff();
+        })();
+
+        // Save token
+        blBody.querySelector('#bl-pub-save-token').onclick = async () => {
+            const token = tokenEl.value.trim();
+            if (!token || token.includes('***')) {
+                toast(t('Wpisz nowy token'), 'warning');
+                return;
+            }
+            try {
+                await api('/builder/publish-config', {
+                    method: 'PUT',
+                    body: { token, repo: repoEl.value.trim() },
+                });
+                toast(t('Token zapisany'), 'success');
+                loadPublishDiff();
+            } catch (e) {
+                toast(e.message || t('Błąd'), 'error');
+            }
+        };
+
+        // Refresh diff
+        blBody.querySelector('#bl-pub-refresh').onclick = () => loadPublishDiff();
+
+        // Select all changed
+        blBody.querySelector('#bl-pub-select-all').onclick = () => {
+            blBody.querySelectorAll('.bl-pub-check').forEach(cb => {
+                if (cb.dataset.changed === '1') cb.checked = true;
+            });
+            updatePublishBtn();
+        };
+
+        // Publish button
+        blBody.querySelector('#bl-pub-btn').onclick = startPublish;
+
+        // Toggle log
+        blBody.querySelector('#bl-pub-toggle-log').onclick = () => {
+            blBody.querySelector('#bl-pub-log').classList.toggle('visible');
+        };
+
+        function updatePublishBtn() {
+            const checked = blBody.querySelectorAll('.bl-pub-check:checked').length;
+            blBody.querySelector('#bl-pub-btn').disabled = checked === 0;
+        }
+
+        async function loadPublishDiff() {
+            const diffBody = blBody.querySelector('#bl-pub-diff-body');
+            diffBody.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Porównywanie z GitHub...';
+
+            try {
+                const data = await api('/builder/publish-diff');
+                if (!data.ok) {
+                    diffBody.innerHTML = `<span style="color:#ef4444">${data.error || 'Błąd'}</span>`;
+                    return;
+                }
+                if (!data.has_token) {
+                    diffBody.innerHTML = `<span style="color:#f59e0b"><i class="fas fa-key"></i> Skonfiguruj GitHub Token powyżej, aby porównać pliki.</span>`;
+                    return;
+                }
+                _pubApps = data.apps || [];
+                if (!_pubApps.length) {
+                    diffBody.innerHTML = '<span style="color:var(--text-muted)">Brak opcjonalnych aplikacji.</span>';
+                    return;
+                }
+                const changedCount = _pubApps.filter(a => a.changed).length;
+                let html = `<div style="margin-bottom:8px;color:var(--text-secondary)">
+                    ${changedCount > 0
+                        ? `<span style="color:#f59e0b"><i class="fas fa-exclamation-circle"></i> ${changedCount} zmienion${changedCount === 1 ? 'a' : changedCount < 5 ? 'e' : 'ych'}</span> / ${_pubApps.length} aplikacji`
+                        : `<span style="color:#10b981"><i class="fas fa-check-circle"></i> Wszystkie aplikacje aktualne</span>`}
+                </div>`;
+
+                html += `<table style="width:100%;border-collapse:collapse;font-size:12px">
+                    <thead><tr style="border-bottom:1px solid var(--border);color:var(--text-muted);text-align:left">
+                        <th style="padding:6px 4px;width:30px"></th>
+                        <th style="padding:6px 4px">Aplikacja</th>
+                        <th style="padding:6px 4px;width:80px">Lokalna</th>
+                        <th style="padding:6px 4px;width:80px">GitHub</th>
+                        <th style="padding:6px 4px;width:120px">Status</th>
+                    </tr></thead><tbody>`;
+
+                for (const app of _pubApps) {
+                    const statusBadges = app.changes.map(c => {
+                        const color = c.status === 'new' ? '#10b981' : '#f59e0b';
+                        const icon = c.status === 'new' ? 'fa-plus' : 'fa-pen';
+                        return `<span style="display:inline-flex;align-items:center;gap:3px;background:${color}22;color:${color};padding:1px 6px;border-radius:4px;font-size:11px"><i class="fas ${icon}" style="font-size:9px"></i>${c.file}</span>`;
+                    }).join(' ');
+
+                    const verStyle = app.changed ? 'color:#f59e0b;font-weight:600' : 'color:var(--text-muted)';
+                    html += `<tr style="border-bottom:1px solid var(--border)">
+                        <td style="padding:6px 4px;text-align:center">
+                            <input type="checkbox" class="bl-pub-check" data-id="${app.id}" data-changed="${app.changed ? 1 : 0}" ${app.changed ? '' : 'disabled'}>
+                        </td>
+                        <td style="padding:6px 4px">
+                            <span style="display:inline-flex;align-items:center;gap:6px">
+                                <i class="fas ${app.icon}" style="color:${app.color};width:14px;text-align:center;font-size:11px"></i>
+                                <strong>${app.name}</strong>
+                            </span>
+                        </td>
+                        <td style="padding:6px 4px;${verStyle}">${app.local_version}</td>
+                        <td style="padding:6px 4px;color:var(--text-muted)">${app.remote_version}</td>
+                        <td style="padding:6px 4px">${app.changed ? statusBadges : '<span style="color:#10b981;font-size:11px"><i class="fas fa-check"></i> OK</span>'}</td>
+                    </tr>`;
+                }
+                html += '</tbody></table>';
+                diffBody.innerHTML = html;
+
+                // Wire up checkboxes
+                blBody.querySelectorAll('.bl-pub-check').forEach(cb => {
+                    cb.onchange = updatePublishBtn;
+                });
+            } catch (e) {
+                diffBody.innerHTML = `<span style="color:#ef4444">Błąd: ${e.message || e}</span>`;
+            }
+        }
+
+        async function startPublish() {
+            const selected = [];
+            blBody.querySelectorAll('.bl-pub-check:checked').forEach(cb => selected.push(cb.dataset.id));
+            if (!selected.length) return;
+            if (!await confirmDialog(t('Opublikować ' + selected.length + ' aplikacji do GitHub?'))) return;
+
+            state.building = true;
+            setDisabled(true);
+
+            const bar = blBody.querySelector('#bl-pub-bar');
+            const barText = blBody.querySelector('#bl-pub-bar-text');
+            const detail = blBody.querySelector('#bl-pub-detail');
+            const logEl = blBody.querySelector('#bl-pub-log');
+            const resultEl = blBody.querySelector('#bl-pub-result');
+            const timerEl = blBody.querySelector('#bl-pub-timer');
+            const progress = blBody.querySelector('#bl-pub-progress');
+
+            bar.style.width = '0%';
+            barText.textContent = '0%';
+            detail.textContent = '';
+            logEl.innerHTML = '';
+            logEl.classList.remove('visible');
+            resultEl.style.display = 'none';
+            progress.classList.add('active');
+
+            const buildStart = Date.now();
+            const timerIv = setInterval(() => {
+                const s = Math.floor((Date.now() - buildStart) / 1000);
+                const m = Math.floor(s / 60);
+                timerEl.textContent = `⏱ ${m}:${String(s % 60).padStart(2, '0')}`;
+            }, 1000);
+
+            try {
+                const resp = await fetch('/api/builder/publish-apps', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + NAS.token,
+                        'X-CSRFToken': NAS.csrfToken || '',
+                    },
+                    body: JSON.stringify({ app_ids: selected }),
+                });
+                await readSSE(resp, bar, barText, detail, logEl, resultEl);
+            } catch (e) {
+                showResult(resultEl, false, 'Błąd połączenia: ' + e.message);
+            } finally {
+                clearInterval(timerIv);
+                state.building = false;
+                setDisabled(false);
+            }
+        }
+    }
+
+    /* ═══════════════════════════════════════════
        Image Tab
     ═══════════════════════════════════════════ */
     function renderImage() {
@@ -309,7 +551,7 @@ function renderBuilderApp(body) {
     async function startImage() {
         if (state.building) return;
 
-        if (!confirm(t('Budowanie obrazu x86_64 zajmie ~15-30 minut.') + '\n' + t('Kontynuować?'))) return;
+        if (!await confirmDialog(t('Budowanie obrazu x86_64 zajmie ~15-30 minut.') + '\n' + t('Kontynuować?'))) return;
 
         state.building = true;
         setDisabled(true);
@@ -505,7 +747,7 @@ function renderBuilderApp(body) {
                 const paths = [...blBody.querySelectorAll(`.bl-sel[data-group="${g}"]:checked`)].map(cb => cb.dataset.path);
                 if (!paths.length) return;
                 const label = g === 'rel' ? t('pakietów') : t('obrazów');
-                if (!confirm(t('Usunąć') + ` ${paths.length} ${label}?`)) return;
+                if (!await confirmDialog(t('Usunąć') + ` ${paths.length} ${label}?`)) return;
                 try {
                     const res = await api('/builder/delete', { method: 'POST', body: { paths } });
                     if (res.deleted?.length) toast(`${t('Usunięto')} ${res.deleted.length} ${t('plików')}`, 'success');
@@ -519,7 +761,7 @@ function renderBuilderApp(body) {
         blBody.querySelectorAll('.bl-artifact-del').forEach(btn => {
             btn.onclick = async () => {
                 const path = btn.dataset.path;
-                if (!confirm(t('Usunąć') + ` ${path.split('/').pop()}?`)) return;
+                if (!await confirmDialog(t('Usunąć') + ` ${path.split('/').pop()}?`)) return;
                 try {
                     const res = await api('/builder/delete', { method: 'POST', body: { path } });
                     if (res.ok) { toast(t('Usunięto'), 'success'); loadInfo(); }
@@ -544,7 +786,7 @@ function renderBuilderApp(body) {
         })();
         const cacheBtn = blBody.querySelector('#bl-cache-clear');
         if (cacheBtn) cacheBtn.onclick = async () => {
-            if (!confirm(t('Wyczyścić cache? Następny build pobierze pakiety od nowa.'))) return;
+            if (!await confirmDialog(t('Wyczyścić cache? Następny build pobierze pakiety od nowa.'))) return;
             await api('/builder/cache', { method: 'DELETE' });
             toast('Cache wyczyszczony', 'success');
             loadInfo();
@@ -582,7 +824,7 @@ function renderBuilderApp(body) {
         })();
         const histClearBtn = blBody.querySelector('#bl-history-clear');
         if (histClearBtn) histClearBtn.onclick = async () => {
-            if (!confirm(t('Wyczyścić historię budowań?'))) return;
+            if (!await confirmDialog(t('Wyczyścić historię budowań?'))) return;
             await api('/builder/history/clear', { method: 'POST' });
             toast(t('Historia wyczyszczona'), 'success');
             renderArtifacts();
@@ -796,13 +1038,261 @@ function renderBuilderApp(body) {
     }
 
     async function cancelBuild() {
-        if (!confirm(t('Na pewno anulować bieżący build?'))) return;
+        if (!await confirmDialog(t('Na pewno anulować bieżący build?'))) return;
         try {
             await api('/builder/cancel', { method: 'POST' });
             toast('Anulowano build', 'info');
         } catch (e) {
             toast(e.message || t('Błąd'), 'error');
         }
+    }
+
+    /* ═══════════════════════════════════════════
+       Build Spec Tab
+    ═══════════════════════════════════════════ */
+    async function renderSpec() {
+        blBody.innerHTML = '<div class="bl-empty"><i class="fas fa-spinner fa-spin"></i> ' + t('Ładowanie...') + '</div>';
+        let spec, defaults;
+        try {
+            const res = await api('/builder/spec');
+            spec = res.spec || {};
+            const defRes = await api('/builder/spec/defaults');
+            defaults = defRes.spec || {};
+        } catch (e) {
+            blBody.innerHTML = '<div class="bl-empty">' + t('Nie udało się pobrać konfiguracji build spec') + '</div>';
+            return;
+        }
+
+        const base = spec.base || {};
+        const identity = spec.identity || {};
+        const partitions = spec.partitions || {};
+        const buildCfg = spec.build || {};
+        const security = spec.security || {};
+        const packages = spec.packages || {};
+        const services = spec.services || {};
+
+        blBody.innerHTML = `
+        <div class="bl-section">
+            <div class="bl-section-title"><i class="fas fa-file-code"></i> ${t('Deklaratywna konfiguracja buildera')}</div>
+            <div class="bl-spec-info" style="margin-bottom:12px">${t('Konfiguracja jest zapisywana w')} <code>data/build-spec.yaml</code>. ${t('Zmiany wpływają na następny build.')}</div>
+
+            <div class="bl-spec-grid">
+                <!-- Base -->
+                <div class="bl-spec-card">
+                    <div class="bl-spec-card-title"><i class="fas fa-cube"></i> ${t('Baza systemu')}</div>
+                    <div class="bl-spec-field">
+                        <label>${t('Release Debian')}</label>
+                        <select class="bl-select" id="sp-release">
+                            <option value="bookworm" ${base.release === 'bookworm' ? 'selected' : ''}>Bookworm (12)</option>
+                            <option value="trixie" ${base.release === 'trixie' ? 'selected' : ''}>Trixie (13)</option>
+                        </select>
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>${t('Architektura')}</label>
+                        <input class="bl-input" id="sp-arch" value="${base.arch || 'amd64'}" readonly style="opacity:.6">
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>${t('Rozmiar obrazu (GB)')}</label>
+                        <input class="bl-input" id="sp-imgsize" type="number" min="4" max="32" value="${base.img_size_gb || 8}">
+                    </div>
+                </div>
+
+                <!-- Identity -->
+                <div class="bl-spec-card">
+                    <div class="bl-spec-card-title"><i class="fas fa-id-badge"></i> ${t('Tożsamość')}</div>
+                    <div class="bl-spec-field">
+                        <label>${t('Hostname')}</label>
+                        <input class="bl-input" id="sp-hostname" value="${identity.hostname || 'ethos'}">
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>${t('Nazwa marki')}</label>
+                        <input class="bl-input" id="sp-brand" value="${identity.brand_name || 'EthOS'}">
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>${t('Domyślny użytkownik')}</label>
+                        <input class="bl-input" id="sp-user" value="${identity.default_user || 'nasadmin'}">
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>${t('Port NAS')}</label>
+                        <input class="bl-input" id="sp-port" type="number" min="1" max="65535" value="${identity.nas_port || 9000}">
+                    </div>
+                </div>
+
+                <!-- Partitions -->
+                <div class="bl-spec-card">
+                    <div class="bl-spec-card-title"><i class="fas fa-hdd"></i> ${t('Partycje')}</div>
+                    <div class="bl-spec-field">
+                        <label>${t('ESP (MB)')}</label>
+                        <input class="bl-input" id="sp-esp" type="number" min="128" max="1024" value="${partitions.esp_mb || 256}">
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>SquashFS</label>
+                        <select class="bl-select" id="sp-sqsh">
+                            <option value="true" ${partitions.squashfs !== false ? 'selected' : ''}>${t('Włączony')}</option>
+                            <option value="false" ${partitions.squashfs === false ? 'selected' : ''}>${t('Wyłączony')}</option>
+                        </select>
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>dm-verity</label>
+                        <select class="bl-select" id="sp-verity">
+                            <option value="true" ${partitions.verity !== false ? 'selected' : ''}>${t('Włączony')}</option>
+                            <option value="false" ${partitions.verity === false ? 'selected' : ''}>${t('Wyłączony')}</option>
+                        </select>
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>${t('Dane (filesystem)')}</label>
+                        <input class="bl-input" value="${partitions.data_type || 'btrfs'}" readonly style="opacity:.6">
+                    </div>
+                </div>
+
+                <!-- Build -->
+                <div class="bl-spec-card">
+                    <div class="bl-spec-card-title"><i class="fas fa-cogs"></i> ${t('Parametry buildu')}</div>
+                    <div class="bl-spec-field">
+                        <label>${t('Kompresja zstd (poziom)')}</label>
+                        <input class="bl-input" id="sp-comp" type="number" min="1" max="19" value="${buildCfg.compression_level || 3}">
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>${t('Min RAM do tmpfs (MB)')}</label>
+                        <input class="bl-input" id="sp-tmpfs" type="number" min="4000" max="64000" value="${buildCfg.tmpfs_min_ram_mb || 10000}">
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>${t('Cache debootstrap')}</label>
+                        <select class="bl-select" id="sp-cache-deb">
+                            <option value="true" ${buildCfg.cache_debootstrap !== false ? 'selected' : ''}>${t('Włączony')}</option>
+                            <option value="false" ${buildCfg.cache_debootstrap === false ? 'selected' : ''}>${t('Wyłączony')}</option>
+                        </select>
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>${t('Cache apt')}</label>
+                        <select class="bl-select" id="sp-cache-apt">
+                            <option value="true" ${buildCfg.cache_apt !== false ? 'selected' : ''}>${t('Włączony')}</option>
+                            <option value="false" ${buildCfg.cache_apt === false ? 'selected' : ''}>${t('Wyłączony')}</option>
+                        </select>
+                    </div>
+                </div>
+
+                <!-- Security -->
+                <div class="bl-spec-card">
+                    <div class="bl-spec-card-title"><i class="fas fa-shield-alt"></i> ${t('Bezpieczeństwo')}</div>
+                    <div class="bl-spec-field">
+                        <label>UFW</label>
+                        <select class="bl-select" id="sp-ufw">
+                            <option value="true" ${security.ufw_default_deny !== false ? 'selected' : ''}>${t('Włączony')}</option>
+                            <option value="false" ${security.ufw_default_deny === false ? 'selected' : ''}>${t('Wyłączony')}</option>
+                        </select>
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>Fail2Ban</label>
+                        <select class="bl-select" id="sp-f2b">
+                            <option value="true" ${security.fail2ban !== false ? 'selected' : ''}>${t('Włączony')}</option>
+                            <option value="false" ${security.fail2ban === false ? 'selected' : ''}>${t('Wyłączony')}</option>
+                        </select>
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>${t('SSH Password Auth')}</label>
+                        <select class="bl-select" id="sp-sshpw">
+                            <option value="true" ${security.ssh_password_auth !== false ? 'selected' : ''}>${t('Włączony')}</option>
+                            <option value="false" ${security.ssh_password_auth === false ? 'selected' : ''}>${t('Wyłączony')}</option>
+                        </select>
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>${t('Porty UFW')}</label>
+                        <input class="bl-input" id="sp-ufw-ports" value="${(security.ufw_allow_ports || [9000, 22]).join(', ')}">
+                    </div>
+                </div>
+
+                <!-- Services -->
+                <div class="bl-spec-card">
+                    <div class="bl-spec-card-title"><i class="fas fa-server"></i> ${t('Usługi')}</div>
+                    <div class="bl-spec-field">
+                        <label>${t('Włączone')}</label>
+                        <div class="bl-spec-pkgs" id="sp-svc-enable">${(services.enable || []).join('\\n')}</div>
+                    </div>
+                    <div class="bl-spec-field">
+                        <label>${t('Wyłączone')}</label>
+                        <div class="bl-spec-pkgs" id="sp-svc-disable">${(services.disable || []).join('\\n')}</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Packages -->
+        <div class="bl-section">
+            <div class="bl-section-title"><i class="fas fa-cubes"></i> ${t('Pakiety')}</div>
+            <div class="bl-spec-grid">
+                <div class="bl-spec-card" style="grid-column:1/-1">
+                    <div class="bl-spec-card-title"><i class="fas fa-box-open"></i> Debootstrap (${(packages.debootstrap || []).length} ${t('pakietów')})</div>
+                    <div class="bl-spec-pkgs" id="sp-pkgs-deb">${(packages.debootstrap || []).join(', ')}</div>
+                </div>
+                <div class="bl-spec-card">
+                    <div class="bl-spec-card-title"><i class="fas fa-plus-circle"></i> APT Extra (${(packages.apt_extra || []).length})</div>
+                    <div class="bl-spec-pkgs" id="sp-pkgs-apt">${(packages.apt_extra || []).join(', ')}</div>
+                </div>
+                <div class="bl-spec-card">
+                    <div class="bl-spec-card-title"><i class="fab fa-python"></i> Pip (${(packages.pip || []).length})</div>
+                    <div class="bl-spec-pkgs" id="sp-pkgs-pip">${(packages.pip || []).join(', ')}</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Actions -->
+        <div class="bl-spec-actions">
+            <button class="bl-btn bl-btn-outline" id="sp-reset"><i class="fas fa-undo"></i> ${t('Przywróć domyślne')}</button>
+            <button class="bl-btn bl-btn-green" id="sp-save"><i class="fas fa-save"></i> ${t('Zapisz konfigurację')}</button>
+        </div>`;
+
+        // Save spec
+        blBody.querySelector('#sp-save').onclick = async () => {
+            const updated = {
+                base: {
+                    release: blBody.querySelector('#sp-release').value,
+                    arch: 'amd64',
+                    img_size_gb: parseInt(blBody.querySelector('#sp-imgsize').value) || 8,
+                },
+                identity: {
+                    hostname: blBody.querySelector('#sp-hostname').value.trim() || 'ethos',
+                    brand_name: blBody.querySelector('#sp-brand').value.trim() || 'EthOS',
+                    default_user: blBody.querySelector('#sp-user').value.trim() || 'nasadmin',
+                    nas_port: parseInt(blBody.querySelector('#sp-port').value) || 9000,
+                },
+                partitions: {
+                    esp_mb: parseInt(blBody.querySelector('#sp-esp').value) || 256,
+                    squashfs: blBody.querySelector('#sp-sqsh').value === 'true',
+                    verity: blBody.querySelector('#sp-verity').value === 'true',
+                },
+                build: {
+                    compression_level: parseInt(blBody.querySelector('#sp-comp').value) || 3,
+                    tmpfs_min_ram_mb: parseInt(blBody.querySelector('#sp-tmpfs').value) || 10000,
+                    cache_debootstrap: blBody.querySelector('#sp-cache-deb').value === 'true',
+                    cache_apt: blBody.querySelector('#sp-cache-apt').value === 'true',
+                },
+                security: {
+                    ufw_default_deny: blBody.querySelector('#sp-ufw').value === 'true',
+                    fail2ban: blBody.querySelector('#sp-f2b').value === 'true',
+                    ssh_password_auth: blBody.querySelector('#sp-sshpw').value === 'true',
+                    ufw_allow_ports: blBody.querySelector('#sp-ufw-ports').value.split(',').map(p => parseInt(p.trim())).filter(Boolean),
+                },
+            };
+            try {
+                await api('/builder/spec', { method: 'PUT', body: JSON.stringify(updated) });
+                toast(t('Konfiguracja zapisana'), 'success');
+            } catch (e) {
+                toast(e.message || t('Błąd zapisu'), 'error');
+            }
+        };
+
+        // Reset to defaults
+        blBody.querySelector('#sp-reset').onclick = async () => {
+            if (!await confirmDialog(t('Przywrócić domyślną konfigurację?'))) return;
+            try {
+                await api('/builder/spec', { method: 'DELETE' });
+                toast(t('Przywrócono domyślne'), 'success');
+                renderSpec();
+            } catch (e) {
+                toast(e.message || t('Błąd'), 'error');
+            }
+        };
     }
 
     /* ─── Init ─── */

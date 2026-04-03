@@ -123,9 +123,22 @@ def _db_info():
 
 # ─── Crontab helpers ──────────────────────────────────────────────────────────
 
-def _read_crontab():
+def _ensure_cron():
+    """Install cron daemon if not present."""
+    if shutil.which('crontab'):
+        return True
     try:
-        r = host_run('sudo -n crontab -l', timeout=10)
+        r = apt_install('cron', timeout=120)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _read_crontab():
+    if not _ensure_cron():
+        return []
+    try:
+        r = host_run('crontab -l', timeout=10)
         if r.returncode != 0:
             return []
         return r.stdout.splitlines()
@@ -134,12 +147,14 @@ def _read_crontab():
 
 
 def _write_crontab(lines):
+    if not _ensure_cron():
+        return False, 'cron not available'
     content = '\n'.join(lines)
     if content and not content.endswith('\n'):
         content += '\n'
     try:
         r = subprocess.run(
-            ['sudo', '-n', 'crontab', '-'],
+            ['crontab', '-'],
             input=content, capture_output=True, text=True, timeout=10,
         )
         return r.returncode == 0, r.stderr.strip()
@@ -228,9 +243,25 @@ def _parse_scan_log(log_path):
 
 
 def _validate_cron_expr(expr):
+    """Strict cron expression validation — prevents shell injection."""
+    import re
     parts = expr.strip().split()
     if len(parts) != 5:
         return 'Cron expression must have 5 fields'
+    _FIELD_RE = re.compile(
+        r'^(\*|\d{1,2}(?:-\d{1,2})?(?:/\d{1,2})?'
+        r'(?:,\d{1,2}(?:-\d{1,2})?(?:/\d{1,2})?)*)$'
+    )
+    limits = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 7)]
+    names  = ['minute', 'hour', 'day', 'month', 'weekday']
+    for part, (lo, hi), name in zip(parts, limits, names):
+        if not _FIELD_RE.match(part):
+            return f'Invalid {name}: {part}'
+        for tok in re.split(r'[,/\-]', part):
+            if tok == '*':
+                continue
+            if tok.isdigit() and not (lo <= int(tok) <= hi):
+                return f'{name} value {tok} out of range ({lo}-{hi})'
     return None
 
 
@@ -296,6 +327,17 @@ def start_scan():
         scanned = 0
         threats = []
         start   = time.time()
+        total_estimate = 0
+
+        # Quick file count for progress percentage
+        try:
+            count_proc = subprocess.run(
+                ['find', scan_path, '-type', 'f'],
+                capture_output=True, text=True, timeout=15,
+            )
+            total_estimate = max(count_proc.stdout.count('\n'), 1)
+        except Exception:
+            total_estimate = 0
 
         try:
             proc = subprocess.Popen(
@@ -314,13 +356,15 @@ def start_scan():
                 if line.endswith(': OK'):
                     scanned += 1
                     if scanned % 50 == 0:
-                        _emit('progress', -1,
+                        pct = min(int(scanned * 95 / total_estimate), 95) if total_estimate else -1
+                        _emit('progress', pct,
                               'Scanned ' + str(scanned) + ' files...',
                               scanned=scanned, threats=len(threats))
                 elif ': ' in line and 'FOUND' in line:
                     scanned += 1
                     threats.append(line)
-                    _emit('threat', -1, 'Threat: ' + line,
+                    pct = min(int(scanned * 95 / total_estimate), 95) if total_estimate else -1
+                    _emit('threat', pct, 'Threat: ' + line,
                           threat=line, scanned=scanned, threats=len(threats))
                 else:
                     m = re.search(r'Scanned files:\s+(\d+)', line)
@@ -491,16 +535,16 @@ def update_db():
 
         _emit('start', 10, 'Stopping freshclam service...')
         try:
-            host_run('sudo -n systemctl stop clamav-freshclam', timeout=15)
+            host_run('systemctl stop clamav-freshclam', timeout=15)
             _emit('start', 30, 'Downloading virus database updates...')
-            r = host_run('sudo -n freshclam --stdout --no-warnings', timeout=300)
-            host_run('sudo -n systemctl start clamav-freshclam', timeout=15)
+            r = host_run('freshclam --stdout --no-warnings', timeout=300)
+            host_run('systemctl start clamav-freshclam', timeout=15)
             if r.returncode not in (0, 1):
                 _emit('error', 0, ((r.stderr or r.stdout or 'Update error')[:300]))
                 return
             _emit('done', 100, 'Virus database updated!')
         except Exception as e:
-            host_run('sudo -n systemctl start clamav-freshclam', timeout=15)
+            host_run('systemctl start clamav-freshclam', timeout=15)
             _emit('error', 0, str(e))
 
     threading.Thread(target=_bg, daemon=True).start()
@@ -527,9 +571,9 @@ def install():
                 _emit('error', 0, 'Install error: ' + (r.stderr or '')[:300])
                 return
             _emit('progress', 70, 'Downloading virus database...')
-            host_run('sudo -n systemctl stop clamav-freshclam', timeout=15)
-            host_run('sudo -n freshclam --stdout --no-warnings', timeout=300)
-            host_run('sudo -n systemctl start clamav-freshclam', timeout=15)
+            host_run('systemctl stop clamav-freshclam', timeout=15)
+            host_run('freshclam --stdout --no-warnings', timeout=300)
+            host_run('systemctl enable --now clamav-freshclam', timeout=15)
             _emit('done', 100, 'ClamAV installed!')
         except Exception as e:
             _emit('error', 0, str(e))
