@@ -4292,3 +4292,210 @@ function _smRender(body) {
             } catch (e) { cEl.innerHTML = `<div class="dr-warning"><i class="fas fa-times-circle"></i> ${t('Błąd:')} ${escHtml(e.message)}</div>`; }
         }
 
+        /* ─── Polling / Banner ─── */
+        async function cancelOperation() {
+            try { await api('/diskrepair/cancel', { method: 'POST' }); toast('Operacja anulowana', 'warning'); } catch (e) { toast(t('Błąd anulowania: ') + e.message, 'error'); }
+        }
+
+        function startPolling() { stopPolling(); state.pollTimer = setInterval(pollStatus, 2000); pollStatus(); }
+        function stopPolling() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } }
+
+        async function pollStatus() {
+            try {
+                const st = await api(`/diskrepair/status?since=${state.logOffset}`);
+                state.operation = st;
+                const banner = $('#dr-banner'), bannerTitle = $('#dr-banner-title'), bannerBar = $('#dr-banner-bar'), bannerDetail = $('#dr-banner-detail'), bannerCancel = $('#dr-banner-cancel');
+                if (st.status === 'running' || st.status === 'starting') {
+                    banner.classList.add('active');
+                    bannerTitle.textContent = `${st.operation || 'Operacja'} — ${st.disk || st.partition || ''}`;
+                    bannerBar.style.width = (st.percent || 0) + '%';
+                    let detail = st.message || ''; if (st.percent != null) detail = st.percent + '% ' + detail;
+                    bannerDetail.textContent = detail;
+                    bannerCancel.style.display = '';
+                    updateTabProgress(st);
+                    for (const line of (st.logs || [])) appendLog(line);
+                    state.logOffset = st.log_total || state.logOffset;
+                    disableStartButtons(true);
+                } else if (st.status === 'done' || st.status === 'error') {
+                    for (const line of (st.logs || [])) appendLog(line);
+                    state.logOffset = st.log_total || state.logOffset;
+                    const ok = st.status === 'done' || (st.result && st.result === 'success');
+                    banner.classList.add('active');
+                    bannerTitle.textContent = ok ? t('Operacja zakończona pomyślnie') : t('Operacja zakończona z błędem');
+                    bannerBar.style.width = ok ? '100%' : '0%';
+                    bannerDetail.textContent = st.message || '';
+                    bannerCancel.style.display = 'none';
+                    toast(ok ? t('Operacja zakończona') : t('Operacja nie powiodła się'), ok ? 'success' : 'error');
+                    stopPolling(); disableStartButtons(false);
+                    try { await api('/diskrepair/dismiss', { method: 'POST' }); } catch (_) {}
+                    state.operation = null;
+                    setTimeout(() => { banner.classList.remove('active'); loadDisks(); }, 5000);
+                } else {
+                    banner.classList.remove('active'); stopPolling(); disableStartButtons(false); state.operation = null;
+                }
+            } catch (e) { /* keep polling on transient errors */ }
+        }
+
+        function updateTabProgress(st) {
+            const bar = el.querySelector('#dr-check-bar') || el.querySelector('#dr-repair-bar');
+            const pct = el.querySelector('#dr-check-pct') || el.querySelector('#dr-repair-pct');
+            const progressWrap = el.querySelector('#dr-check-progress') || el.querySelector('#dr-repair-progress');
+            if (progressWrap) progressWrap.style.display = '';
+            if (bar) bar.style.width = (st.percent || 0) + '%';
+            if (pct) pct.textContent = (st.percent || 0) + '%';
+        }
+
+        function appendLog(line) {
+            el.querySelectorAll('.dr-log').forEach(logEl => {
+                const cls = /error|fail/i.test(line) ? 'error' : /success|pass|ok/i.test(line) ? 'success' : '';
+                logEl.innerHTML += `<div class="dr-log-line ${cls}">${escHtml(line)}</div>`;
+                logEl.scrollTop = logEl.scrollHeight;
+            });
+        }
+
+        function disableStartButtons(disabled) {
+            el.querySelectorAll('#dr-check-start, #dr-bb-start, #dr-repair-start, #dr-smart-short, #dr-smart-long').forEach(btn => { btn.disabled = disabled; });
+            el.querySelectorAll('.dr-part-check').forEach(btn => { btn.disabled = disabled; });
+        }
+
+        /* ─── Init ─── */
+        $('#dr-banner-cancel').onclick = cancelOperation;
+        $('#dr-refresh-disks').onclick = async () => { await loadDisks(); renderTab(); toast(t('Odświeżono'), 'info'); };
+
+        async function checkRunningOp() {
+            try {
+                const st = await api('/diskrepair/status?since=0');
+                if (st.status === 'running' || st.status === 'starting') { state.operation = st; state.logOffset = st.log_total || 0; startPolling(); }
+            } catch (_) {}
+        }
+
+        loadDisks();
+        checkRunningOp();
+
+        return () => { stopPolling(); };
+    }
+
+    // ─── Section: SSD Cache ─────────────────────────────
+    function renderCacheSection(el) {
+        el.innerHTML = `<div style="padding:20px">
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+                <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text-primary)"><i class="fas fa-bolt" style="color:var(--accent);margin-right:6px"></i>SSD Cache</h3>
+                <button class="fm-toolbar-btn btn-sm" id="sc-refresh"><i class="fas fa-sync-alt"></i> ${t('Odśwież')}</button>
+            </div>
+            <div id="sc-content"><div class="sto-center-lg"><i class="fas fa-spinner fa-spin sto-spinner"></i></div></div>
+        </div>`;
+
+        const contentEl = el.querySelector('#sc-content');
+        el.querySelector('#sc-refresh').onclick = loadCache;
+
+        async function loadCache() {
+            contentEl.innerHTML = `<div class="sto-center-lg"><i class="fas fa-spinner fa-spin sto-spinner"></i></div>`;
+            try {
+                const data = await api('/storage/cache/status');
+                const caches = data.caches || [];
+                const devices = data.devices || [];
+
+                let html = '';
+
+                if (caches.length) {
+                    html += `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-bolt"></i> ${t('Aktywne cache')}</div>`;
+                    for (const c of caches) {
+                        html += `<div style="margin-bottom:12px;padding:12px;background:var(--bg-primary);border-radius:8px">
+                            <div style="font-weight:600;margin-bottom:6px">${c.ssd || '?'} → ${c.hdd || '?'} <span style="font-size:11px;color:var(--text-muted)">(${c.mode || 'writeback'})</span></div>
+                            <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">
+                                ${c.size ? t('Rozmiar') + ': ' + c.size : ''} ${c.used ? '· ' + t('Użyte') + ': ' + c.used : ''} ${c.hit_rate ? '· Hit rate: ' + c.hit_rate : ''}
+                            </div>
+                            <div style="display:flex;gap:8px">
+                                <select class="fm-input" id="sc-mode-${c.id || 0}" style="width:140px">
+                                    <option value="writeback" ${c.mode === 'writeback' ? 'selected' : ''}>Writeback</option>
+                                    <option value="writethrough" ${c.mode === 'writethrough' ? 'selected' : ''}>Writethrough</option>
+                                    <option value="writearound" ${c.mode === 'writearound' ? 'selected' : ''}>Writearound</option>
+                                </select>
+                                <button class="fm-toolbar-btn btn-sm sc-set-mode" data-cache-id="${c.id || 0}"><i class="fas fa-check"></i> ${t('Zmień tryb')}</button>
+                                <button class="fm-toolbar-btn btn-sm btn-red sc-detach" data-cache-id="${c.id || 0}" data-ssd="${c.ssd}" data-hdd="${c.hdd}"><i class="fas fa-unlink"></i> ${t('Odłącz')}</button>
+                            </div>
+                        </div>`;
+                    }
+                    html += '</div>';
+                } else {
+                    html += `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-bolt"></i> ${t('Aktywne cache')}</div><div class="dr-nodata">${t('Brak aktywnych cache SSD')}</div></div>`;
+                }
+
+                // Create form
+                const ssds = devices.filter(d => d.type === 'ssd' || d.rotational === false);
+                const hdds = devices.filter(d => d.type === 'hdd' || d.rotational === true);
+                html += `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-plus-circle"></i> ${t('Utwórz nowy cache')}</div>`;
+                if (ssds.length && hdds.length) {
+                    html += `<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+                        <div><label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px">SSD (cache)</label>
+                            <select class="fm-input" id="sc-ssd" style="width:200px">
+                                ${ssds.map(d => `<option value="${d.device || d.name}">${d.name} (${d.size || '?'})</option>`).join('')}
+                            </select>
+                        </div>
+                        <div><label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px">HDD (backing)</label>
+                            <select class="fm-input" id="sc-hdd" style="width:200px">
+                                ${hdds.map(d => `<option value="${d.device || d.name}">${d.name} (${d.size || '?'})</option>`).join('')}
+                            </select>
+                        </div>
+                        <div><label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px">${t('Tryb')}</label>
+                            <select class="fm-input" id="sc-mode" style="width:140px">
+                                <option value="writeback">Writeback</option>
+                                <option value="writethrough">Writethrough</option>
+                                <option value="writearound">Writearound</option>
+                            </select>
+                        </div>
+                    </div>
+                    <button class="fm-toolbar-btn btn-green" id="sc-create"><i class="fas fa-plus"></i> ${t('Utwórz cache')}</button>`;
+                } else {
+                    html += `<div class="dr-nodata">${t('Potrzebujesz co najmniej jednego SSD i jednego HDD aby utworzyć cache.')}</div>`;
+                }
+                html += '</div>';
+
+                // Devices info
+                if (devices.length) {
+                    html += `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-hdd"></i> ${t('Dostępne urządzenia')}</div>
+                        <table class="dr-table"><thead><tr><th>${t('Urządzenie')}</th><th>${t('Typ')}</th><th>${t('Rozmiar')}</th><th>Model</th></tr></thead>
+                        <tbody>${devices.map(d => `<tr><td>/dev/${d.name}</td><td>${d.rotational === false ? 'SSD' : 'HDD'}</td><td>${d.size || '—'}</td><td>${d.model || '—'}</td></tr>`).join('')}</tbody></table>
+                    </div>`;
+                }
+
+                contentEl.innerHTML = html;
+
+                // Bind events
+                contentEl.querySelectorAll('.sc-set-mode').forEach(btn => {
+                    btn.onclick = async () => {
+                        const id = btn.dataset.cacheId;
+                        const mode = el.querySelector(`#sc-mode-${id}`).value;
+                        try { await api('/storage/cache/mode', { method: 'POST', body: { cache_id: id, mode } }); toast(t('Tryb zmieniony'), 'success'); loadCache(); } catch (e) { toast(e.message, 'error'); }
+                    };
+                });
+
+                contentEl.querySelectorAll('.sc-detach').forEach(btn => {
+                    btn.onclick = async () => {
+                        if (!await confirmDialog(t('Odłączyć cache?'), t('SSD cache zostanie usunięty. Dane na HDD pozostaną nienaruszone.'))) return;
+                        try { await api('/storage/cache/detach', { method: 'POST', body: { cache_id: btn.dataset.cacheId } }); toast(t('Cache odłączony'), 'success'); loadCache(); } catch (e) { toast(e.message, 'error'); }
+                    };
+                });
+
+                const createBtn = contentEl.querySelector('#sc-create');
+                if (createBtn) {
+                    createBtn.onclick = async () => {
+                        const ssd = el.querySelector('#sc-ssd')?.value;
+                        const hdd = el.querySelector('#sc-hdd')?.value;
+                        const mode = el.querySelector('#sc-mode')?.value || 'writeback';
+                        if (!ssd || !hdd) { toast(t('Wybierz SSD i HDD'), 'warning'); return; }
+                        if (!await confirmDialog(t('Utworzyć SSD cache?'), `SSD: ${ssd}\nHDD: ${hdd}\n${t('Tryb')}: ${mode}\n\n${t('Dane na SSD zostaną usunięte!')}`)) return;
+                        createBtn.disabled = true; createBtn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> ${t('Tworzenie...')}`;
+                        try { await api('/storage/cache/create', { method: 'POST', body: { ssd, hdd, mode } }); toast(t('Cache utworzony!'), 'success'); loadCache(); } catch (e) { toast(t('Błąd: ') + e.message, 'error'); createBtn.disabled = false; createBtn.innerHTML = `<i class="fas fa-plus"></i> ${t('Utwórz cache')}`; }
+                    };
+                }
+            } catch (e) {
+                contentEl.innerHTML = `<div class="dr-warning"><i class="fas fa-times-circle"></i> ${t('Błąd:')} ${e.message}</div>`;
+            }
+        }
+
+        loadCache();
+        return null;
+    }
+
+} /* end renderStorageManager */
