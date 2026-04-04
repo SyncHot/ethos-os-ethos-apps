@@ -1,48 +1,9 @@
 /* ═══════════════════════════════════════════════════════════
-   EthOS — Storage Manager  (unified Synology-style UI)
-   Combines: Disks, RAID/Pools, LVM/Volumes, Sharing, Diagnostics, SSD Cache
-
-   Endpoints used:
-     GET  /storage/drives          — disk listing
-     POST /storage/mount|unmount   — mount / unmount
-     POST /storage/format          — format (SSE stream)
-     POST /storage/merge|split     — partition ops
-     POST /storage/label           — set label
-     POST /storage/eject           — eject removable
-     GET  /storage/keepalive       — keep-alive status
-     POST /storage/keepalive       — toggle keep-alive
-     GET  /storage/smart/:dev      — SMART details
-     POST /encryption/...          — LUKS operations
-     GET  /cache/devices|status    — SSD cache info
-     POST /cache/create|detach|mode— SSD cache ops
-     GET  /raid/arrays|disks       — RAID arrays
-     POST /raid/create|delete|...  — RAID management
-     GET  /raid/lvm/...            — LVM management
-     GET  /diskrepair/disks|...    — disk diagnostics
-     GET  /storage/samba/...       — Samba shares
-     GET  /storage/nfs/...         — NFS exports
-     GET  /storage/dlna/...        — DLNA config
-     GET  /storage/webdav/...      — WebDAV shares
-     GET  /storage/sftp/...        — SFTP config
-     GET  /storage/ftp/...         — FTP config
-
-   Socket.IO: (none)
+   EthOS — Unified Storage Manager (Synology-style)
+   Disks · RAID · Volumes · Sharing · Diagnostics · SSD Cache
    ═══════════════════════════════════════════════════════════ */
 
-// ── Sharing helpers (module-level) ──────────────────────────
-AppRegistry['sharing'] = function (appDef) {
-    createWindow('sharing', {
-        title: t('Udostępnianie'),
-        icon: appDef.icon,
-        iconColor: appDef.color,
-        width: 820,
-        height: 560,
-        onRender: (body) => renderSharingApp(body),
-        onClose: () => { /* no intervals/sockets to clean */ },
-    });
-};
-
-/* ── helpers ────────────────────────────────── */
+/* ── Sharing helpers (module-level) ──────────────────────── */
 function _shBadge(ok, label) {
     if (ok === null) return `<span class="fm-badge shr-badge-loading">${label || '…'}</span>`;
     if (ok === 'off') return `<span class="fm-badge shr-badge-warn">${label || t('Wyłączony')}</span>`;
@@ -71,421 +32,176 @@ const _SH_ALL_PROTOS = [
     { id: 'ftp',    pkgId: 'sharing-ftp',    icon: 'fa-upload',       label: 'FTP' },
 ];
 
-// ═══════════════════════════════════════════════════════════
-// App registration
-// ═══════════════════════════════════════════════════════════
+/* ── main render ────────────────────────────── */
 
+/* ── App Registration ────────────────────────────────────── */
 AppRegistry['storage-manager'] = function (appDef) {
     createWindow('storage-manager', {
-        title: t('Storage Manager'),
-        icon: 'fa-database',
-        iconColor: appDef.color || '#10b981',
+        title: t('Menedżer dysków'),
+        icon: appDef.icon,
+        iconColor: appDef.color,
         width: 1200,
         height: 800,
-        minWidth: 900,
-        minHeight: 600,
         onRender: (body) => _smRender(body),
     });
 };
+
 function _smRender(body) {
-    let _cleanup = null;
-    let _activeSection = null;
+    const sections = [
+        { id: 'overview',     icon: 'fa-chart-pie',    label: t('Przegląd') },
+        { id: 'disks',        icon: 'fa-hdd',          label: t('Dyski') },
+        { id: 'raid',         icon: 'fa-server',       label: t('Pule / RAID') },
+        { id: 'volumes',      icon: 'fa-cubes',        label: t('Wolumeny') },
+        { id: 'sharing',      icon: 'fa-share-alt',    label: t('Udostępnianie') },
+        { id: 'diagnostics',  icon: 'fa-stethoscope',  label: t('Diagnostyka') },
+        { id: 'cache',        icon: 'fa-bolt',         label: 'SSD Cache' },
+    ];
 
     body.innerHTML = `
     <style>
-/* ── Sidebar layout ── */
-.sm-wrap { display:flex; height:100%; overflow:hidden; }
-.sm-sidebar { width:210px; min-width:210px; background:var(--bg-secondary); border-right:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; }
-.sm-sidebar-hdr { padding:16px; border-bottom:1px solid var(--border); display:flex; align-items:center; gap:10px; }
-.sm-sidebar-icon { font-size:24px; color:var(--accent); }
-.sm-sidebar-title { font-weight:700; font-size:14px; color:var(--text-primary); }
-.sm-sidebar-sub { font-size:11px; color:var(--text-muted); margin-top:2px; }
-.sm-nav { flex:1; overflow-y:auto; padding:8px; }
-.sm-nav-item { display:flex; align-items:center; gap:10px; padding:9px 12px; border-radius:8px; cursor:pointer; color:var(--text-muted); font-size:13px; font-weight:500; transition:all .15s; text-decoration:none; margin-bottom:2px; }
-.sm-nav-item:hover { background:var(--bg-card); color:var(--text-primary); }
-.sm-nav-item.active { background:var(--accent); color:#fff; }
-.sm-nav-item i { width:18px; text-align:center; font-size:14px; }
-.sm-nav-sep { height:1px; background:var(--border); margin:8px 12px; }
-.sm-content { flex:1; overflow-y:auto; overflow-x:hidden; }
-
-/* ── Overview section ── */
-.sm-ov { padding:20px; }
-.sm-ov-cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(200px, 1fr)); gap:12px; margin-bottom:20px; }
-.sm-ov-card { background:var(--bg-card); border-radius:10px; padding:16px; border:1px solid var(--border); }
-.sm-ov-card-icon { font-size:20px; margin-bottom:8px; }
-.sm-ov-card-val { font-size:24px; font-weight:700; color:var(--text-primary); }
-.sm-ov-card-label { font-size:11px; color:var(--text-muted); margin-top:2px; }
-.sm-ov-table { width:100%; border-collapse:collapse; font-size:12px; background:var(--bg-card); border-radius:10px; overflow:hidden; border:1px solid var(--border); }
-.sm-ov-table th { text-align:left; font-weight:600; padding:10px 12px; border-bottom:2px solid var(--border); color:var(--text-secondary); font-size:11px; text-transform:uppercase; letter-spacing:.3px; background:var(--bg-secondary); }
-.sm-ov-table td { padding:8px 12px; border-bottom:1px solid var(--border); color:var(--text-primary); }
-.sm-ov-table tr:last-child td { border-bottom:none; }
-.sm-ov-bar { height:6px; background:var(--bg-primary); border-radius:3px; overflow:hidden; flex:1; }
-.sm-ov-bar-fill { height:100%; border-radius:3px; }
-.sm-ov-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:16px; }
-.sm-ov-actions button { padding:8px 16px; border-radius:8px; border:1px solid var(--border); background:var(--bg-card); color:var(--text-primary); cursor:pointer; font-size:12px; display:flex; align-items:center; gap:6px; transition:all .15s; }
-.sm-ov-actions button:hover { border-color:var(--accent); color:var(--accent); }
-.sm-section-title { font-weight:600; font-size:14px; color:var(--text-primary); margin-bottom:12px; display:flex; align-items:center; gap:8px; }
-
-/* ── RAID CSS (from raid module) ── */
-.raid-wrap { display:flex; flex-direction:column; height:100%; overflow:hidden; }
-
-        /* ── Tabs ── */
-        .raid-tabs { display:flex; border-bottom:1px solid var(--border); padding:0 16px; background:var(--bg-secondary); flex-shrink:0; }
-        .raid-tab { padding:10px 18px; font-size:12px; font-weight:500; color:var(--text-muted); cursor:pointer; border-bottom:2px solid transparent; transition:color .15s, border-color .15s; white-space:nowrap; display:flex; align-items:center; gap:6px; }
-        .raid-tab:hover { color:var(--text-primary); }
-        .raid-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
-
-        /* ── Content ── */
-        .raid-content { flex:1; overflow-y:auto; padding:16px; }
-        .raid-toolbar { display:flex; align-items:center; gap:8px; margin-bottom:14px; flex-wrap:wrap; }
-        .raid-toolbar-right { margin-left:auto; display:flex; gap:8px; align-items:center; }
-        .raid-status-text { font-size:12px; color:var(--text-muted); }
-
-        /* ── Cards ── */
-        .raid-cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:12px; }
-        .raid-card { background:var(--bg-card); border-radius:10px; border:1px solid var(--border); padding:16px; cursor:pointer; transition:all .15s; }
-        .raid-card:hover { border-color:rgba(79,140,255,.3); background:rgba(79,140,255,.03); }
-        .raid-card.selected { border-color:var(--accent)!important; box-shadow:0 0 0 1px var(--accent); }
-        .raid-card-head { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
-        .raid-card-icon { width:40px; height:40px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:18px; flex-shrink:0; }
-        .raid-card-title { font-weight:600; font-size:13px; color:var(--text-primary); }
-        .raid-card-sub { font-size:11px; color:var(--text-muted); }
-        .raid-card-body { font-size:12px; }
-        .raid-card-row { display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid var(--border); }
-        .raid-card-row:last-child { border-bottom:none; }
-        .raid-card-label { color:var(--text-muted); }
-        .raid-card-val { color:var(--text-primary); font-weight:500; }
-
-        /* ── Badges ── */
-        .raid-badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.3px; }
-        .raid-badge-active { background:rgba(34,197,94,.15); color:#22c55e; }
-        .raid-badge-degraded { background:rgba(245,158,11,.15); color:#f59e0b; }
-        .raid-badge-rebuilding { background:rgba(59,130,246,.15); color:#3b82f6; }
-        .raid-badge-inactive { background:rgba(107,114,128,.15); color:#6b7280; }
-        .raid-badge-clean { background:rgba(34,197,94,.15); color:#22c55e; }
-        .raid-badge-spare { background:rgba(139,92,246,.15); color:#8b5cf6; }
-        .raid-badge-faulty { background:rgba(239,68,68,.15); color:#ef4444; }
-
-        /* ── Progress ── */
-        .raid-progress { height:6px; background:var(--bg-primary); border-radius:3px; overflow:hidden; margin-top:6px; }
-        .raid-progress-bar { height:100%; background:linear-gradient(90deg, var(--accent), #6366f1); border-radius:3px; transition:width .5s; }
-        .raid-progress-label { font-size:10px; color:var(--text-muted); margin-top:4px; }
-
-        /* ── Disk map ── */
-        .raid-disk-map { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
-        .raid-disk-chip { display:inline-flex; align-items:center; gap:4px; padding:4px 10px; border-radius:6px; font-size:11px; font-weight:500; background:var(--bg-primary); border:1px solid var(--border); }
-        .raid-disk-chip .dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
-        .raid-disk-chip .dot.ok { background:#22c55e; }
-        .raid-disk-chip .dot.spare { background:#8b5cf6; }
-        .raid-disk-chip .dot.faulty { background:#ef4444; }
-        .raid-disk-chip .dot.rebuilding { background:#3b82f6; animation:raidPulse 1.5s infinite; }
-        @keyframes raidPulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-
-        /* ── Detail panel ── */
-        .raid-detail { background:var(--bg-card); border-radius:10px; border:1px solid var(--border); padding:16px; margin-top:14px; }
-        .raid-detail-head { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
-        .raid-detail-title { font-weight:600; font-size:14px; color:var(--text-primary); flex:1; }
-        .raid-detail-actions { display:flex; gap:6px; }
-
-        .raid-table { width:100%; border-collapse:collapse; font-size:12px; }
-        .raid-table th { text-align:left; font-weight:600; padding:8px 10px; border-bottom:2px solid var(--border); color:var(--text-secondary); font-size:11px; text-transform:uppercase; letter-spacing:.3px; }
-        .raid-table td { padding:7px 10px; border-bottom:1px solid var(--border); color:var(--text-primary); }
-        .raid-table tr:last-child td { border-bottom:none; }
-
-        /* ── Wizard / Forms ── */
-        .raid-wizard { background:var(--bg-card); border-radius:10px; border:1px solid var(--border); padding:20px; margin-bottom:14px; }
-        .raid-wizard-title { font-weight:600; font-size:14px; color:var(--text-primary); margin-bottom:14px; display:flex; align-items:center; gap:8px; }
-        .raid-form-row { display:flex; gap:12px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
-        .raid-form-row label { font-size:12px; color:var(--text-muted); min-width:100px; }
-        .raid-form-row .fm-input { flex:1; min-width:120px; }
-        .raid-disk-select { display:flex; flex-wrap:wrap; gap:6px; }
-        .raid-disk-opt { display:flex; align-items:center; gap:6px; padding:8px 12px; border-radius:8px; background:var(--bg-primary); border:1px solid var(--border); cursor:pointer; font-size:12px; transition:all .15s; }
-        .raid-disk-opt:hover { border-color:var(--accent); }
-        .raid-disk-opt.checked { border-color:var(--accent); background:rgba(79,140,255,.08); }
-        .raid-disk-opt input { accent-color:var(--accent); }
-        .raid-disk-opt .dname { font-weight:600; color:var(--text-primary); }
-        .raid-disk-opt .dsize { color:var(--text-muted); margin-left:4px; }
-        .raid-form-actions { display:flex; gap:8px; margin-top:14px; }
-        .raid-level-info { font-size:11px; color:var(--text-muted); padding:6px 10px; background:var(--bg-primary); border-radius:6px; margin-bottom:10px; }
-
-        /* ── LVM ── */
-        .raid-lvm-section { margin-bottom:20px; }
-        .raid-section-title { font-weight:600; font-size:13px; color:var(--text-primary); margin-bottom:10px; display:flex; align-items:center; gap:8px; }
-
-        /* ── Empty state ── */
-        .raid-empty { display:flex; align-items:center; justify-content:center; height:200px; color:var(--text-muted); font-size:14px; flex-direction:column; gap:8px; }
-        .raid-empty i { font-size:40px; opacity:.4; }
-
-        /* ── Buttons ── */
-        .raid-btn { padding:6px 14px; border-radius:6px; font-size:12px; font-weight:500; cursor:pointer; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); transition:all .15s; }
-        .raid-btn:hover { border-color:var(--accent); color:var(--accent); }
-        .raid-btn-primary { background:var(--accent); color:#fff; border-color:var(--accent); }
-        .raid-btn-primary:hover { opacity:.85; }
-        .raid-btn-danger { color:#ef4444; border-color:rgba(239,68,68,.3); }
-        .raid-btn-danger:hover { background:rgba(239,68,68,.1); border-color:#ef4444; }
-        .raid-btn-sm { padding:4px 10px; font-size:11px; }
-        .raid-btn:disabled { opacity:.4; cursor:not-allowed; }
-
-/* ── Diagnostics CSS (from disk repair module) ── */
-.dr-wrap { display:flex; height:100%; overflow:hidden; }
-
-        /* ── Sidebar ── */
-        .dr-sidebar { width:250px; min-width:250px; background:var(--bg-secondary); border-right:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; }
-        .dr-sidebar-header { display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid var(--border); }
-        .dr-sidebar-header span { font-weight:600; font-size:13px; color:var(--text-primary); }
-        .dr-disk-list { flex:1; overflow-y:auto; padding:6px; }
-        .dr-disk-item { display:flex; align-items:center; gap:10px; padding:10px; border-radius:8px; cursor:pointer; margin-bottom:4px; transition:background .15s; }
-        .dr-disk-item:hover { background:var(--bg-card); }
-        .dr-disk-item.active { background:var(--accent); color:#fff; }
-        .dr-disk-item.active .dr-disk-model { color:#fff; }
-        .dr-disk-item.active .dr-disk-size { color:rgba(255,255,255,.7); }
-        .dr-disk-item.active .dr-temp-badge { background:rgba(255,255,255,.2); color:#fff; }
-        .dr-disk-icon { font-size:22px; width:28px; text-align:center; flex-shrink:0; }
-        .dr-disk-meta { flex:1; min-width:0; }
-        .dr-disk-model { font-size:12px; font-weight:600; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        .dr-disk-size { font-size:11px; color:var(--text-muted); }
-        .dr-health-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
-        .dr-temp-badge { font-size:10px; padding:2px 6px; border-radius:4px; background:var(--bg-primary); color:var(--text-muted); flex-shrink:0; }
-
-        /* ── Main ── */
-        .dr-main { flex:1; display:flex; flex-direction:column; overflow:hidden; }
-        .dr-banner { display:none; padding:10px 16px; background:var(--bg-card); border-bottom:1px solid var(--border); }
-        .dr-banner.active { display:flex; align-items:center; gap:12px; }
-        .dr-banner-info { flex:1; min-width:0; }
-        .dr-banner-title { font-size:12px; font-weight:600; color:var(--text-primary); }
-        .dr-banner-progress { height:8px; background:var(--bg-primary); border-radius:4px; overflow:hidden; margin-top:6px; }
-        .dr-banner-bar { height:100%; background:linear-gradient(90deg, var(--accent), #6366f1); border-radius:4px; transition:width .3s; width:0%; }
-        .dr-banner-detail { font-size:11px; color:var(--text-muted); margin-top:4px; }
-
-        /* ── Tabs ── */
-        .dr-tabs { display:flex; border-bottom:1px solid var(--border); padding:0 16px; background:var(--bg-secondary); flex-shrink:0; }
-        .dr-tab { padding:10px 16px; font-size:12px; font-weight:500; color:var(--text-muted); cursor:pointer; border-bottom:2px solid transparent; transition:color .15s, border-color .15s; white-space:nowrap; }
-        .dr-tab:hover { color:var(--text-primary); }
-        .dr-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
-
-        /* ── Tab content ── */
-        .dr-content { flex:1; overflow-y:auto; padding:16px; }
-        .dr-empty { display:flex; align-items:center; justify-content:center; height:100%; color:var(--text-muted); font-size:14px; flex-direction:column; gap:8px; }
-        .dr-empty i { font-size:40px; opacity:.4; }
-
-        .dr-card { background:var(--bg-card); border-radius:10px; padding:16px; margin-bottom:14px; }
-        .dr-card-title { font-weight:600; font-size:13px; color:var(--text-primary); margin-bottom:10px; display:flex; align-items:center; gap:8px; }
-        .dr-card-title i { width:18px; text-align:center; }
-
-        .dr-table { width:100%; border-collapse:collapse; font-size:12px; }
-        .dr-table th { text-align:left; font-weight:600; padding:8px 10px; border-bottom:2px solid var(--border); color:var(--text-secondary); font-size:11px; text-transform:uppercase; letter-spacing:.3px; }
-        .dr-table td { padding:7px 10px; border-bottom:1px solid var(--border); color:var(--text-primary); }
-        .dr-table tr:last-child td { border-bottom:none; }
-
-        .dr-kv { display:grid; grid-template-columns:140px 1fr; gap:6px 12px; font-size:12px; }
-        .dr-kv-label { color:var(--text-muted); }
-        .dr-kv-value { color:var(--text-primary); font-weight:500; }
-
-        .dr-metrics { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
-        .dr-metric { background:var(--bg-card); border-radius:10px; padding:14px 18px; flex:1; min-width:120px; text-align:center; }
-        .dr-metric-value { font-size:22px; font-weight:700; color:var(--text-primary); }
-        .dr-metric-label { font-size:11px; color:var(--text-muted); margin-top:2px; }
-
-        .dr-health-big { display:flex; align-items:center; gap:12px; padding:14px; background:var(--bg-primary); border-radius:10px; margin-bottom:14px; }
-        .dr-health-icon { font-size:32px; }
-        .dr-health-text { font-size:15px; font-weight:600; }
-
-        .dr-btn { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:8px 14px; cursor:pointer; font-size:12px; display:inline-flex; align-items:center; gap:6px; white-space:nowrap; }
-        .dr-btn:hover { filter:brightness(1.1); }
-        .dr-btn:disabled { opacity:.5; cursor:not-allowed; filter:none; }
-        .dr-btn-sm { padding:5px 10px; font-size:11px; }
-        .dr-btn-outline { background:transparent; border:1px solid var(--border); color:var(--text-secondary); }
-        .dr-btn-outline:hover { border-color:var(--accent); color:var(--accent); }
-        .dr-btn-danger { background:#ef4444; }
-        .dr-btn-danger:hover { background:#dc2626; }
-        .dr-btn-warn { background:#f59e0b; }
-        .dr-btn-warn:hover { background:#d97706; }
-
-        .dr-select { background:var(--bg-primary); border:1px solid var(--border); border-radius:6px; padding:8px 10px; color:var(--text-primary); font-size:12px; }
-        .dr-select option { background:var(--bg-primary); color:var(--text-primary); }
-
-        .dr-log { max-height:200px; overflow-y:auto; background:var(--bg-primary); border-radius:8px; padding:8px 10px; margin-top:10px; font-family:monospace; font-size:11px; color:var(--text-muted); }
-        .dr-log-line { padding:2px 0; border-bottom:1px solid var(--border); }
-        .dr-log-line:last-child { border:none; }
-        .dr-log-line.error { color:#ef4444; }
-        .dr-log-line.success { color:#10b981; }
-
-        .dr-progress-outer { height:20px; background:var(--bg-primary); border-radius:10px; overflow:hidden; position:relative; margin-top:10px; }
-        .dr-progress-inner { height:100%; background:linear-gradient(90deg, var(--accent), #6366f1); border-radius:10px; transition:width .3s; width:0%; }
-        .dr-progress-text { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:600; color:#fff; text-shadow:0 1px 2px rgba(0,0,0,.4); }
-
-        .dr-row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-        .dr-warning { background:#fef3c7; color:#92400e; border-radius:8px; padding:10px 14px; font-size:12px; display:flex; align-items:center; gap:8px; margin-bottom:12px; }
-        .dr-warning i { color:#f59e0b; }
-
-        .dr-smart-status { display:inline-block; width:8px; height:8px; border-radius:50%; }
-
-        .dr-hist-item { display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid var(--border); font-size:12px; }
-        .dr-hist-item:last-child { border:none; }
-        .dr-hist-icon { font-size:16px; width:20px; text-align:center; }
-        .dr-hist-meta { flex:1; min-width:0; }
-        .dr-hist-time { font-size:10px; color:var(--text-muted); white-space:nowrap; }
-
-        .dr-nodata { text-align:center; padding:30px; color:var(--text-muted); font-size:13px; }
+    .sm-layout { display:flex; height:100%; overflow:hidden; }
+    .sm-sidebar { width:210px; min-width:210px; background:var(--bg-secondary); border-right:1px solid var(--border-color); display:flex; flex-direction:column; overflow-y:auto; }
+    .sm-sidebar-header { padding:16px 14px 12px; font-size:13px; font-weight:700; color:var(--text-secondary); text-transform:uppercase; letter-spacing:0.5px; }
+    .sm-nav-item { display:flex; align-items:center; gap:10px; padding:10px 16px; cursor:pointer; color:var(--text-primary); font-size:13px; border-left:3px solid transparent; transition:background .15s; }
+    .sm-nav-item:hover { background:var(--bg-hover); }
+    .sm-nav-item.active { background:var(--bg-active, var(--bg-hover)); border-left-color:var(--accent); color:var(--accent); font-weight:600; }
+    .sm-nav-item i { width:18px; text-align:center; font-size:14px; }
+    .sm-content { flex:1; overflow-y:auto; min-width:0; }
     </style>
-
-    <div class="sm-wrap">
+    <div class="sm-layout">
         <div class="sm-sidebar">
-            <div class="sm-sidebar-hdr">
-                <i class="fas fa-database sm-sidebar-icon"></i>
-                <div>
-                    <div class="sm-sidebar-title">${t('Storage Manager')}</div>
-                    <div class="sm-sidebar-sub" id="sm-sub"></div>
-                </div>
-            </div>
-            <nav class="sm-nav">
-                <a class="sm-nav-item active" data-section="overview"><i class="fas fa-chart-pie"></i><span>${t('Przegląd')}</span></a>
-                <a class="sm-nav-item" data-section="disks"><i class="fas fa-hdd"></i><span>${t('Dyski')}</span></a>
-                <a class="sm-nav-item" data-section="raid"><i class="fas fa-layer-group"></i><span>${t('Pule / RAID')}</span></a>
-                <a class="sm-nav-item" data-section="volumes"><i class="fas fa-cubes"></i><span>${t('Wolumeny')}</span></a>
-                <div class="sm-nav-sep"></div>
-                <a class="sm-nav-item" data-section="sharing"><i class="fas fa-share-alt"></i><span>${t('Udostępnianie')}</span></a>
-                <div class="sm-nav-sep"></div>
-                <a class="sm-nav-item" data-section="diagnostics"><i class="fas fa-heartbeat"></i><span>${t('Diagnostyka')}</span></a>
-                <a class="sm-nav-item" data-section="cache"><i class="fas fa-bolt"></i><span>${t('SSD Cache')}</span></a>
-            </nav>
+            <div class="sm-sidebar-header"><i class="fas fa-database" style="margin-right:6px"></i>${t('Storage Manager')}</div>
+            ${sections.map(s => `<div class="sm-nav-item" data-section="${s.id}"><i class="fas ${s.icon}"></i><span>${s.label}</span></div>`).join('')}
         </div>
         <div class="sm-content" id="sm-content"></div>
     </div>`;
 
-    const smContent = body.querySelector('#sm-content');
+    const contentEl = body.querySelector('#sm-content');
+    let activeSection = null;
+    let cleanupFn = null;
 
-    function switchSection(name) {
-        if (_cleanup) { try { _cleanup(); } catch(e) {} _cleanup = null; }
-        _activeSection = name;
-        body.querySelectorAll('.sm-nav-item').forEach(n => n.classList.toggle('active', n.dataset.section === name));
-        smContent.innerHTML = '';
-        switch (name) {
-            case 'overview':     _cleanup = _smOverview(smContent); break;
-            case 'disks':        _cleanup = _smDisks(smContent); break;
-            case 'raid':         _cleanup = _smRaid(smContent); break;
-            case 'volumes':      _cleanup = _smVolumes(smContent); break;
-            case 'sharing':      _cleanup = _smSharing(smContent); break;
-            case 'diagnostics':  _cleanup = _smDiagnostics(smContent); break;
-            case 'cache':        _cleanup = _smCache(smContent); break;
+    function switchSection(id) {
+        if (activeSection === id) return;
+        if (cleanupFn) { try { cleanupFn(); } catch(_){} cleanupFn = null; }
+        activeSection = id;
+        body.querySelectorAll('.sm-nav-item').forEach(n => n.classList.toggle('active', n.dataset.section === id));
+        contentEl.innerHTML = '';
+        contentEl.style.cssText = '';
+
+        const setCleanup = (fn) => { if (activeSection === id) cleanupFn = fn; };
+
+        switch (id) {
+            case 'overview':     cleanupFn = _smOverview(contentEl); break;
+            case 'disks':        cleanupFn = _smDisks(contentEl); break;
+            case 'raid':         cleanupFn = _smRaid(contentEl, 'arrays'); break;
+            case 'volumes':      cleanupFn = _smRaid(contentEl, 'lvm'); break;
+            case 'sharing':      _smSharing(contentEl).then(fn => setCleanup(fn)); break;
+            case 'diagnostics':  cleanupFn = _smDiagnostics(contentEl); break;
+            case 'cache':        cleanupFn = _smCache(contentEl); break;
         }
     }
 
-    body.querySelectorAll('.sm-nav-item').forEach(item => {
-        item.onclick = (e) => { e.preventDefault(); switchSection(item.dataset.section); };
-    });
-
+    body.querySelectorAll('.sm-nav-item').forEach(n => n.onclick = () => switchSection(n.dataset.section));
     switchSection('overview');
+}
 
-    // ═══════════════════════════════════════════════════════════
-    // Section: Overview
-    // ═══════════════════════════════════════════════════════════
-    function _smOverview(el) {
-        el.innerHTML = `<div class="sm-ov">
-            <div class="sm-ov-cards" id="smov-cards">
-                <div class="sm-ov-card"><i class="fas fa-spinner fa-spin sm-ov-card-icon" style="color:var(--accent)"></i><div class="sm-ov-card-val">&mdash;</div><div class="sm-ov-card-label">${t('Ładowanie...')}</div></div>
-            </div>
-            <div class="sm-section-title"><i class="fas fa-hdd"></i> ${t('Zamontowane dyski')}</div>
-            <table class="sm-ov-table"><thead><tr>
-                <th>${t('Urządzenie')}</th><th>${t('Punkt montowania')}</th>
-                <th>${t('System plików')}</th><th>${t('Rozmiar')}</th><th>${t('Użycie')}</th>
-            </tr></thead><tbody id="smov-drives"><tr><td colspan="5" style="text-align:center;padding:20px;color:var(--text-muted)">${t('Ładowanie...')}</td></tr></tbody></table>
-            <div class="sm-ov-actions" id="smov-actions"></div>
-        </div>`;
+/* ═══════════════════════════════════════════════════════════
+   Section: Overview (new dashboard)
+   ═══════════════════════════════════════════════════════════ */
+function _smOverview(el) {
+    el.innerHTML = '<div style="padding:20px"><div style="display:flex;gap:16px;flex-wrap:wrap" id="smo-cards"></div><div id="smo-detail" style="margin-top:20px"></div></div>';
+    const cardsEl = el.querySelector('#smo-cards');
+    const detailEl = el.querySelector('#smo-detail');
 
-        async function loadOverview() {
-            try {
-                const [dData, rData, drData] = await Promise.allSettled([
-                    api('/storage/drives'),
-                    api('/raid/arrays'),
-                    api('/diskrepair/disks')
-                ]);
+    async function load() {
+        cardsEl.innerHTML = '<div style="color:var(--text-secondary)"><i class="fas fa-spinner fa-spin"></i> ' + t('Ładowanie...') + '</div>';
+        const [drivesRes, raidRes, drRes] = await Promise.allSettled([
+            api('/storage/drives'),
+            api('/raid/arrays'),
+            api('/diskrepair/disks'),
+        ]);
 
-                const drives = dData.status === 'fulfilled' && !dData.value.error ? (dData.value.drives || []) : [];
-                const arrays = rData.status === 'fulfilled' && !rData.value.error ? (rData.value.arrays || []) : [];
-                const diagDisks = drData.status === 'fulfilled' && !drData.value.error ? (drData.value.disks || []) : [];
+        const dVal = drivesRes.status === 'fulfilled' ? drivesRes.value : {};
+        const drives = Array.isArray(dVal) ? dVal : (dVal.drives || []);
+        const rVal = raidRes.status === 'fulfilled' ? raidRes.value : [];
+        const arrays = Array.isArray(rVal) ? rVal : (rVal.arrays || []);
+        const drVal = drRes.status === 'fulfilled' ? drRes.value : [];
+        const drDisks = Array.isArray(drVal) ? drVal : (drVal.disks || []);
 
-                const mounted = drives.filter(d => d.mounted);
-                const totalBytes = mounted.reduce((s, d) => s + (d.size_bytes || 0), 0);
-                const usedBytes = mounted.reduce((s, d) => s + (d.used_bytes || 0), 0);
-                const healthyCount = diagDisks.filter(d => (d.health||'').toLowerCase() === 'passed').length;
-                const warnCount = diagDisks.length - healthyCount;
+        // Compute stats — size comes as string "4.5T", usage.total as bytes
+        const physDisks = drives.filter(d => d.type === 'disk' && !d.name.startsWith('nbd'));
+        const parts = drives.filter(d => d.type === 'part' && d.usage);
+        const totalBytes = parts.reduce((s, d) => s + (d.usage.total || 0), 0);
+        const usedBytes = parts.reduce((s, d) => s + (d.usage.used || 0), 0);
+        const healthyCount = drDisks.filter(d => d.smart_healthy === true).length;
+        const smartAvail = drDisks.filter(d => d.smart_available).length;
+        const warnCount = smartAvail - healthyCount;
 
-                const _hs = (b) => {
-                    if (!b || b <= 0) return '0 B';
-                    const u = ['B','KB','MB','GB','TB','PB'];
-                    const i = Math.min(Math.floor(Math.log(b)/Math.log(1024)), u.length-1);
-                    return (b/Math.pow(1024,i)).toFixed(i>0?1:0)+' '+u[i];
-                };
-
-                const cardsEl = el.querySelector('#smov-cards');
-                if (!cardsEl) return;
-                cardsEl.innerHTML = `
-                    <div class="sm-ov-card">
-                        <div class="sm-ov-card-icon" style="color:#3b82f6"><i class="fas fa-database"></i></div>
-                        <div class="sm-ov-card-val">${_hs(totalBytes)}</div>
-                        <div class="sm-ov-card-label">${t('Pojemność')} (${_hs(usedBytes)} ${t('użyte')})</div>
-                    </div>
-                    <div class="sm-ov-card">
-                        <div class="sm-ov-card-icon" style="color:#10b981"><i class="fas fa-hdd"></i></div>
-                        <div class="sm-ov-card-val">${drives.length}</div>
-                        <div class="sm-ov-card-label">${t('Dyski / partycje')}</div>
-                    </div>
-                    <div class="sm-ov-card">
-                        <div class="sm-ov-card-icon" style="color:${warnCount > 0 ? '#f59e0b' : '#22c55e'}"><i class="fas fa-heartbeat"></i></div>
-                        <div class="sm-ov-card-val">${healthyCount} / ${diagDisks.length}</div>
-                        <div class="sm-ov-card-label">${t('Zdrowe dyski')}</div>
-                    </div>
-                    <div class="sm-ov-card">
-                        <div class="sm-ov-card-icon" style="color:#6366f1"><i class="fas fa-layer-group"></i></div>
-                        <div class="sm-ov-card-val">${arrays.length}</div>
-                        <div class="sm-ov-card-label">${t('Macierze RAID')}</div>
-                    </div>`;
-
-                const tbody = el.querySelector('#smov-drives');
-                if (!tbody) return;
-                if (mounted.length === 0) {
-                    tbody.innerHTML = `<tr><td colspan="5" style="text-align:center;padding:20px;color:var(--text-muted)">${t('Brak zamontowanych dysków')}</td></tr>`;
-                } else {
-                    tbody.innerHTML = mounted.map(d => {
-                        const pct = d.size_bytes > 0 ? Math.round((d.used_bytes||0)/d.size_bytes*100) : 0;
-                        const color = pct > 90 ? '#ef4444' : pct > 70 ? '#f59e0b' : '#22c55e';
-                        return `<tr>
-                            <td><code>${d.device || d.name || '?'}</code></td>
-                            <td>${d.mountpoint || '—'}</td>
-                            <td>${d.fstype || '—'}</td>
-                            <td>${_hs(d.size_bytes)}</td>
-                            <td style="min-width:120px"><div style="display:flex;align-items:center;gap:8px">
-                                <div class="sm-ov-bar"><div class="sm-ov-bar-fill" style="width:${pct}%;background:${color}"></div></div>
-                                <span style="font-weight:600;font-size:11px;color:${color}">${pct}%</span>
-                            </div></td>
-                        </tr>`;
-                    }).join('');
-                }
-
-                el.querySelector('#smov-actions').innerHTML = `
-                    <button onclick="this.closest('.sm-wrap').querySelector('[data-section=disks]').click()"><i class="fas fa-hdd"></i> ${t('Zarządzaj dyskami')}</button>
-                    <button onclick="this.closest('.sm-wrap').querySelector('[data-section=raid]').click()"><i class="fas fa-layer-group"></i> ${t('Macierze RAID')}</button>
-                    <button onclick="this.closest('.sm-wrap').querySelector('[data-section=sharing]').click()"><i class="fas fa-share-alt"></i> ${t('Udostępnianie')}</button>
-                    <button onclick="this.closest('.sm-wrap').querySelector('[data-section=diagnostics]').click()"><i class="fas fa-heartbeat"></i> ${t('Diagnostyka')}</button>`;
-
-                const sub = body.querySelector('#sm-sub');
-                if (sub) sub.textContent = mounted.length + ' ' + t('zamontowanych') + ', ' + _hs(totalBytes);
-            } catch (e) {
-                console.error('Overview load error:', e);
-            }
+        function card(icon, color, title, value, sub) {
+            return `<div style="background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:10px;padding:18px 22px;min-width:180px;flex:1">
+                <div style="font-size:24px;color:${color};margin-bottom:8px"><i class="fas ${icon}"></i></div>
+                <div style="font-size:22px;font-weight:700;color:var(--text-primary)">${value}</div>
+                <div style="font-size:12px;color:var(--text-secondary);margin-top:2px">${title}</div>
+                ${sub ? '<div style="font-size:11px;color:var(--text-tertiary, var(--text-secondary));margin-top:4px">' + sub + '</div>' : ''}
+            </div>`;
         }
 
-        loadOverview();
-        return null;
+        const fmt = (b) => {
+            if (b >= 1e12) return (b/1e12).toFixed(1) + ' TB';
+            if (b >= 1e9) return (b/1e9).toFixed(1) + ' GB';
+            return (b/1e6).toFixed(0) + ' MB';
+        };
+
+        cardsEl.innerHTML =
+            card('fa-hdd', 'var(--accent)', t('Dyski'), physDisks.length, `${fmt(totalBytes)} ${t('łącznie')}`) +
+            card('fa-server', '#4ecdc4', t('Macierze RAID'), arrays.length, arrays.filter(a => a.state === 'clean' || a.state === 'active').length + ' ' + t('zdrowe')) +
+            card('fa-heartbeat', warnCount > 0 ? '#e74c3c' : '#2ecc71', 'SMART', `${healthyCount}/${smartAvail}`, warnCount > 0 ? `${warnCount} ${t('ostrzeżeń')}` : t('Wszystko OK')) +
+            card('fa-chart-pie', '#9b59b6', t('Użyte'), totalBytes > 0 ? Math.round(usedBytes/totalBytes*100) + '%' : '—', `${fmt(usedBytes)} / ${fmt(totalBytes)}`);
+
+        // Drive table
+        if (physDisks.length) {
+            // Merge diskrepair SMART data into physical disks
+            const drMap = {};
+            for (const dr of drDisks) drMap[dr.name] = dr;
+
+            let tbl = `<table style="width:100%;border-collapse:collapse;font-size:13px">
+                <thead><tr style="text-align:left;border-bottom:2px solid var(--border-color)">
+                    <th style="padding:8px">${t('Dysk')}</th><th style="padding:8px">${t('Model')}</th>
+                    <th style="padding:8px">${t('Pojemność')}</th><th style="padding:8px">${t('Interfejs')}</th>
+                    <th style="padding:8px">${t('Temp')}</th><th style="padding:8px">SMART</th>
+                </tr></thead><tbody>`;
+            for (const d of physDisks) {
+                const dr = drMap[d.name] || {};
+                const temp = dr.temperature ? dr.temperature + '°C' : '—';
+                const tempColor = (dr.temperature && dr.temperature > 50) ? '#e74c3c' : 'var(--text-secondary)';
+                const health = dr.smart_healthy === true ? t('OK') : (dr.smart_available ? '<span style="color:#e74c3c">' + t('Uwaga') + '</span>' : '—');
+                tbl += `<tr style="border-bottom:1px solid var(--border-color)">
+                    <td style="padding:8px;font-weight:600">${d.name || '?'}</td>
+                    <td style="padding:8px;color:var(--text-secondary)">${d.model || '—'}</td>
+                    <td style="padding:8px">${d.size || '—'}</td>
+                    <td style="padding:8px;color:var(--text-secondary)">${(d.tran || '—').toUpperCase()}</td>
+                    <td style="padding:8px;color:${tempColor}">${temp}</td>
+                    <td style="padding:8px">${health}</td>
+                </tr>`;
+            }
+            tbl += '</tbody></table>';
+            detailEl.innerHTML = `<div style="background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:10px;padding:16px">
+                <h4 style="margin:0 0 12px;font-size:14px;font-weight:600">${t('Wszystkie dyski')}</h4>${tbl}</div>`;
+        }
     }
+    load();
+    return null;
+}
 
-    // ═══════════════════════════════════════════════════════════
-    // Section: Disks (from storage.js)
-    // ═══════════════════════════════════════════════════════════
-    function _smDisks(el) {
+/* ═══════════════════════════════════════════════════════════
+   Section: Disks (from original storage.js)
+   ═══════════════════════════════════════════════════════════ */
+function _smDisks(el) {
+    /* el replaces original "body" */
+    const body = el;
+    const state = { drives: [], selected: null, systemVisible: false, keepalive: {} };
 
-    el.innerHTML = `
+    body.innerHTML = `
     <div class="storage-app">
         <div class="storage-toolbar">
             <button class="fm-toolbar-btn" id="st-refresh" title="${t('Odśwież')}"><i class="fas fa-sync-alt"></i></button>
@@ -561,7 +277,7 @@ function _smRender(body) {
         </div>
     </div>`;
 
-    const $ = id => el.querySelector(id);
+    const $ = id => body.querySelector(id);
     const statusEl = $('#st-status');
 
     /* ═══════════════════════════════════════════════════════
@@ -790,7 +506,7 @@ function _smRender(body) {
     }
 
     function bindCardEvents() {
-        el.querySelectorAll('.st-card').forEach(card => {
+        body.querySelectorAll('.st-card').forEach(card => {
             card.onclick = (e) => {
                 if (e.target.closest('.st-smart-badge')) {
                     showSmartDetail(e.target.closest('.st-smart-badge').dataset.smartDisk);
@@ -803,7 +519,7 @@ function _smRender(body) {
             };
         });
         // System group toggle
-        el.querySelectorAll('.st-group-toggle').forEach(hdr => {
+        body.querySelectorAll('.st-group-toggle').forEach(hdr => {
             hdr.onclick = () => {
                 state.systemVisible = !state.systemVisible;
                 renderDrives();
@@ -1453,119 +1169,131 @@ function _smRender(body) {
         }
     };
 
+    /* ═══════════════════════════════════════════════════════
+       SSD Cache Manager
+       ═══════════════════════════════════════════════════════ */
+    const _cacheBtn = $('#st-cache-btn');
+    if (_cacheBtn) _cacheBtn.onclick = async () => {
+        const devData = await api('/cache/devices');
+        if (devData.error) { toast(devData.error, 'error'); return; }
+        const statusData = await api('/cache/status');
+        const live = (statusData && statusData.live) || [];
+        const configured = (statusData && statusData.configured) || [];
 
-        return null;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // Section: SSD Cache (from storage.js)
-    // ═══════════════════════════════════════════════════════════
-    function _smCache(el) {
-        async function loadCache() {
-            const data = await api('/storage/drives');
-            if (data.error) { el.innerHTML = '<div style="padding:20px;color:var(--text-muted)">' + t('Błąd ładowania') + ': ' + data.error + '</div>'; return; }
-            renderCacheUI(data.drives || []);
+        let activeHtml = '';
+        if (configured.length > 0) {
+            activeHtml = `<div style="margin-bottom:16px">
+                <h4 style="margin:0 0 8px">${t('Aktywne cache')}</h4>
+                ${configured.map(c => {
+                    const backing = live.flatMap(l => l.backing_devices || []).find(b => b.device === c.backing_device);
+                    const hitRate = backing ? (backing.hit_ratio !== null ? backing.hit_ratio + '%' : '—') : '—';
+                    const dirty = backing ? (backing.dirty_data || '0') : '0';
+                    return `<div class="st-cache-item" style="display:flex;align-items:center;gap:12px;padding:8px;border:1px solid var(--border);border-radius:8px;margin-bottom:6px">
+                        <div style="flex:1">
+                            <b>${c.cache_device}</b> → <b>${c.backing_device}</b>
+                            <span class="sto-action-sub">${c.mode}</span>
+                            <span style="margin-left:12px">${t('Trafienia')}: ${hitRate} | ${t('Brudne dane')}: ${dirty}</span>
+                        </div>
+                        <select class="modal-input st-cache-mode-sel" data-backing="${c.backing_device}" style="width:140px">
+                            ${['writethrough','writeback','writearound'].map(m =>
+                                `<option value="${m}" ${m === c.mode ? 'selected' : ''}>${m}</option>`
+                            ).join('')}
+                        </select>
+                        <button class="fm-toolbar-btn btn-red btn-sm st-cache-detach" data-backing="${c.backing_device}"><i class="fas fa-unlink"></i> ${t('Odłącz')}</button>
+                    </div>`;
+                }).join('')}
+            </div>`;
         }
 
-        function renderCacheUI(drives) {
-            const cacheDevs = drives.filter(d => d.bcache_role === 'cache');
-            const backingDevs = drives.filter(d => d.bcache_role === 'backing');
-            const availSSDs = drives.filter(d => d.is_ssd && !d.mounted && !d.bcache_role && d.device);
-            const availHDDs = drives.filter(d => !d.is_ssd && !d.bcache_role && d.device && !d.is_system);
+        const ssdOpts = (devData.ssds || []).map(s =>
+            `<option value="${s.device}">${s.name} — ${s.size} ${s.model}</option>`
+        ).join('');
+        const hddOpts = (devData.hdds || []).map(h =>
+            `<option value="${h.device}">${h.name} — ${h.size} ${h.model}</option>`
+        ).join('');
 
-            el.innerHTML = `<div style="padding:20px">
-                <div class="sm-section-title"><i class="fas fa-bolt" style="color:#f59e0b"></i> ${t('SSD Cache')}</div>
-
-                ${cacheDevs.length > 0 ? `
-                <div class="raid-card" style="margin-bottom:16px">
-                    <div class="raid-card-head">
-                        <div class="raid-card-icon" style="background:rgba(245,158,11,.15);color:#f59e0b"><i class="fas fa-bolt"></i></div>
-                        <div><div class="raid-card-title">${t('Aktywne cache')}</div>
-                        <div class="raid-card-sub">${cacheDevs.length} ${t('urządzeń')}</div></div>
-                    </div>
-                    <div class="raid-card-body">
-                        ${cacheDevs.map(c => '<div class="raid-card-row"><span class="raid-card-label">' + c.device + '</span><span class="raid-card-val">' + (c.label || c.fstype || 'bcache') + '</span></div>').join('')}
-                        ${backingDevs.map(b => '<div class="raid-card-row"><span class="raid-card-label">' + b.device + ' (backing)</span><span class="raid-card-val">' + (b.label || b.mountpoint || '—') + '</span></div>').join('')}
-                    </div>
-                    <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap">
-                        <select id="sm-cache-mode" class="dr-select">
-                            <option value="writeback">writeback</option>
-                            <option value="writethrough">writethrough</option>
-                            <option value="writearound">writearound</option>
-                        </select>
-                        <button class="raid-btn raid-btn-sm" id="sm-cache-mode-btn"><i class="fas fa-cog"></i> ${t('Zmień tryb')}</button>
-                        <button class="raid-btn raid-btn-sm raid-btn-danger" id="sm-cache-detach-btn"><i class="fas fa-unlink"></i> ${t('Odłącz cache')}</button>
-                    </div>
-                </div>` : `<div class="raid-empty" style="height:100px;margin-bottom:16px"><i class="fas fa-bolt"></i><span>${t('Brak aktywnego SSD cache')}</span></div>`}
-
-                <div class="raid-wizard">
-                    <div class="raid-wizard-title"><i class="fas fa-plus-circle" style="color:var(--accent)"></i> ${t('Utwórz nowy cache')}</div>
-                    ${availSSDs.length === 0 ? '<div class="raid-level-info"><i class="fas fa-info-circle"></i> ' + t('Brak dostępnych SSD. Podłącz niezamontowany dysk SSD.') + '</div>' : `
-                    <div class="raid-form-row">
-                        <label>${t('SSD (cache)')}</label>
-                        <select id="sm-cache-ssd" class="fm-input" style="flex:1">
-                            ${availSSDs.map(d => '<option value="' + d.device + '">' + d.device + ' (' + (d.label||d.model||'SSD') + ', ' + d.human_size + ')</option>').join('')}
-                        </select>
-                    </div>
-                    <div class="raid-form-row">
-                        <label>${t('HDD (backing)')}</label>
-                        <select id="sm-cache-hdd" class="fm-input" style="flex:1">
-                            ${availHDDs.length > 0 ? availHDDs.map(d => '<option value="' + d.device + '">' + d.device + ' (' + (d.label||d.model||'HDD') + ', ' + d.human_size + ')</option>').join('') : '<option value="">' + t('Brak dostępnych HDD') + '</option>'}
-                        </select>
-                    </div>
-                    <div class="raid-form-row">
-                        <label>${t('Tryb')}</label>
-                        <select id="sm-cache-newmode" class="fm-input" style="flex:1">
-                            <option value="writeback">writeback (${t('szybszy, ryzyko utraty przy awarii')})</option>
-                            <option value="writethrough" selected>writethrough (${t('bezpieczny, wolniejszy zapis')})</option>
-                            <option value="writearound">writearound (${t('cache tylko odczytu')})</option>
-                        </select>
-                    </div>
-                    <div class="raid-form-actions">
-                        <button class="raid-btn raid-btn-primary" id="sm-cache-create-btn" ${availHDDs.length === 0 ? 'disabled' : ''}><i class="fas fa-plus"></i> ${t('Utwórz cache')}</button>
-                    </div>`}
+        const hasDevices = ssdOpts && hddOpts;
+        const newCacheHtml = hasDevices ? `
+            <h4 style="margin:0 0 8px">${t('Nowy cache')}</h4>
+            <div class="usr-form">
+                <label>${t('Dysk SSD (cache)')}</label>
+                <select id="st-cache-ssd" class="modal-input">${ssdOpts}</select>
+                <label>${t('Dysk HDD (backing)')}</label>
+                <select id="st-cache-hdd" class="modal-input">${hddOpts}</select>
+                <label>${t('Tryb cache')}</label>
+                <select id="st-cache-mode" class="modal-input">
+                    <option value="writethrough">${t('Write-through (bezpieczny)')}</option>
+                    <option value="writeback">${t('Write-back (szybszy)')}</option>
+                    <option value="writearound">${t('Write-around')}</option>
+                </select>
+                <div class="st-fmt-system-info sto-sys-info-danger" style="margin-top:8px">
+                    <i class="fas fa-exclamation-triangle sto-text-danger"></i>
+                    <span class="sto-text-danger"><b>${t('UWAGA:')}</b> ${t('Dane na obu dyskach zostaną usunięte!')}</span>
                 </div>
-            </div>`;
+            </div>` : `<p style="color:var(--text-muted)">${t('Brak dostępnych dysków SSD lub HDD do konfiguracji cache.')}</p>`;
 
-            const modeBtn = el.querySelector('#sm-cache-mode-btn');
-            if (modeBtn) modeBtn.onclick = async () => {
-                const mode = el.querySelector('#sm-cache-mode').value;
-                const r = await api('/cache/mode', { method: 'POST', body: JSON.stringify({ mode }) });
-                if (r.error) toast(r.error, 'error');
-                else { toast(t('Tryb zmieniony na') + ' ' + mode, 'success'); loadCache(); }
-            };
-
-            const detachBtn = el.querySelector('#sm-cache-detach-btn');
-            if (detachBtn) detachBtn.onclick = async () => {
-                if (!await confirmDialog(t('Odłączyć SSD cache?'), t('Dane nie zostaną utracone, ale cache przestanie działać.'))) return;
-                const r = await api('/cache/detach', { method: 'POST' });
-                if (r.error) toast(r.error, 'error');
-                else { toast(t('Cache odłączony'), 'success'); loadCache(); }
-            };
-
-            const createBtn = el.querySelector('#sm-cache-create-btn');
-            if (createBtn) createBtn.onclick = async () => {
-                const ssd = el.querySelector('#sm-cache-ssd').value;
-                const hdd = el.querySelector('#sm-cache-hdd').value;
-                const mode = el.querySelector('#sm-cache-newmode').value;
-                if (!ssd || !hdd) { toast(t('Wybierz SSD i HDD'), 'error'); return; }
+        const buttons = [{ label: t('Zamknij'), class: 'secondary' }];
+        if (hasDevices) {
+            buttons.push({ label: t('Utwórz cache'), class: 'danger', action: async (m) => {
+                const ssd = m.querySelector('#st-cache-ssd').value;
+                const hdd = m.querySelector('#st-cache-hdd').value;
+                const mode = m.querySelector('#st-cache-mode').value;
+                if (!ssd || !hdd) { toast(t('Wybierz oba dyski'), 'warning'); return; }
+                if (ssd === hdd) { toast(t('SSD i HDD muszą być różnymi dyskami'), 'warning'); return; }
                 if (!await confirmDialog(t('Utworzyć SSD cache? Dane na obu dyskach zostaną usunięte!'))) return;
-                createBtn.disabled = true;
-                const r = await api('/cache/create', { method: 'POST', body: JSON.stringify({ cache_device: ssd, backing_device: hdd, mode }) });
-                if (r.error) toast(r.error, 'error');
-                else toast(t('Cache utworzony pomyślnie'), 'success');
-                loadCache();
-            };
+                try {
+                    const r = await api('/cache/create', { method: 'POST', body: { cache_device: ssd, backing_device: hdd, mode } });
+                    if (r.error) { toast(r.error, 'error'); return; }
+                    toast(t('SSD Cache utworzony!'), 'success');
+                    loadDrives();
+                } catch (e) { toast(e.message, 'error'); }
+            }});
         }
 
-        loadCache();
-        return null;
-    }
+        showModal(t('SSD Cache Manager'), activeHtml + newCacheHtml, buttons).then(() => {});
 
-    // ═══════════════════════════════════════════════════════════
-    // Section: RAID (from raid.js — arrays tab)
-    // ═══════════════════════════════════════════════════════════
-    function _smRaid(el) {
+        // Bind detach + mode change after modal renders
+        setTimeout(() => {
+            document.querySelectorAll('.st-cache-detach').forEach(btn => {
+                btn.onclick = async () => {
+                    const backing = btn.dataset.backing;
+                    if (!await confirmDialog(t('Odłączyć SSD cache od') + ' ' + backing + '?')) return;
+                    try {
+                        const r = await api('/cache/detach', { method: 'POST', body: { backing_device: backing } });
+                        if (r.error) { toast(r.error, 'error'); return; }
+                        toast(t('Cache odłączony'), 'success');
+                        document.querySelector('.modal-overlay')?.remove();
+                        loadDrives();
+                    } catch (e) { toast(e.message, 'error'); }
+                };
+            });
+            document.querySelectorAll('.st-cache-mode-sel').forEach(sel => {
+                sel.onchange = async () => {
+                    const backing = sel.dataset.backing;
+                    try {
+                        const r = await api('/cache/mode', { method: 'PUT', body: { backing_device: backing, mode: sel.value } });
+                        if (r.error) { toast(r.error, 'error'); return; }
+                        toast(t('Tryb zmieniony: ') + sel.value, 'success');
+                    } catch (e) { toast(e.message, 'error'); }
+                };
+            });
+        }, 100);
+    };
+
+    /* ═══════════════════════════════════════════════════════
+       Init
+       ═══════════════════════════════════════════════════════ */
+    $('#st-refresh').onclick = () => loadDrives();
+    loadDrives();
+    return null;
+}
+
+/* ═══════════════════════════════════════════════════════════
+   Section: RAID + Volumes (from original raid.js)
+   Param defaultTab: 'arrays' or 'lvm'
+   ═══════════════════════════════════════════════════════════ */
+function _smRaid(el, defaultTab) {
+    const body = el;
     const state = {
         tab: 'arrays',
         arrays: [],
@@ -1577,7 +1305,107 @@ function _smRender(body) {
         pollTimer: null,
     };
 
-    el.innerHTML = `
+    body.innerHTML = `
+    <style>
+        .raid-wrap { display:flex; flex-direction:column; height:100%; overflow:hidden; }
+
+        /* ── Tabs ── */
+        .raid-tabs { display:flex; border-bottom:1px solid var(--border); padding:0 16px; background:var(--bg-secondary); flex-shrink:0; }
+        .raid-tab { padding:10px 18px; font-size:12px; font-weight:500; color:var(--text-muted); cursor:pointer; border-bottom:2px solid transparent; transition:color .15s, border-color .15s; white-space:nowrap; display:flex; align-items:center; gap:6px; }
+        .raid-tab:hover { color:var(--text-primary); }
+        .raid-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+
+        /* ── Content ── */
+        .raid-content { flex:1; overflow-y:auto; padding:16px; }
+        .raid-toolbar { display:flex; align-items:center; gap:8px; margin-bottom:14px; flex-wrap:wrap; }
+        .raid-toolbar-right { margin-left:auto; display:flex; gap:8px; align-items:center; }
+        .raid-status-text { font-size:12px; color:var(--text-muted); }
+
+        /* ── Cards ── */
+        .raid-cards { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:12px; }
+        .raid-card { background:var(--bg-card); border-radius:10px; border:1px solid var(--border); padding:16px; cursor:pointer; transition:all .15s; }
+        .raid-card:hover { border-color:rgba(79,140,255,.3); background:rgba(79,140,255,.03); }
+        .raid-card.selected { border-color:var(--accent)!important; box-shadow:0 0 0 1px var(--accent); }
+        .raid-card-head { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+        .raid-card-icon { width:40px; height:40px; border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:18px; flex-shrink:0; }
+        .raid-card-title { font-weight:600; font-size:13px; color:var(--text-primary); }
+        .raid-card-sub { font-size:11px; color:var(--text-muted); }
+        .raid-card-body { font-size:12px; }
+        .raid-card-row { display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid var(--border); }
+        .raid-card-row:last-child { border-bottom:none; }
+        .raid-card-label { color:var(--text-muted); }
+        .raid-card-val { color:var(--text-primary); font-weight:500; }
+
+        /* ── Badges ── */
+        .raid-badge { display:inline-block; padding:2px 8px; border-radius:6px; font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.3px; }
+        .raid-badge-active { background:rgba(34,197,94,.15); color:#22c55e; }
+        .raid-badge-degraded { background:rgba(245,158,11,.15); color:#f59e0b; }
+        .raid-badge-rebuilding { background:rgba(59,130,246,.15); color:#3b82f6; }
+        .raid-badge-inactive { background:rgba(107,114,128,.15); color:#6b7280; }
+        .raid-badge-clean { background:rgba(34,197,94,.15); color:#22c55e; }
+        .raid-badge-spare { background:rgba(139,92,246,.15); color:#8b5cf6; }
+        .raid-badge-faulty { background:rgba(239,68,68,.15); color:#ef4444; }
+
+        /* ── Progress ── */
+        .raid-progress { height:6px; background:var(--bg-primary); border-radius:3px; overflow:hidden; margin-top:6px; }
+        .raid-progress-bar { height:100%; background:linear-gradient(90deg, var(--accent), #6366f1); border-radius:3px; transition:width .5s; }
+        .raid-progress-label { font-size:10px; color:var(--text-muted); margin-top:4px; }
+
+        /* ── Disk map ── */
+        .raid-disk-map { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+        .raid-disk-chip { display:inline-flex; align-items:center; gap:4px; padding:4px 10px; border-radius:6px; font-size:11px; font-weight:500; background:var(--bg-primary); border:1px solid var(--border); }
+        .raid-disk-chip .dot { width:8px; height:8px; border-radius:50%; flex-shrink:0; }
+        .raid-disk-chip .dot.ok { background:#22c55e; }
+        .raid-disk-chip .dot.spare { background:#8b5cf6; }
+        .raid-disk-chip .dot.faulty { background:#ef4444; }
+        .raid-disk-chip .dot.rebuilding { background:#3b82f6; animation:raidPulse 1.5s infinite; }
+        @keyframes raidPulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+
+        /* ── Detail panel ── */
+        .raid-detail { background:var(--bg-card); border-radius:10px; border:1px solid var(--border); padding:16px; margin-top:14px; }
+        .raid-detail-head { display:flex; align-items:center; gap:10px; margin-bottom:12px; }
+        .raid-detail-title { font-weight:600; font-size:14px; color:var(--text-primary); flex:1; }
+        .raid-detail-actions { display:flex; gap:6px; }
+
+        .raid-table { width:100%; border-collapse:collapse; font-size:12px; }
+        .raid-table th { text-align:left; font-weight:600; padding:8px 10px; border-bottom:2px solid var(--border); color:var(--text-secondary); font-size:11px; text-transform:uppercase; letter-spacing:.3px; }
+        .raid-table td { padding:7px 10px; border-bottom:1px solid var(--border); color:var(--text-primary); }
+        .raid-table tr:last-child td { border-bottom:none; }
+
+        /* ── Wizard / Forms ── */
+        .raid-wizard { background:var(--bg-card); border-radius:10px; border:1px solid var(--border); padding:20px; margin-bottom:14px; }
+        .raid-wizard-title { font-weight:600; font-size:14px; color:var(--text-primary); margin-bottom:14px; display:flex; align-items:center; gap:8px; }
+        .raid-form-row { display:flex; gap:12px; align-items:center; margin-bottom:10px; flex-wrap:wrap; }
+        .raid-form-row label { font-size:12px; color:var(--text-muted); min-width:100px; }
+        .raid-form-row .fm-input { flex:1; min-width:120px; }
+        .raid-disk-select { display:flex; flex-wrap:wrap; gap:6px; }
+        .raid-disk-opt { display:flex; align-items:center; gap:6px; padding:8px 12px; border-radius:8px; background:var(--bg-primary); border:1px solid var(--border); cursor:pointer; font-size:12px; transition:all .15s; }
+        .raid-disk-opt:hover { border-color:var(--accent); }
+        .raid-disk-opt.checked { border-color:var(--accent); background:rgba(79,140,255,.08); }
+        .raid-disk-opt input { accent-color:var(--accent); }
+        .raid-disk-opt .dname { font-weight:600; color:var(--text-primary); }
+        .raid-disk-opt .dsize { color:var(--text-muted); margin-left:4px; }
+        .raid-form-actions { display:flex; gap:8px; margin-top:14px; }
+        .raid-level-info { font-size:11px; color:var(--text-muted); padding:6px 10px; background:var(--bg-primary); border-radius:6px; margin-bottom:10px; }
+
+        /* ── LVM ── */
+        .raid-lvm-section { margin-bottom:20px; }
+        .raid-section-title { font-weight:600; font-size:13px; color:var(--text-primary); margin-bottom:10px; display:flex; align-items:center; gap:8px; }
+
+        /* ── Empty state ── */
+        .raid-empty { display:flex; align-items:center; justify-content:center; height:200px; color:var(--text-muted); font-size:14px; flex-direction:column; gap:8px; }
+        .raid-empty i { font-size:40px; opacity:.4; }
+
+        /* ── Buttons ── */
+        .raid-btn { padding:6px 14px; border-radius:6px; font-size:12px; font-weight:500; cursor:pointer; border:1px solid var(--border); background:var(--bg-primary); color:var(--text-primary); transition:all .15s; }
+        .raid-btn:hover { border-color:var(--accent); color:var(--accent); }
+        .raid-btn-primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+        .raid-btn-primary:hover { opacity:.85; }
+        .raid-btn-danger { color:#ef4444; border-color:rgba(239,68,68,.3); }
+        .raid-btn-danger:hover { background:rgba(239,68,68,.1); border-color:#ef4444; }
+        .raid-btn-sm { padding:4px 10px; font-size:11px; }
+        .raid-btn:disabled { opacity:.4; cursor:not-allowed; }
+    </style>
     <div class="raid-wrap">
         <div class="raid-tabs" id="raid-tabs">
             <div class="raid-tab active" data-tab="arrays"><i class="fas fa-layer-group"></i> ${t('RAID Arrays')}</div>
@@ -1586,8 +1414,8 @@ function _smRender(body) {
         <div class="raid-content" id="raid-content"></div>
     </div>`;
 
-    const $ = s => el.querySelector(s);
-    const $$ = s => el.querySelectorAll(s);
+    const $ = s => body.querySelector(s);
+    const $$ = s => body.querySelectorAll(s);
     const content = $('#raid-content');
 
     // Tab switching
@@ -1655,7 +1483,7 @@ function _smRender(body) {
     }
 
     async function loadArrays() {
-        const statusEl = el.querySelector('#raid-status');
+        const statusEl = body.querySelector('#raid-status');
         if (statusEl) statusEl.textContent = t('Loading...');
         try {
             const [arrays, disks] = await Promise.all([
@@ -1672,11 +1500,11 @@ function _smRender(body) {
     }
 
     function renderArrayCards() {
-        const area = el.querySelector('#raid-cards-area');
+        const area = body.querySelector('#raid-cards-area');
         if (!area) return;
         if (!state.arrays.length) {
             area.innerHTML = `<div class="raid-empty"><i class="fas fa-layer-group"></i><span>${t('No RAID arrays found')}</span></div>`;
-            el.querySelector('#raid-detail-area').innerHTML = '';
+            body.querySelector('#raid-detail-area').innerHTML = '';
             return;
         }
 
@@ -1725,7 +1553,7 @@ function _smRender(body) {
     }
 
     async function renderArrayDetail() {
-        const area = el.querySelector('#raid-detail-area');
+        const area = body.querySelector('#raid-detail-area');
         if (!area || !state.selectedArray) { if (area) area.innerHTML = ''; return; }
 
         area.innerHTML = `<div class="raid-detail"><div class="raid-status-text">${t('Loading...')}</div></div>`;
@@ -1802,7 +1630,7 @@ function _smRender(body) {
     }
 
     function showAddDiskDialog(arrName) {
-        const wizard = el.querySelector('#raid-wizard-area');
+        const wizard = body.querySelector('#raid-wizard-area');
         if (!wizard) return;
         const available = state.disks;
         if (!available.length) {
@@ -1842,7 +1670,7 @@ function _smRender(body) {
 
     // ─── Create Wizard ───
     function showCreateWizard() {
-        const wizard = el.querySelector('#raid-wizard-area');
+        const wizard = body.querySelector('#raid-wizard-area');
         if (!wizard) return;
         const available = state.disks;
 
@@ -1950,7 +1778,7 @@ function _smRender(body) {
     }
 
     async function loadLVM() {
-        const statusEl = el.querySelector('#lvm-status');
+        const statusEl = body.querySelector('#lvm-status');
         if (statusEl) statusEl.textContent = t('Loading...');
         try {
             const [vgs, lvs, disks] = await Promise.all([
@@ -1970,7 +1798,7 @@ function _smRender(body) {
     }
 
     function renderVGSection() {
-        const area = el.querySelector('#lvm-vg-section');
+        const area = body.querySelector('#lvm-vg-section');
         if (!area) return;
 
         area.innerHTML = `<div class="raid-lvm-section">
@@ -2018,7 +1846,7 @@ function _smRender(body) {
     }
 
     function showCreateVGWizard() {
-        const wizard = el.querySelector('#lvm-vg-wizard');
+        const wizard = body.querySelector('#lvm-vg-wizard');
         if (!wizard) return;
         const available = state.disks;
 
@@ -2068,7 +1896,7 @@ function _smRender(body) {
     }
 
     function renderLVSection() {
-        const area = el.querySelector('#lvm-lv-section');
+        const area = body.querySelector('#lvm-lv-section');
         if (!area) return;
 
         area.innerHTML = `<div class="raid-lvm-section">
@@ -2105,7 +1933,7 @@ function _smRender(body) {
     }
 
     function showCreateLVWizard() {
-        const wizard = el.querySelector('#lvm-lv-wizard');
+        const wizard = body.querySelector('#lvm-lv-wizard');
         if (!wizard) return;
 
         wizard.innerHTML = `<div class="raid-wizard">
@@ -2179,648 +2007,23 @@ function _smRender(body) {
         origClose.onclick = () => { stopPoll(); if (orig) orig(); };
     }
 
-        // Hide LVM tab, show arrays
-        const _lvmTab = el.querySelector('.raid-tab[data-tab="lvm"]');
-        if (_lvmTab) _lvmTab.style.display = 'none';
-
-        return () => { try { if (_raidPoll) clearInterval(_raidPoll); } catch(e) {} };
+    /* Auto-select the requested tab */
+    if (defaultTab === 'lvm') {
+        const lvmTab = body.querySelector('[data-tab="lvm"]');
+        if (lvmTab) lvmTab.click();
     }
+    return () => { stopPoll(); };
+}
 
-    // ═══════════════════════════════════════════════════════════
-    // Section: Volumes/LVM (from raid.js — LVM tab)
-    // ═══════════════════════════════════════════════════════════
-    function _smVolumes(el) {
-    const state = {
-        tab: 'arrays',
-        arrays: [],
-        disks: [],
-        vgs: [],
-        lvs: [],
-        pvs: [],
-        selectedArray: null,
-        pollTimer: null,
-    };
-
-    el.innerHTML = `
-    <div class="raid-wrap">
-        <div class="raid-tabs" id="raid-tabs">
-            <div class="raid-tab active" data-tab="arrays"><i class="fas fa-layer-group"></i> ${t('RAID Arrays')}</div>
-            <div class="raid-tab" data-tab="lvm"><i class="fas fa-cubes"></i> ${t('LVM')}</div>
-        </div>
-        <div class="raid-content" id="raid-content"></div>
-    </div>`;
-
-    const $ = s => el.querySelector(s);
-    const $$ = s => el.querySelectorAll(s);
-    const content = $('#raid-content');
-
-    // Tab switching
-    $('#raid-tabs').addEventListener('click', e => {
-        const tab = e.target.closest('.raid-tab');
-        if (!tab) return;
-        $$('.raid-tab').forEach(t => t.classList.remove('active'));
-        tab.classList.add('active');
-        state.tab = tab.dataset.tab;
-        render();
-    });
-
-    function render() {
-        if (state.tab === 'arrays') renderArrays();
-        else if (state.tab === 'lvm') renderLVM();
-    }
-
-    // ─── RAID level descriptions ───
-    const levelInfo = {
-        '0': 'Striping — no redundancy. Best performance, any disk failure loses all data.',
-        '1': 'Mirroring — full copy on each disk. Survives N-1 disk failures.',
-        '5': 'Striping with parity — survives 1 disk failure. Needs ≥3 disks.',
-        '6': 'Double parity — survives 2 disk failures. Needs ≥4 disks.',
-        '10': 'Mirrored stripes — good performance + redundancy. Needs ≥4 disks.',
-    };
-    const minDisks = { '0': 2, '1': 2, '5': 3, '6': 4, '10': 4 };
-
-    // ─── Status helpers ───
-    function arrayStateBadge(arr) {
-        const s = (arr.state || '').toLowerCase();
-        if (s.includes('rebuild') || arr.sync) return `<span class="raid-badge raid-badge-rebuilding">rebuilding</span>`;
-        if (s.includes('degrad')) return `<span class="raid-badge raid-badge-degraded">degraded</span>`;
-        if (s === 'inactive') return `<span class="raid-badge raid-badge-inactive">inactive</span>`;
-        if (s.includes('clean') || s.includes('active')) return `<span class="raid-badge raid-badge-active">active</span>`;
-        return `<span class="raid-badge raid-badge-active">${_esc(s || 'active')}</span>`;
-    }
-
-    function diskStateDot(st) {
-        const s = (st || '').toLowerCase();
-        if (s.includes('spare')) return 'spare';
-        if (s.includes('faulty') || s.includes('removed')) return 'faulty';
-        if (s.includes('rebuild')) return 'rebuilding';
-        return 'ok';
-    }
-
-    function _esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-
-    // ═══════════════════════════════════════════
-    //  RAID Arrays tab
-    // ═══════════════════════════════════════════
-    function renderArrays() {
-        content.innerHTML = `
-            <div class="raid-toolbar">
-                <button class="raid-btn" id="raid-refresh"><i class="fas fa-sync-alt"></i> ${t('Refresh')}</button>
-                <button class="raid-btn raid-btn-primary" id="raid-create-btn"><i class="fas fa-plus"></i> ${t('Create Array')}</button>
-                <div class="raid-toolbar-right"><span class="raid-status-text" id="raid-status"></span></div>
-            </div>
-            <div id="raid-wizard-area"></div>
-            <div id="raid-cards-area"></div>
-            <div id="raid-detail-area"></div>`;
-
-        $('#raid-refresh').onclick = loadArrays;
-        $('#raid-create-btn').onclick = showCreateWizard;
-        loadArrays();
-    }
-
-    async function loadArrays() {
-        const statusEl = el.querySelector('#raid-status');
-        if (statusEl) statusEl.textContent = t('Loading...');
-        try {
-            const [arrays, disks] = await Promise.all([
-                api('/raid/arrays'),
-                api('/raid/disks'),
-            ]);
-            state.arrays = arrays || [];
-            state.disks = disks || [];
-            if (statusEl) statusEl.textContent = `${state.arrays.length} ${t('arrays')}, ${state.disks.length} ${t('available disks')}`;
-            renderArrayCards();
-        } catch (e) {
-            if (statusEl) statusEl.textContent = t('Error loading data');
-        }
-    }
-
-    function renderArrayCards() {
-        const area = el.querySelector('#raid-cards-area');
-        if (!area) return;
-        if (!state.arrays.length) {
-            area.innerHTML = `<div class="raid-empty"><i class="fas fa-layer-group"></i><span>${t('No RAID arrays found')}</span></div>`;
-            el.querySelector('#raid-detail-area').innerHTML = '';
-            return;
-        }
-
-        area.innerHTML = `<div class="raid-cards">${state.arrays.map(a => {
-            const sel = state.selectedArray === a.name ? 'selected' : '';
-            const level = a.level || a.raid_level || '?';
-            const size = a.array_size || '';
-            const disksArr = a.disks || [];
-            const members = a.members || [];
-            return `<div class="raid-card ${sel}" data-name="${_esc(a.name)}">
-                <div class="raid-card-head">
-                    <div class="raid-card-icon" style="background:rgba(79,140,255,.12);color:var(--accent);">
-                        <i class="fas fa-layer-group"></i>
-                    </div>
-                    <div>
-                        <div class="raid-card-title">/dev/${_esc(a.name)}</div>
-                        <div class="raid-card-sub">RAID ${_esc(level)}</div>
-                    </div>
-                    <div style="margin-left:auto">${arrayStateBadge(a)}</div>
-                </div>
-                <div class="raid-card-body">
-                    ${size ? `<div class="raid-card-row"><span class="raid-card-label">${t('Size')}</span><span class="raid-card-val">${_esc(size)}</span></div>` : ''}
-                    <div class="raid-card-row"><span class="raid-card-label">${t('Disks')}</span><span class="raid-card-val">${disksArr.length || members.length}</span></div>
-                    ${a.sync ? `<div style="margin-top:6px">
-                        <div class="raid-progress"><div class="raid-progress-bar" style="width:${a.sync.progress}%"></div></div>
-                        <div class="raid-progress-label">${_esc(a.sync.action)} — ${a.sync.progress.toFixed(1)}%</div>
-                    </div>` : ''}
-                </div>
-                <div class="raid-disk-map">${(disksArr.length ? disksArr : members.map(m => ({device: '/dev/' + m, state: 'active'}))).map(d => {
-                    const dot = diskStateDot(d.state || 'active');
-                    const nm = (d.device || d).replace('/dev/', '');
-                    return `<span class="raid-disk-chip"><span class="dot ${dot}"></span>${_esc(nm)}</span>`;
-                }).join('')}</div>
-            </div>`;
-        }).join('')}</div>`;
-
-        area.querySelectorAll('.raid-card').forEach(card => {
-            card.onclick = () => {
-                state.selectedArray = card.dataset.name;
-                renderArrayCards();
-                renderArrayDetail();
-            };
-        });
-
-        if (state.selectedArray) renderArrayDetail();
-    }
-
-    async function renderArrayDetail() {
-        const area = el.querySelector('#raid-detail-area');
-        if (!area || !state.selectedArray) { if (area) area.innerHTML = ''; return; }
-
-        area.innerHTML = `<div class="raid-detail"><div class="raid-status-text">${t('Loading...')}</div></div>`;
-        try {
-            const detail = await api(`/raid/arrays/${encodeURIComponent(state.selectedArray)}/status`);
-            const disks = detail.disks || [];
-            area.innerHTML = `<div class="raid-detail">
-                <div class="raid-detail-head">
-                    <i class="fas fa-layer-group" style="color:var(--accent);font-size:16px;"></i>
-                    <span class="raid-detail-title">/dev/${_esc(detail.name || state.selectedArray)}</span>
-                    <div class="raid-detail-actions">
-                        <button class="raid-btn raid-btn-sm" id="raid-add-disk"><i class="fas fa-plus"></i> ${t('Add Disk')}</button>
-                        <button class="raid-btn raid-btn-sm raid-btn-danger" id="raid-delete-arr"><i class="fas fa-trash"></i> ${t('Delete')}</button>
-                    </div>
-                </div>
-                <table class="raid-table">
-                    <tr><td class="raid-card-label">${t('RAID Level')}</td><td>${_esc(detail.raid_level || '')}</td></tr>
-                    <tr><td class="raid-card-label">${t('State')}</td><td>${_esc(detail.state || '')}</td></tr>
-                    <tr><td class="raid-card-label">${t('Array Size')}</td><td>${_esc(detail.array_size || '')}</td></tr>
-                    <tr><td class="raid-card-label">${t('Active Devices')}</td><td>${_esc(detail.active_devices || '')}</td></tr>
-                    <tr><td class="raid-card-label">${t('Failed Devices')}</td><td>${_esc(detail.failed_devices || '')}</td></tr>
-                    <tr><td class="raid-card-label">${t('Spare Devices')}</td><td>${_esc(detail.spare_devices || '')}</td></tr>
-                    <tr><td class="raid-card-label">${t('UUID')}</td><td style="font-family:monospace;font-size:11px">${_esc(detail.uuid || '')}</td></tr>
-                </table>
-                ${detail.sync ? `<div style="margin-top:10px">
-                    <div class="raid-progress"><div class="raid-progress-bar" style="width:${detail.sync.progress}%"></div></div>
-                    <div class="raid-progress-label">${_esc(detail.sync.action)} — ${detail.sync.progress.toFixed(1)}%</div>
-                </div>` : ''}
-                ${disks.length ? `<div style="margin-top:12px">
-                    <div class="raid-section-title"><i class="fas fa-hdd"></i> ${t('Member Disks')}</div>
-                    <table class="raid-table">
-                        <thead><tr><th>${t('Device')}</th><th>${t('State')}</th><th></th></tr></thead>
-                        <tbody>${disks.map(d => `<tr>
-                            <td><code>${_esc(d.device)}</code></td>
-                            <td><span class="raid-badge raid-badge-${diskStateDot(d.state)}">${_esc(d.state)}</span></td>
-                            <td><button class="raid-btn raid-btn-sm raid-btn-danger raid-remove-disk" data-dev="${_esc(d.device)}"><i class="fas fa-eject"></i></button></td>
-                        </tr>`).join('')}</tbody>
-                    </table>
-                </div>` : ''}
-            </div>`;
-
-            area.querySelector('#raid-delete-arr').onclick = () => deleteArray(state.selectedArray);
-            area.querySelector('#raid-add-disk').onclick = () => showAddDiskDialog(state.selectedArray);
-            area.querySelectorAll('.raid-remove-disk').forEach(btn => {
-                btn.onclick = () => removeDiskFromArray(state.selectedArray, btn.dataset.dev);
-            });
-        } catch (e) {
-            area.innerHTML = `<div class="raid-detail"><div class="raid-status-text" style="color:#ef4444">${t('Error loading details')}</div></div>`;
-        }
-    }
-
-    async function deleteArray(name) {
-        if (!await confirmDialog(t('Potwierdzenie'), t('Delete array /dev/') + name + '? ' + t('This will destroy the array. Data may be lost!'))) return;
-        try {
-            await api(`/raid/arrays/${encodeURIComponent(name)}`, { method: 'DELETE' });
-            state.selectedArray = null;
-            loadArrays();
-        } catch (e) {
-            toast(t('Failed to delete array'), 'error');
-        }
-    }
-
-    async function removeDiskFromArray(arrName, device) {
-        if (!await confirmDialog(t('Potwierdzenie'), t('Remove ') + device + t(' from /dev/') + arrName + '?')) return;
-        try {
-            await api(`/raid/arrays/${encodeURIComponent(arrName)}/remove`, {
-                method: 'POST', body: { device }
-            });
-            renderArrayDetail();
-            loadArrays();
-        } catch (e) {
-            toast(t('Failed to remove disk'), 'error');
-        }
-    }
-
-    function showAddDiskDialog(arrName) {
-        const wizard = el.querySelector('#raid-wizard-area');
-        if (!wizard) return;
-        const available = state.disks;
-        if (!available.length) {
-            wizard.innerHTML = `<div class="raid-wizard"><div class="raid-status-text">${t('No available disks')}</div></div>`;
-            return;
-        }
-        wizard.innerHTML = `<div class="raid-wizard">
-            <div class="raid-wizard-title"><i class="fas fa-plus-circle"></i> ${t('Add Disk to')} /dev/${_esc(arrName)}</div>
-            <div class="raid-disk-select" id="raid-add-disk-select">
-                ${available.map(d => `<label class="raid-disk-opt">
-                    <input type="radio" name="raid-add-dev" value="${_esc(d.device)}">
-                    <span class="dname">${_esc(d.name)}</span>
-                    <span class="dsize">${_esc(d.size)}</span>
-                </label>`).join('')}
-            </div>
-            <div class="raid-form-actions">
-                <button class="raid-btn raid-btn-primary" id="raid-add-confirm">${t('Add')}</button>
-                <button class="raid-btn" id="raid-add-cancel">${t('Cancel')}</button>
-            </div>
-        </div>`;
-        wizard.querySelector('#raid-add-cancel').onclick = () => { wizard.innerHTML = ''; };
-        wizard.querySelector('#raid-add-confirm').onclick = async () => {
-            const sel = wizard.querySelector('input[name="raid-add-dev"]:checked');
-            if (!sel) return;
-            try {
-                await api(`/raid/arrays/${encodeURIComponent(arrName)}/add`, {
-                    method: 'POST', body: { device: sel.value }
-                });
-                wizard.innerHTML = '';
-                loadArrays();
-                renderArrayDetail();
-            } catch (e) {
-                toast(t('Failed to add disk'), 'error');
-            }
-        };
-    }
-
-    // ─── Create Wizard ───
-    function showCreateWizard() {
-        const wizard = el.querySelector('#raid-wizard-area');
-        if (!wizard) return;
-        const available = state.disks;
-
-        wizard.innerHTML = `<div class="raid-wizard">
-            <div class="raid-wizard-title"><i class="fas fa-plus-circle"></i> ${t('Create RAID Array')}</div>
-
-            <div class="raid-form-row">
-                <label>${t('RAID Level')}</label>
-                <select class="fm-input" id="raid-wiz-level" style="max-width:160px">
-                    <option value="1">RAID 1 — Mirror</option>
-                    <option value="5">RAID 5 — Parity</option>
-                    <option value="6">RAID 6 — Double Parity</option>
-                    <option value="0">RAID 0 — Stripe</option>
-                    <option value="10">RAID 10 — Mirror+Stripe</option>
-                </select>
-            </div>
-            <div class="raid-level-info" id="raid-wiz-level-info">${levelInfo['1']}</div>
-
-            <div class="raid-form-row">
-                <label>${t('Array Name')}</label>
-                <input class="fm-input" id="raid-wiz-name" placeholder="${t('auto')}" style="max-width:160px">
-            </div>
-
-            <div class="raid-form-row">
-                <label>${t('Spare Disks')}</label>
-                <input class="fm-input" id="raid-wiz-spares" type="number" min="0" value="0" style="max-width:80px">
-            </div>
-
-            <div style="margin-top:8px;margin-bottom:4px;font-size:12px;color:var(--text-muted)">
-                <i class="fas fa-hdd"></i> ${t('Select disks')} (${available.length} ${t('available')}):
-            </div>
-            ${available.length ? `<div class="raid-disk-select" id="raid-wiz-disks">
-                ${available.map(d => `<label class="raid-disk-opt">
-                    <input type="checkbox" value="${_esc(d.device)}" data-name="${_esc(d.name)}">
-                    <span class="dname">${_esc(d.name)}</span>
-                    <span class="dsize">${_esc(d.size)}</span>
-                    ${d.model ? `<span class="dsize">${_esc(d.model)}</span>` : ''}
-                </label>`).join('')}
-            </div>` : `<div class="raid-status-text" style="padding:10px 0">${t('No available disks found')}</div>`}
-
-            <div class="raid-form-actions">
-                <button class="raid-btn raid-btn-primary" id="raid-wiz-create" ${!available.length ? 'disabled' : ''}><i class="fas fa-check"></i> ${t('Create')}</button>
-                <button class="raid-btn" id="raid-wiz-cancel">${t('Cancel')}</button>
-            </div>
-        </div>`;
-
-        const levelSel = wizard.querySelector('#raid-wiz-level');
-        const infoEl = wizard.querySelector('#raid-wiz-level-info');
-        levelSel.onchange = () => { infoEl.textContent = levelInfo[levelSel.value] || ''; };
-
-        // Toggle checked class on disk options
-        wizard.querySelectorAll('.raid-disk-opt input[type="checkbox"]').forEach(cb => {
-            cb.onchange = () => cb.closest('.raid-disk-opt').classList.toggle('checked', cb.checked);
-        });
-
-        wizard.querySelector('#raid-wiz-cancel').onclick = () => { wizard.innerHTML = ''; };
-        wizard.querySelector('#raid-wiz-create').onclick = async () => {
-            const level = levelSel.value;
-            const devices = [...wizard.querySelectorAll('#raid-wiz-disks input:checked')].map(cb => cb.value);
-            const spares = parseInt(wizard.querySelector('#raid-wiz-spares').value) || 0;
-            const name = wizard.querySelector('#raid-wiz-name').value.trim();
-
-            const activeCount = devices.length - spares;
-            const needed = minDisks[level] || 2;
-            if (activeCount < needed) {
-                toast(t('RAID ') + level + t(' requires at least ') + needed + t(' active disks. Selected: ') + activeCount, 'warning');
-                return;
-            }
-
-            if (!await confirmDialog(t('Potwierdzenie'), t('Create RAID ') + level + t(' with ') + devices.length + t(' disks?') +
-                (level === '0' ? '\n⚠️ ' + t('RAID 0 has NO redundancy!') : ''))) return;
-
-            const btn = wizard.querySelector('#raid-wiz-create');
-            btn.disabled = true;
-            btn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> ${t('Creating...')}`;
-            try {
-                const payload = { level, devices, spares };
-                if (name) payload.name = name;
-                const res = await api('/raid/arrays', { method: 'POST', body: payload });
-                if (res.error) throw new Error(res.error);
-                wizard.innerHTML = '';
-                loadArrays();
-            } catch (e) {
-                toast(t('Failed to create array: ') + (e.message || e), 'error');
-                btn.disabled = false;
-                btn.innerHTML = `<i class="fas fa-check"></i> ${t('Create')}`;
-            }
-        };
-    }
-
-    // ═══════════════════════════════════════════
-    //  LVM tab
-    // ═══════════════════════════════════════════
-    function renderLVM() {
-        content.innerHTML = `
-            <div class="raid-toolbar">
-                <button class="raid-btn" id="lvm-refresh"><i class="fas fa-sync-alt"></i> ${t('Refresh')}</button>
-                <div class="raid-toolbar-right"><span class="raid-status-text" id="lvm-status"></span></div>
-            </div>
-            <div id="lvm-vg-section"></div>
-            <div id="lvm-lv-section"></div>`;
-
-        $('#lvm-refresh').onclick = loadLVM;
-        loadLVM();
-    }
-
-    async function loadLVM() {
-        const statusEl = el.querySelector('#lvm-status');
-        if (statusEl) statusEl.textContent = t('Loading...');
-        try {
-            const [vgs, lvs, disks] = await Promise.all([
-                api('/raid/lvm/vgs'),
-                api('/raid/lvm/lvs'),
-                api('/raid/disks'),
-            ]);
-            state.vgs = vgs || [];
-            state.lvs = lvs || [];
-            state.disks = disks || [];
-            if (statusEl) statusEl.textContent = `${state.vgs.length} VG, ${state.lvs.length} LV`;
-            renderVGSection();
-            renderLVSection();
-        } catch (e) {
-            if (statusEl) statusEl.textContent = t('Error loading data');
-        }
-    }
-
-    function renderVGSection() {
-        const area = el.querySelector('#lvm-vg-section');
-        if (!area) return;
-
-        area.innerHTML = `<div class="raid-lvm-section">
-            <div class="raid-section-title"><i class="fas fa-archive"></i> ${t('Volume Groups')}
-                <button class="raid-btn raid-btn-sm raid-btn-primary" id="lvm-create-vg" style="margin-left:auto"><i class="fas fa-plus"></i> ${t('Create VG')}</button>
-            </div>
-            <div id="lvm-vg-wizard"></div>
-            ${state.vgs.length ? `<div class="raid-cards">${state.vgs.map(vg => `<div class="raid-card">
-                <div class="raid-card-head">
-                    <div class="raid-card-icon" style="background:rgba(139,92,246,.12);color:#8b5cf6;">
-                        <i class="fas fa-archive"></i>
-                    </div>
-                    <div>
-                        <div class="raid-card-title">${_esc(vg.vg_name)}</div>
-                        <div class="raid-card-sub">${_esc(vg.vg_size || '')}</div>
-                    </div>
-                    <button class="raid-btn raid-btn-sm raid-btn-danger lvm-del-vg" data-vg="${_esc(vg.vg_name)}" style="margin-left:auto" title="${t('Delete VG')}"><i class="fas fa-trash"></i></button>
-                </div>
-                <div class="raid-card-body">
-                    <div class="raid-card-row"><span class="raid-card-label">${t('Free')}</span><span class="raid-card-val">${_esc(vg.vg_free || '')}</span></div>
-                    <div class="raid-card-row"><span class="raid-card-label">${t('PV Count')}</span><span class="raid-card-val">${_esc(vg.pv_count || '')}</span></div>
-                    <div class="raid-card-row"><span class="raid-card-label">${t('LV Count')}</span><span class="raid-card-val">${_esc(vg.lv_count || '')}</span></div>
-                </div>
-                ${(vg.pvs || []).length ? `<div class="raid-disk-map">${vg.pvs.map(p =>
-                    `<span class="raid-disk-chip"><span class="dot ok"></span>${_esc((p.pv_name || '').replace('/dev/', ''))}</span>`
-                ).join('')}</div>` : ''}
-            </div>`).join('')}</div>` : `<div class="raid-empty"><i class="fas fa-archive"></i><span>${t('No volume groups')}</span></div>`}
-        </div>`;
-
-        area.querySelector('#lvm-create-vg').onclick = showCreateVGWizard;
-        area.querySelectorAll('.lvm-del-vg').forEach(btn => {
-            btn.onclick = async (e) => {
-                e.stopPropagation();
-                const vgName = btn.dataset.vg;
-                if (!await confirmDialog(t('Potwierdzenie'), t('Delete volume group ') + vgName + '?')) return;
-                try {
-                    const res = await api(`/raid/lvm/vg/${encodeURIComponent(vgName)}`, { method: 'DELETE' });
-                    if (res.error) throw new Error(res.error);
-                    loadLVM();
-                } catch (e) {
-                    toast(t('Failed to delete VG: ') + (e.message || e), 'error');
-                }
-            };
-        });
-    }
-
-    function showCreateVGWizard() {
-        const wizard = el.querySelector('#lvm-vg-wizard');
-        if (!wizard) return;
-        const available = state.disks;
-
-        wizard.innerHTML = `<div class="raid-wizard">
-            <div class="raid-wizard-title"><i class="fas fa-plus-circle"></i> ${t('Create Volume Group')}</div>
-            <div class="raid-form-row">
-                <label>${t('VG Name')}</label>
-                <input class="fm-input" id="lvm-vg-name" placeholder="vg0" style="max-width:200px">
-            </div>
-            <div style="margin-top:8px;margin-bottom:4px;font-size:12px;color:var(--text-muted)">
-                <i class="fas fa-hdd"></i> ${t('Select physical volumes')} (${available.length} ${t('available')}):
-            </div>
-            ${available.length ? `<div class="raid-disk-select" id="lvm-vg-disks">
-                ${available.map(d => `<label class="raid-disk-opt">
-                    <input type="checkbox" value="${_esc(d.device)}">
-                    <span class="dname">${_esc(d.name)}</span>
-                    <span class="dsize">${_esc(d.size)}</span>
-                </label>`).join('')}
-            </div>` : `<div class="raid-status-text">${t('No available disks')}</div>`}
-            <div class="raid-form-actions">
-                <button class="raid-btn raid-btn-primary" id="lvm-vg-confirm" ${!available.length ? 'disabled' : ''}>${t('Create')}</button>
-                <button class="raid-btn" id="lvm-vg-cancel">${t('Cancel')}</button>
-            </div>
-        </div>`;
-
-        wizard.querySelectorAll('.raid-disk-opt input[type="checkbox"]').forEach(cb => {
-            cb.onchange = () => cb.closest('.raid-disk-opt').classList.toggle('checked', cb.checked);
-        });
-        wizard.querySelector('#lvm-vg-cancel').onclick = () => { wizard.innerHTML = ''; };
-        wizard.querySelector('#lvm-vg-confirm').onclick = async () => {
-            const name = wizard.querySelector('#lvm-vg-name').value.trim();
-            const devices = [...wizard.querySelectorAll('#lvm-vg-disks input:checked')].map(cb => cb.value);
-            if (!name) { toast(t('VG name is required'), 'warning'); return; }
-            if (!devices.length) { toast(t('Select at least one device'), 'warning'); return; }
-            const btn = wizard.querySelector('#lvm-vg-confirm');
-            btn.disabled = true;
-            try {
-                const res = await api('/raid/lvm/vg', { method: 'POST', body: { name, devices } });
-                if (res.error) throw new Error(res.error);
-                wizard.innerHTML = '';
-                loadLVM();
-            } catch (e) {
-                toast(t('Failed: ') + (e.message || e), 'error');
-                btn.disabled = false;
-            }
-        };
-    }
-
-    function renderLVSection() {
-        const area = el.querySelector('#lvm-lv-section');
-        if (!area) return;
-
-        area.innerHTML = `<div class="raid-lvm-section">
-            <div class="raid-section-title"><i class="fas fa-cube"></i> ${t('Logical Volumes')}
-                <button class="raid-btn raid-btn-sm raid-btn-primary" id="lvm-create-lv" style="margin-left:auto" ${!state.vgs.length ? 'disabled' : ''}><i class="fas fa-plus"></i> ${t('Create LV')}</button>
-            </div>
-            <div id="lvm-lv-wizard"></div>
-            ${state.lvs.length ? `<table class="raid-table">
-                <thead><tr><th>${t('Name')}</th><th>${t('VG')}</th><th>${t('Size')}</th><th>${t('Path')}</th><th></th></tr></thead>
-                <tbody>${state.lvs.map(lv => `<tr>
-                    <td><strong>${_esc(lv.lv_name)}</strong></td>
-                    <td>${_esc(lv.vg_name)}</td>
-                    <td>${_esc(lv.lv_size)}</td>
-                    <td><code style="font-size:11px">${_esc(lv.lv_path || `/dev/${lv.vg_name}/${lv.lv_name}`)}</code></td>
-                    <td><button class="raid-btn raid-btn-sm raid-btn-danger lvm-del-lv" data-vg="${_esc(lv.vg_name)}" data-lv="${_esc(lv.lv_name)}"><i class="fas fa-trash"></i></button></td>
-                </tr>`).join('')}</tbody>
-            </table>` : `<div class="raid-empty" style="height:120px"><i class="fas fa-cube"></i><span>${t('No logical volumes')}</span></div>`}
-        </div>`;
-
-        area.querySelector('#lvm-create-lv').onclick = showCreateLVWizard;
-        area.querySelectorAll('.lvm-del-lv').forEach(btn => {
-            btn.onclick = async () => {
-                const vg = btn.dataset.vg, lv = btn.dataset.lv;
-                if (!await confirmDialog(t('Potwierdzenie'), t('Delete logical volume ') + vg + '/' + lv + '?')) return;
-                try {
-                    const res = await api(`/raid/lvm/lv/${encodeURIComponent(vg)}/${encodeURIComponent(lv)}`, { method: 'DELETE' });
-                    if (res.error) throw new Error(res.error);
-                    loadLVM();
-                } catch (e) {
-                    toast(t('Failed: ') + (e.message || e), 'error');
-                }
-            };
-        });
-    }
-
-    function showCreateLVWizard() {
-        const wizard = el.querySelector('#lvm-lv-wizard');
-        if (!wizard) return;
-
-        wizard.innerHTML = `<div class="raid-wizard">
-            <div class="raid-wizard-title"><i class="fas fa-plus-circle"></i> ${t('Create Logical Volume')}</div>
-            <div class="raid-form-row">
-                <label>${t('Volume Group')}</label>
-                <select class="fm-input" id="lvm-lv-vg" style="max-width:200px">
-                    ${state.vgs.map(vg => `<option value="${_esc(vg.vg_name)}">${_esc(vg.vg_name)} (${_esc(vg.vg_free || '')} ${t('free')})</option>`).join('')}
-                </select>
-            </div>
-            <div class="raid-form-row">
-                <label>${t('LV Name')}</label>
-                <input class="fm-input" id="lvm-lv-name" placeholder="lv0" style="max-width:200px">
-            </div>
-            <div class="raid-form-row">
-                <label>${t('Size')}</label>
-                <input class="fm-input" id="lvm-lv-size" placeholder="${t('e.g. 10G, 500M')}" style="max-width:160px">
-                <label class="raid-disk-opt" style="padding:6px 10px">
-                    <input type="checkbox" id="lvm-lv-useall"> <span class="dname">${t('Use all free space')}</span>
-                </label>
-            </div>
-            <div class="raid-form-actions">
-                <button class="raid-btn raid-btn-primary" id="lvm-lv-confirm">${t('Create')}</button>
-                <button class="raid-btn" id="lvm-lv-cancel">${t('Cancel')}</button>
-            </div>
-        </div>`;
-
-        const useAllCb = wizard.querySelector('#lvm-lv-useall');
-        const sizeInput = wizard.querySelector('#lvm-lv-size');
-        useAllCb.onchange = () => { sizeInput.disabled = useAllCb.checked; if (useAllCb.checked) sizeInput.value = ''; };
-
-        wizard.querySelector('#lvm-lv-cancel').onclick = () => { wizard.innerHTML = ''; };
-        wizard.querySelector('#lvm-lv-confirm').onclick = async () => {
-            const vg_name = wizard.querySelector('#lvm-lv-vg').value;
-            const name = wizard.querySelector('#lvm-lv-name').value.trim();
-            const size = sizeInput.value.trim();
-            const use_all = useAllCb.checked;
-            if (!name) { toast(t('LV name is required'), 'warning'); return; }
-            if (!use_all && !size) { toast(t('Specify size or use all free space'), 'warning'); return; }
-            const btn = wizard.querySelector('#lvm-lv-confirm');
-            btn.disabled = true;
-            try {
-                const res = await api('/raid/lvm/lv', { method: 'POST', body: { vg_name, name, size, use_all } });
-                if (res.error) throw new Error(res.error);
-                wizard.innerHTML = '';
-                loadLVM();
-            } catch (e) {
-                toast(t('Failed: ') + (e.message || e), 'error');
-                btn.disabled = false;
-            }
-        };
-    }
-
-    // ─── Auto-refresh for rebuilds ───
-    function startPoll() {
-        stopPoll();
-        state.pollTimer = setInterval(() => {
-            if (state.tab === 'arrays' && state.arrays.some(a => a.sync)) loadArrays();
-        }, 10000);
-    }
-    function stopPoll() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } }
-
-    // Initial render
-    render();
-    startPoll();
-
-    // Cleanup on window close
-    const origClose = body.closest('.window')?.querySelector('.win-close');
-    if (origClose) {
-        const orig = origClose.onclick;
-        origClose.onclick = () => { stopPoll(); if (orig) orig(); };
-    }
-
-        // Hide arrays tab, show LVM
-        const _arrTab = el.querySelector('.raid-tab[data-tab="arrays"]');
-        if (_arrTab) _arrTab.style.display = 'none';
-        // Auto-switch to LVM tab
-        const _lvmTab2 = el.querySelector('.raid-tab[data-tab="lvm"]');
-        if (_lvmTab2) _lvmTab2.click();
-
-        return null;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // Section: Sharing (from sharing.js)
-    // ═══════════════════════════════════════════════════════════
-    async function _smSharing(el) {
-    const $ = (s) => el.querySelector(s);
+/* ═══════════════════════════════════════════════════════════
+   Section: Sharing (from original sharing.js)
+   ═══════════════════════════════════════════════════════════ */
+async function _smSharing(el) {
+    const body = el;
+    const $ = (s) => body.querySelector(s);
 
     /* Show loading state */
-    el.innerHTML = `<div class="shr-loading"><i class="fas fa-spinner fa-spin shr-spin-icon"></i>${t('Ładowanie…')}</div>`;
+    body.innerHTML = `<div class="shr-loading"><i class="fas fa-spinner fa-spin shr-spin-icon"></i>${t('Ładowanie…')}</div>`;
 
     /* Fetch installed packages to determine which tabs to show */
     let installedProtos;
@@ -2834,7 +2037,7 @@ function _smRender(body) {
 
     /* Empty state — no protocols installed */
     if (!installedProtos.length) {
-        el.innerHTML = `
+        body.innerHTML = `
         <div class="shr-empty">
             <i class="fas fa-share-alt shr-empty-icon"></i>
             <h3 class="shr-empty-title">${t('Brak zainstalowanych protokołów')}</h3>
@@ -2853,7 +2056,7 @@ function _smRender(body) {
        We make it a flex-row container directly so sidebar + panel
        sit side by side without needing height:100% on a wrapper. */
     body.style.cssText = 'display:flex;flex-direction:row;overflow:hidden;padding:0';
-    el.innerHTML = `
+    body.innerHTML = `
         <div class="sh-sidebar shr-sidebar">
             ${installedProtos.map(p => `
                 <button class="sh-tab shr-tab-btn" data-tab="${p.id}"><i class="fas ${p.icon} shr-tab-icon"></i><span>${p.label}</span></button>
@@ -2865,7 +2068,7 @@ function _smRender(body) {
 
     function switchTab(id) {
         activeTab = id;
-        el.querySelectorAll('.sh-tab').forEach(b => {
+        body.querySelectorAll('.sh-tab').forEach(b => {
             const active = b.dataset.tab === id;
             b.style.borderLeftColor = active ? '#6366f1' : 'transparent';
             b.style.color = active ? 'var(--text)' : 'var(--text-muted)';
@@ -2876,7 +2079,7 @@ function _smRender(body) {
         (render[id] || render.samba)($('#sh-panel'));
     }
 
-    el.querySelectorAll('.sh-tab').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
+    body.querySelectorAll('.sh-tab').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
     switchTab(installedProtos[0].id);
 
     /* ══════════════════════════════════════════
@@ -3524,14 +2727,14 @@ function _smRender(body) {
         panel.querySelector('#sh-ftp-ref').onclick = () => load();
         load();
     }
+    return null;
+}
 
-        return null;
-    }
-
-    // ═══════════════════════════════════════════════════════════
-    // Section: Diagnostics (from diskrepair.js)
-    // ═══════════════════════════════════════════════════════════
-    function _smDiagnostics(el) {
+/* ═══════════════════════════════════════════════════════════
+   Section: Diagnostics (from original diskrepair.js)
+   ═══════════════════════════════════════════════════════════ */
+function _smDiagnostics(el) {
+    const body = el;
     const state = {
         disks: [],
         selectedDisk: null,
@@ -3544,7 +2747,110 @@ function _smRender(body) {
         history: [],
     };
 
-    el.innerHTML = `
+    body.innerHTML = `
+    <style>
+        .dr-wrap { display:flex; height:100%; overflow:hidden; }
+
+        /* ── Sidebar ── */
+        .dr-sidebar { width:250px; min-width:250px; background:var(--bg-secondary); border-right:1px solid var(--border); display:flex; flex-direction:column; overflow:hidden; }
+        .dr-sidebar-header { display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid var(--border); }
+        .dr-sidebar-header span { font-weight:600; font-size:13px; color:var(--text-primary); }
+        .dr-disk-list { flex:1; overflow-y:auto; padding:6px; }
+        .dr-disk-item { display:flex; align-items:center; gap:10px; padding:10px; border-radius:8px; cursor:pointer; margin-bottom:4px; transition:background .15s; }
+        .dr-disk-item:hover { background:var(--bg-card); }
+        .dr-disk-item.active { background:var(--accent); color:#fff; }
+        .dr-disk-item.active .dr-disk-model { color:#fff; }
+        .dr-disk-item.active .dr-disk-size { color:rgba(255,255,255,.7); }
+        .dr-disk-item.active .dr-temp-badge { background:rgba(255,255,255,.2); color:#fff; }
+        .dr-disk-icon { font-size:22px; width:28px; text-align:center; flex-shrink:0; }
+        .dr-disk-meta { flex:1; min-width:0; }
+        .dr-disk-model { font-size:12px; font-weight:600; color:var(--text-primary); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .dr-disk-size { font-size:11px; color:var(--text-muted); }
+        .dr-health-dot { width:10px; height:10px; border-radius:50%; flex-shrink:0; }
+        .dr-temp-badge { font-size:10px; padding:2px 6px; border-radius:4px; background:var(--bg-primary); color:var(--text-muted); flex-shrink:0; }
+
+        /* ── Main ── */
+        .dr-main { flex:1; display:flex; flex-direction:column; overflow:hidden; }
+        .dr-banner { display:none; padding:10px 16px; background:var(--bg-card); border-bottom:1px solid var(--border); }
+        .dr-banner.active { display:flex; align-items:center; gap:12px; }
+        .dr-banner-info { flex:1; min-width:0; }
+        .dr-banner-title { font-size:12px; font-weight:600; color:var(--text-primary); }
+        .dr-banner-progress { height:8px; background:var(--bg-primary); border-radius:4px; overflow:hidden; margin-top:6px; }
+        .dr-banner-bar { height:100%; background:linear-gradient(90deg, var(--accent), #6366f1); border-radius:4px; transition:width .3s; width:0%; }
+        .dr-banner-detail { font-size:11px; color:var(--text-muted); margin-top:4px; }
+
+        /* ── Tabs ── */
+        .dr-tabs { display:flex; border-bottom:1px solid var(--border); padding:0 16px; background:var(--bg-secondary); flex-shrink:0; }
+        .dr-tab { padding:10px 16px; font-size:12px; font-weight:500; color:var(--text-muted); cursor:pointer; border-bottom:2px solid transparent; transition:color .15s, border-color .15s; white-space:nowrap; }
+        .dr-tab:hover { color:var(--text-primary); }
+        .dr-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+
+        /* ── Tab content ── */
+        .dr-content { flex:1; overflow-y:auto; padding:16px; }
+        .dr-empty { display:flex; align-items:center; justify-content:center; height:100%; color:var(--text-muted); font-size:14px; flex-direction:column; gap:8px; }
+        .dr-empty i { font-size:40px; opacity:.4; }
+
+        .dr-card { background:var(--bg-card); border-radius:10px; padding:16px; margin-bottom:14px; }
+        .dr-card-title { font-weight:600; font-size:13px; color:var(--text-primary); margin-bottom:10px; display:flex; align-items:center; gap:8px; }
+        .dr-card-title i { width:18px; text-align:center; }
+
+        .dr-table { width:100%; border-collapse:collapse; font-size:12px; }
+        .dr-table th { text-align:left; font-weight:600; padding:8px 10px; border-bottom:2px solid var(--border); color:var(--text-secondary); font-size:11px; text-transform:uppercase; letter-spacing:.3px; }
+        .dr-table td { padding:7px 10px; border-bottom:1px solid var(--border); color:var(--text-primary); }
+        .dr-table tr:last-child td { border-bottom:none; }
+
+        .dr-kv { display:grid; grid-template-columns:140px 1fr; gap:6px 12px; font-size:12px; }
+        .dr-kv-label { color:var(--text-muted); }
+        .dr-kv-value { color:var(--text-primary); font-weight:500; }
+
+        .dr-metrics { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:14px; }
+        .dr-metric { background:var(--bg-card); border-radius:10px; padding:14px 18px; flex:1; min-width:120px; text-align:center; }
+        .dr-metric-value { font-size:22px; font-weight:700; color:var(--text-primary); }
+        .dr-metric-label { font-size:11px; color:var(--text-muted); margin-top:2px; }
+
+        .dr-health-big { display:flex; align-items:center; gap:12px; padding:14px; background:var(--bg-primary); border-radius:10px; margin-bottom:14px; }
+        .dr-health-icon { font-size:32px; }
+        .dr-health-text { font-size:15px; font-weight:600; }
+
+        .dr-btn { background:var(--accent); color:#fff; border:none; border-radius:6px; padding:8px 14px; cursor:pointer; font-size:12px; display:inline-flex; align-items:center; gap:6px; white-space:nowrap; }
+        .dr-btn:hover { filter:brightness(1.1); }
+        .dr-btn:disabled { opacity:.5; cursor:not-allowed; filter:none; }
+        .dr-btn-sm { padding:5px 10px; font-size:11px; }
+        .dr-btn-outline { background:transparent; border:1px solid var(--border); color:var(--text-secondary); }
+        .dr-btn-outline:hover { border-color:var(--accent); color:var(--accent); }
+        .dr-btn-danger { background:#ef4444; }
+        .dr-btn-danger:hover { background:#dc2626; }
+        .dr-btn-warn { background:#f59e0b; }
+        .dr-btn-warn:hover { background:#d97706; }
+
+        .dr-select { background:var(--bg-primary); border:1px solid var(--border); border-radius:6px; padding:8px 10px; color:var(--text-primary); font-size:12px; }
+        .dr-select option { background:var(--bg-primary); color:var(--text-primary); }
+
+        .dr-log { max-height:200px; overflow-y:auto; background:var(--bg-primary); border-radius:8px; padding:8px 10px; margin-top:10px; font-family:monospace; font-size:11px; color:var(--text-muted); }
+        .dr-log-line { padding:2px 0; border-bottom:1px solid var(--border); }
+        .dr-log-line:last-child { border:none; }
+        .dr-log-line.error { color:#ef4444; }
+        .dr-log-line.success { color:#10b981; }
+
+        .dr-progress-outer { height:20px; background:var(--bg-primary); border-radius:10px; overflow:hidden; position:relative; margin-top:10px; }
+        .dr-progress-inner { height:100%; background:linear-gradient(90deg, var(--accent), #6366f1); border-radius:10px; transition:width .3s; width:0%; }
+        .dr-progress-text { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:600; color:#fff; text-shadow:0 1px 2px rgba(0,0,0,.4); }
+
+        .dr-row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+        .dr-warning { background:#fef3c7; color:#92400e; border-radius:8px; padding:10px 14px; font-size:12px; display:flex; align-items:center; gap:8px; margin-bottom:12px; }
+        .dr-warning i { color:#f59e0b; }
+
+        .dr-smart-status { display:inline-block; width:8px; height:8px; border-radius:50%; }
+
+        .dr-hist-item { display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid var(--border); font-size:12px; }
+        .dr-hist-item:last-child { border:none; }
+        .dr-hist-icon { font-size:16px; width:20px; text-align:center; }
+        .dr-hist-meta { flex:1; min-width:0; }
+        .dr-hist-time { font-size:10px; color:var(--text-muted); white-space:nowrap; }
+
+        .dr-nodata { text-align:center; padding:30px; color:var(--text-muted); font-size:13px; }
+    </style>
+
     <div class="dr-wrap">
         <div class="dr-sidebar">
             <div class="dr-sidebar-header">
@@ -3576,8 +2882,8 @@ function _smRender(body) {
         </div>
     </div>`;
 
-    const $ = s => el.querySelector(s);
-    const $$ = s => el.querySelectorAll(s);
+    const $ = s => body.querySelector(s);
+    const $$ = s => body.querySelectorAll(s);
 
     /* ─── Helpers ─── */
     function humanSize(b) {
@@ -4112,9 +3418,9 @@ function _smRender(body) {
 
     function updateTabProgress(st) {
         // Update inline progress bars in check/repair tabs
-        const bar = el.querySelector('#dr-check-bar') || el.querySelector('#dr-repair-bar');
-        const pct = el.querySelector('#dr-check-pct') || el.querySelector('#dr-repair-pct');
-        const progressWrap = el.querySelector('#dr-check-progress') || el.querySelector('#dr-repair-progress');
+        const bar = body.querySelector('#dr-check-bar') || body.querySelector('#dr-repair-bar');
+        const pct = body.querySelector('#dr-check-pct') || body.querySelector('#dr-repair-pct');
+        const progressWrap = body.querySelector('#dr-check-progress') || body.querySelector('#dr-repair-progress');
 
         if (progressWrap) progressWrap.style.display = '';
         if (bar) bar.style.width = (st.percent || 0) + '%';
@@ -4122,7 +3428,7 @@ function _smRender(body) {
     }
 
     function appendLog(line) {
-        const logEls = el.querySelectorAll('.dr-log');
+        const logEls = body.querySelectorAll('.dr-log');
         logEls.forEach(logEl => {
             const cls = /error|fail/i.test(line) ? 'error' : /success|pass|ok/i.test(line) ? 'success' : '';
             logEl.innerHTML += `<div class="dr-log-line ${cls}">${escHtml(line)}</div>`;
@@ -4131,10 +3437,10 @@ function _smRender(body) {
     }
 
     function disableStartButtons(disabled) {
-        el.querySelectorAll('#dr-check-start, #dr-bb-start, #dr-repair-start, #dr-smart-short, #dr-smart-long').forEach(btn => {
+        body.querySelectorAll('#dr-check-start, #dr-bb-start, #dr-repair-start, #dr-smart-short, #dr-smart-long').forEach(btn => {
             btn.disabled = disabled;
         });
-        el.querySelectorAll('.dr-part-check').forEach(btn => { btn.disabled = disabled; });
+        body.querySelectorAll('.dr-part-check').forEach(btn => { btn.disabled = disabled; });
     }
 
     /* ─── Banner cancel ─── */
@@ -4162,340 +3468,122 @@ function _smRender(body) {
     /* ─── Init ─── */
     loadDisks();
     checkRunningOp();
+    return () => { stopPolling(); };
+}
 
-        return () => { try { if (pollTimer) clearInterval(pollTimer); } catch(e) {} };
-    }
+/* ═══════════════════════════════════════════════════════════
+   Section: SSD Cache (bcache management)
+   ═══════════════════════════════════════════════════════════ */
+function _smCache(el) {
+    el.innerHTML = `<div style="padding:20px">
+        <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
+            <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text-primary)"><i class="fas fa-bolt" style="color:var(--accent);margin-right:6px"></i>SSD Cache</h3>
+            <button class="fm-toolbar-btn btn-sm" id="sc-refresh"><i class="fas fa-sync-alt"></i> ${t('Odśwież')}</button>
+        </div>
+        <div id="sc-content"><div class="sto-center-lg"><i class="fas fa-spinner fa-spin sto-spinner"></i></div></div>
+    </div>`;
 
-} // end _smRender
-        /* ─── Tab: Check ─── */
-        function renderCheckTab(cEl) {
-            const d = state.selectedDisk;
-            const parts = (d.partitions || []).filter(p => p.fstype);
-            cEl.innerHTML = `
-                <div class="dr-card"><div class="dr-card-title"><i class="fas fa-search"></i> ${t('Sprawdzanie systemu plików (fsck)')}</div>
-                    ${parts.length ? `
-                    <div class="dr-row" style="margin-bottom:12px">
-                        <select class="dr-select" id="dr-check-part" style="flex:1">
-                            <option value="">— ${t('Wybierz partycję')} —</option>
-                            ${parts.map(p => `<option value="${escHtml(p.name)}">/dev/${escHtml(p.name)} (${escHtml(p.fstype)}, ${humanSize(p.size)})</option>`).join('')}
-                        </select>
-                        <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary);cursor:pointer"><input type="checkbox" id="dr-check-repair"> ${t('Napraw (fsck -y)')}</label>
-                    </div>
-                    <div class="dr-row"><button class="dr-btn" id="dr-check-start" ${isRunning() ? 'disabled' : ''}><i class="fas fa-play"></i> Rozpocznij sprawdzanie</button></div>
-                    ` : `<div class="dr-nodata">${t('Brak partycji z systemem plików')}</div>`}
-                </div>
-                <div id="dr-check-progress" style="display:none">
-                    <div class="dr-card"><div class="dr-card-title"><i class="fas fa-cog fa-spin"></i> ${t('Postęp')}</div>
-                        <div class="dr-progress-outer"><div class="dr-progress-inner" id="dr-check-bar"></div><div class="dr-progress-text" id="dr-check-pct">0%</div></div>
-                        <div class="dr-log" id="dr-check-log"></div>
-                        <div style="margin-top:10px"><button class="dr-btn dr-btn-sm dr-btn-danger" id="dr-check-cancel"><i class="fas fa-stop"></i> Anuluj</button></div>
-                    </div>
-                </div>`;
-            const startBtn = cEl.querySelector('#dr-check-start');
-            if (startBtn) {
-                startBtn.onclick = () => {
-                    const part = cEl.querySelector('#dr-check-part').value;
-                    const repair = cEl.querySelector('#dr-check-repair').checked;
-                    if (!part) { toast(t('Wybierz partycję'), 'warning'); return; }
-                    startFsck(part, repair);
-                };
-            }
-            const cancelBtn = cEl.querySelector('#dr-check-cancel');
-            if (cancelBtn) cancelBtn.onclick = cancelOperation;
-            if (isRunning() && state.operation && state.operation.operation === 'fsck') {
-                const wrap = cEl.querySelector('#dr-check-progress'); if (wrap) wrap.style.display = '';
-            }
-        }
+    const contentEl = el.querySelector('#sc-content');
+    el.querySelector('#sc-refresh').onclick = loadCache;
 
-        async function startFsck(partition, repair) {
-            if (isRunning()) { toast('Inna operacja w toku', 'warning'); return; }
-            try { await api('/diskrepair/fsck', { method: 'POST', body: { partition, repair } }); toast(t('Sprawdzanie rozpoczęte'), 'info'); state.logOffset = 0; startPolling(); } catch (e) { toast(t('Błąd: ') + e.message, 'error'); }
-        }
+    async function loadCache() {
+        contentEl.innerHTML = '<div class="sto-center-lg"><i class="fas fa-spinner fa-spin sto-spinner"></i></div>';
+        try {
+            const [statusData, devData] = await Promise.all([
+                api('/cache/status'),
+                api('/cache/devices'),
+            ]);
+            const live = (statusData && statusData.live) || [];
+            const configured = (statusData && statusData.configured) || [];
+            const ssds = (devData && devData.ssds) || [];
+            const hdds = (devData && devData.hdds) || [];
 
-        /* ─── Tab: Repair ─── */
-        function renderRepairTab(cEl) {
-            const d = state.selectedDisk;
-            const parts = (d.partitions || []).filter(p => p.fstype);
-            cEl.innerHTML = `
-                <div class="dr-warning"><i class="fas fa-exclamation-triangle"></i> ${t('Operacje naprawcze mogą trwać bardzo długo i mogą uszkodzić dane. Upewnij się, że masz kopię zapasową!')}</div>
-                <div class="dr-card"><div class="dr-card-title"><i class="fas fa-search-plus"></i> ${t('Skanowanie uszkodzonych sektorów (badblocks)')}</div>
-                    <div class="dr-row" style="margin-bottom:10px">
-                        <span style="font-size:12px;color:var(--text-secondary)">Dysk:</span>
-                        <strong style="font-size:12px;color:var(--text-primary)">/dev/${escHtml(d.name)}</strong>
-                        <select class="dr-select" id="dr-bb-mode">
-                            <option value="readonly">Tylko odczyt (bezpieczny)</option>
-                            <option value="nondestructive">Niedestrukcyjny zapis</option>
-                        </select>
-                    </div>
-                    <div class="dr-warning"><i class="fas fa-clock"></i> ${t('Badblocks może trwać wiele godzin, w zależności od rozmiaru dysku.')}</div>
-                    <button class="dr-btn dr-btn-warn" id="dr-bb-start" ${isRunning() ? 'disabled' : ''}><i class="fas fa-play"></i> Rozpocznij skanowanie</button>
-                </div>
-                <div class="dr-card"><div class="dr-card-title"><i class="fas fa-wrench"></i> ${t('Naprawa systemu plików')}</div>
-                    ${parts.length ? `
-                    <div class="dr-row" style="margin-bottom:10px">
-                        <select class="dr-select" id="dr-repair-part" style="flex:1">
-                            <option value="">— ${t('Wybierz partycję')} —</option>
-                            ${parts.map(p => `<option value="${escHtml(p.name)}">/dev/${escHtml(p.name)} (${escHtml(p.fstype)}, ${humanSize(p.size)})${p.mounted ? ' [' + t('zamontowany') + ']' : ''}</option>`).join('')}
-                        </select>
-                        <button class="dr-btn dr-btn-sm dr-btn-outline" id="dr-repair-unmount"><i class="fas fa-eject"></i> Odmontuj</button>
-                        <button class="dr-btn dr-btn-danger" id="dr-repair-start" ${isRunning() ? 'disabled' : ''}><i class="fas fa-wrench"></i> Napraw (fsck -y)</button>
-                    </div>
-                    ` : `<div class="dr-nodata">${t('Brak partycji z systemem plików')}</div>`}
-                </div>
-                <div id="dr-repair-progress" style="display:none">
-                    <div class="dr-card"><div class="dr-card-title"><i class="fas fa-cog fa-spin"></i> ${t('Postęp operacji')}</div>
-                        <div class="dr-progress-outer"><div class="dr-progress-inner" id="dr-repair-bar"></div><div class="dr-progress-text" id="dr-repair-pct">0%</div></div>
-                        <div class="dr-log" id="dr-repair-log"></div>
-                        <div style="margin-top:10px"><button class="dr-btn dr-btn-sm dr-btn-danger" id="dr-repair-cancel"><i class="fas fa-stop"></i> Anuluj</button></div>
-                    </div>
-                </div>`;
-            const bbStartBtn = cEl.querySelector('#dr-bb-start');
-            if (bbStartBtn) bbStartBtn.onclick = () => { const mode = cEl.querySelector('#dr-bb-mode').value; startBadblocks(state.selectedDisk.name, mode); };
-            const repairStartBtn = cEl.querySelector('#dr-repair-start');
-            if (repairStartBtn) repairStartBtn.onclick = () => { const part = cEl.querySelector('#dr-repair-part').value; if (!part) { toast(t('Wybierz partycję'), 'warning'); return; } startFsck(part, true); };
-            const unmountBtn = cEl.querySelector('#dr-repair-unmount');
-            if (unmountBtn) unmountBtn.onclick = async () => {
-                const part = cEl.querySelector('#dr-repair-part').value;
-                if (!part) { toast(t('Wybierz partycję'), 'warning'); return; }
-                try { await api('/diskrepair/unmount', { method: 'POST', body: { partition: part } }); toast('Odmontowano /dev/' + part, 'success'); await loadDisks(); renderTab(); } catch (e) { toast(t('Błąd odmontowywania: ') + e.message, 'error'); }
-            };
-            const repairCancel = cEl.querySelector('#dr-repair-cancel');
-            if (repairCancel) repairCancel.onclick = cancelOperation;
-            if (isRunning()) { const wrap = cEl.querySelector('#dr-repair-progress'); if (wrap) wrap.style.display = ''; }
-        }
+            let html = '';
 
-        async function startBadblocks(disk, mode) {
-            if (isRunning()) { toast('Inna operacja w toku', 'warning'); return; }
-            try { await api('/diskrepair/badblocks', { method: 'POST', body: { disk, mode } }); toast(t('Skanowanie badblocks rozpoczęte'), 'info'); state.logOffset = 0; startPolling(); } catch (e) { toast(t('Błąd: ') + e.message, 'error'); }
-        }
-
-        /* ─── Tab: History ─── */
-        async function renderHistoryTab(cEl) {
-            cEl.innerHTML = `<div class="dr-nodata"><i class="fas fa-spinner fa-spin"></i> ${t('Ładowanie...')}</div>`;
-            try {
-                const data = await api('/diskrepair/history');
-                state.history = data || [];
-                if (!state.history.length) { cEl.innerHTML = '<div class="dr-nodata"><i class="fas fa-clock-rotate-left"></i> Brak historii operacji</div>'; return; }
-                cEl.innerHTML = `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-clock-rotate-left"></i> Historia operacji</div>
-                    ${state.history.slice().reverse().map(h => {
-                        const ok = h.success || h.result === 'success';
-                        const icon = ok ? 'fa-check-circle' : 'fa-times-circle';
-                        const color = ok ? '#10b981' : '#ef4444';
-                        const ts = h.timestamp ? new Date(typeof h.timestamp === 'number' && h.timestamp < 1e12 ? h.timestamp * 1000 : h.timestamp).toLocaleString(getLocale()) : '';
-                        return `<div class="dr-hist-item">
-                            <i class="fas ${icon} dr-hist-icon" style="color:${color}"></i>
-                            <div class="dr-hist-meta"><div style="font-weight:500;color:var(--text-primary)">${escHtml(h.operation || h.type || '?')} — ${escHtml(h.disk || h.partition || '')}</div><div style="font-size:11px;color:var(--text-muted)">${escHtml(h.message || h.detail || '')}</div></div>
-                            <div class="dr-hist-time">${ts}</div>
-                        </div>`;
-                    }).join('')}
-                </div>`;
-            } catch (e) { cEl.innerHTML = `<div class="dr-warning"><i class="fas fa-times-circle"></i> ${t('Błąd:')} ${escHtml(e.message)}</div>`; }
-        }
-
-        /* ─── Polling / Banner ─── */
-        async function cancelOperation() {
-            try { await api('/diskrepair/cancel', { method: 'POST' }); toast('Operacja anulowana', 'warning'); } catch (e) { toast(t('Błąd anulowania: ') + e.message, 'error'); }
-        }
-
-        function startPolling() { stopPolling(); state.pollTimer = setInterval(pollStatus, 2000); pollStatus(); }
-        function stopPolling() { if (state.pollTimer) { clearInterval(state.pollTimer); state.pollTimer = null; } }
-
-        async function pollStatus() {
-            try {
-                const st = await api(`/diskrepair/status?since=${state.logOffset}`);
-                state.operation = st;
-                const banner = $('#dr-banner'), bannerTitle = $('#dr-banner-title'), bannerBar = $('#dr-banner-bar'), bannerDetail = $('#dr-banner-detail'), bannerCancel = $('#dr-banner-cancel');
-                if (st.status === 'running' || st.status === 'starting') {
-                    banner.classList.add('active');
-                    bannerTitle.textContent = `${st.operation || 'Operacja'} — ${st.disk || st.partition || ''}`;
-                    bannerBar.style.width = (st.percent || 0) + '%';
-                    let detail = st.message || ''; if (st.percent != null) detail = st.percent + '% ' + detail;
-                    bannerDetail.textContent = detail;
-                    bannerCancel.style.display = '';
-                    updateTabProgress(st);
-                    for (const line of (st.logs || [])) appendLog(line);
-                    state.logOffset = st.log_total || state.logOffset;
-                    disableStartButtons(true);
-                } else if (st.status === 'done' || st.status === 'error') {
-                    for (const line of (st.logs || [])) appendLog(line);
-                    state.logOffset = st.log_total || state.logOffset;
-                    const ok = st.status === 'done' || (st.result && st.result === 'success');
-                    banner.classList.add('active');
-                    bannerTitle.textContent = ok ? t('Operacja zakończona pomyślnie') : t('Operacja zakończona z błędem');
-                    bannerBar.style.width = ok ? '100%' : '0%';
-                    bannerDetail.textContent = st.message || '';
-                    bannerCancel.style.display = 'none';
-                    toast(ok ? t('Operacja zakończona') : t('Operacja nie powiodła się'), ok ? 'success' : 'error');
-                    stopPolling(); disableStartButtons(false);
-                    try { await api('/diskrepair/dismiss', { method: 'POST' }); } catch (_) {}
-                    state.operation = null;
-                    setTimeout(() => { banner.classList.remove('active'); loadDisks(); }, 5000);
-                } else {
-                    banner.classList.remove('active'); stopPolling(); disableStartButtons(false); state.operation = null;
-                }
-            } catch (e) { /* keep polling on transient errors */ }
-        }
-
-        function updateTabProgress(st) {
-            const bar = el.querySelector('#dr-check-bar') || el.querySelector('#dr-repair-bar');
-            const pct = el.querySelector('#dr-check-pct') || el.querySelector('#dr-repair-pct');
-            const progressWrap = el.querySelector('#dr-check-progress') || el.querySelector('#dr-repair-progress');
-            if (progressWrap) progressWrap.style.display = '';
-            if (bar) bar.style.width = (st.percent || 0) + '%';
-            if (pct) pct.textContent = (st.percent || 0) + '%';
-        }
-
-        function appendLog(line) {
-            el.querySelectorAll('.dr-log').forEach(logEl => {
-                const cls = /error|fail/i.test(line) ? 'error' : /success|pass|ok/i.test(line) ? 'success' : '';
-                logEl.innerHTML += `<div class="dr-log-line ${cls}">${escHtml(line)}</div>`;
-                logEl.scrollTop = logEl.scrollHeight;
-            });
-        }
-
-        function disableStartButtons(disabled) {
-            el.querySelectorAll('#dr-check-start, #dr-bb-start, #dr-repair-start, #dr-smart-short, #dr-smart-long').forEach(btn => { btn.disabled = disabled; });
-            el.querySelectorAll('.dr-part-check').forEach(btn => { btn.disabled = disabled; });
-        }
-
-        /* ─── Init ─── */
-        $('#dr-banner-cancel').onclick = cancelOperation;
-        $('#dr-refresh-disks').onclick = async () => { await loadDisks(); renderTab(); toast(t('Odświeżono'), 'info'); };
-
-        async function checkRunningOp() {
-            try {
-                const st = await api('/diskrepair/status?since=0');
-                if (st.status === 'running' || st.status === 'starting') { state.operation = st; state.logOffset = st.log_total || 0; startPolling(); }
-            } catch (_) {}
-        }
-
-        loadDisks();
-        checkRunningOp();
-
-        return () => { stopPolling(); };
-    }
-
-    // ─── Section: SSD Cache ─────────────────────────────
-    function renderCacheSection(el) {
-        el.innerHTML = `<div style="padding:20px">
-            <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px">
-                <h3 style="margin:0;font-size:16px;font-weight:600;color:var(--text-primary)"><i class="fas fa-bolt" style="color:var(--accent);margin-right:6px"></i>SSD Cache</h3>
-                <button class="fm-toolbar-btn btn-sm" id="sc-refresh"><i class="fas fa-sync-alt"></i> ${t('Odśwież')}</button>
-            </div>
-            <div id="sc-content"><div class="sto-center-lg"><i class="fas fa-spinner fa-spin sto-spinner"></i></div></div>
-        </div>`;
-
-        const contentEl = el.querySelector('#sc-content');
-        el.querySelector('#sc-refresh').onclick = loadCache;
-
-        async function loadCache() {
-            contentEl.innerHTML = `<div class="sto-center-lg"><i class="fas fa-spinner fa-spin sto-spinner"></i></div>`;
-            try {
-                const data = await api('/storage/cache/status');
-                const caches = data.caches || [];
-                const devices = data.devices || [];
-
-                let html = '';
-
-                if (caches.length) {
-                    html += `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-bolt"></i> ${t('Aktywne cache')}</div>`;
-                    for (const c of caches) {
-                        html += `<div style="margin-bottom:12px;padding:12px;background:var(--bg-primary);border-radius:8px">
-                            <div style="font-weight:600;margin-bottom:6px">${c.ssd || '?'} → ${c.hdd || '?'} <span style="font-size:11px;color:var(--text-muted)">(${c.mode || 'writeback'})</span></div>
-                            <div style="font-size:12px;color:var(--text-muted);margin-bottom:8px">
-                                ${c.size ? t('Rozmiar') + ': ' + c.size : ''} ${c.used ? '· ' + t('Użyte') + ': ' + c.used : ''} ${c.hit_rate ? '· Hit rate: ' + c.hit_rate : ''}
-                            </div>
-                            <div style="display:flex;gap:8px">
-                                <select class="fm-input" id="sc-mode-${c.id || 0}" style="width:140px">
-                                    <option value="writeback" ${c.mode === 'writeback' ? 'selected' : ''}>Writeback</option>
-                                    <option value="writethrough" ${c.mode === 'writethrough' ? 'selected' : ''}>Writethrough</option>
-                                    <option value="writearound" ${c.mode === 'writearound' ? 'selected' : ''}>Writearound</option>
-                                </select>
-                                <button class="fm-toolbar-btn btn-sm sc-set-mode" data-cache-id="${c.id || 0}"><i class="fas fa-check"></i> ${t('Zmień tryb')}</button>
-                                <button class="fm-toolbar-btn btn-sm btn-red sc-detach" data-cache-id="${c.id || 0}" data-ssd="${c.ssd}" data-hdd="${c.hdd}"><i class="fas fa-unlink"></i> ${t('Odłącz')}</button>
-                            </div>
-                        </div>`;
-                    }
-                    html += '</div>';
-                } else {
-                    html += `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-bolt"></i> ${t('Aktywne cache')}</div><div class="dr-nodata">${t('Brak aktywnych cache SSD')}</div></div>`;
-                }
-
-                // Create form
-                const ssds = devices.filter(d => d.type === 'ssd' || d.rotational === false);
-                const hdds = devices.filter(d => d.type === 'hdd' || d.rotational === true);
-                html += `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-plus-circle"></i> ${t('Utwórz nowy cache')}</div>`;
-                if (ssds.length && hdds.length) {
-                    html += `<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
-                        <div><label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px">SSD (cache)</label>
-                            <select class="fm-input" id="sc-ssd" style="width:200px">
-                                ${ssds.map(d => `<option value="${d.device || d.name}">${d.name} (${d.size || '?'})</option>`).join('')}
-                            </select>
+            /* Active caches */
+            if (configured.length) {
+                html += '<div style="background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:10px;padding:16px;margin-bottom:16px">';
+                html += '<h4 style="margin:0 0 12px;font-size:14px;font-weight:600"><i class="fas fa-bolt" style="color:var(--accent);margin-right:6px"></i>' + t('Aktywne cache') + '</h4>';
+                for (const c of configured) {
+                    const backing = live.flatMap(l => l.backing_devices || []).find(b => b.device === c.backing_device);
+                    const hitRate = backing ? (backing.hit_ratio !== null ? backing.hit_ratio + '%' : '—') : '—';
+                    const dirty = backing ? (backing.dirty_data || '0') : '0';
+                    html += `<div style="display:flex;align-items:center;gap:12px;padding:10px;border:1px solid var(--border-color);border-radius:8px;margin-bottom:6px;flex-wrap:wrap">
+                        <div style="flex:1;min-width:200px">
+                            <b>${c.cache_device || '?'}</b> <span style="color:var(--text-secondary)">→</span> <b>${c.backing_device || '?'}</b>
+                            <span style="margin-left:8px;font-size:12px;color:var(--text-secondary)">${c.mode || '?'}</span>
+                            <span style="margin-left:12px;font-size:12px">${t('Trafienia')}: ${hitRate} | ${t('Brudne dane')}: ${dirty}</span>
                         </div>
-                        <div><label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px">HDD (backing)</label>
-                            <select class="fm-input" id="sc-hdd" style="width:200px">
-                                ${hdds.map(d => `<option value="${d.device || d.name}">${d.name} (${d.size || '?'})</option>`).join('')}
-                            </select>
-                        </div>
-                        <div><label style="font-size:12px;color:var(--text-muted);display:block;margin-bottom:4px">${t('Tryb')}</label>
-                            <select class="fm-input" id="sc-mode" style="width:140px">
-                                <option value="writeback">Writeback</option>
-                                <option value="writethrough">Writethrough</option>
-                                <option value="writearound">Writearound</option>
-                            </select>
-                        </div>
-                    </div>
-                    <button class="fm-toolbar-btn btn-green" id="sc-create"><i class="fas fa-plus"></i> ${t('Utwórz cache')}</button>`;
-                } else {
-                    html += `<div class="dr-nodata">${t('Potrzebujesz co najmniej jednego SSD i jednego HDD aby utworzyć cache.')}</div>`;
-                }
-                html += '</div>';
-
-                // Devices info
-                if (devices.length) {
-                    html += `<div class="dr-card"><div class="dr-card-title"><i class="fas fa-hdd"></i> ${t('Dostępne urządzenia')}</div>
-                        <table class="dr-table"><thead><tr><th>${t('Urządzenie')}</th><th>${t('Typ')}</th><th>${t('Rozmiar')}</th><th>Model</th></tr></thead>
-                        <tbody>${devices.map(d => `<tr><td>/dev/${d.name}</td><td>${d.rotational === false ? 'SSD' : 'HDD'}</td><td>${d.size || '—'}</td><td>${d.model || '—'}</td></tr>`).join('')}</tbody></table>
+                        <select class="modal-input sc-mode-sel" data-backing="${c.backing_device}" style="width:140px">
+                            ${['writethrough','writeback','writearound'].map(m =>
+                                `<option value="${m}" ${m === c.mode ? 'selected' : ''}>${m}</option>`
+                            ).join('')}
+                        </select>
+                        <button class="fm-toolbar-btn btn-sm btn-red sc-detach" data-backing="${c.backing_device}"><i class="fas fa-unlink"></i> ${t('Odłącz')}</button>
                     </div>`;
                 }
-
-                contentEl.innerHTML = html;
-
-                // Bind events
-                contentEl.querySelectorAll('.sc-set-mode').forEach(btn => {
-                    btn.onclick = async () => {
-                        const id = btn.dataset.cacheId;
-                        const mode = el.querySelector(`#sc-mode-${id}`).value;
-                        try { await api('/storage/cache/mode', { method: 'POST', body: { cache_id: id, mode } }); toast(t('Tryb zmieniony'), 'success'); loadCache(); } catch (e) { toast(e.message, 'error'); }
-                    };
-                });
-
-                contentEl.querySelectorAll('.sc-detach').forEach(btn => {
-                    btn.onclick = async () => {
-                        if (!await confirmDialog(t('Odłączyć cache?'), t('SSD cache zostanie usunięty. Dane na HDD pozostaną nienaruszone.'))) return;
-                        try { await api('/storage/cache/detach', { method: 'POST', body: { cache_id: btn.dataset.cacheId } }); toast(t('Cache odłączony'), 'success'); loadCache(); } catch (e) { toast(e.message, 'error'); }
-                    };
-                });
-
-                const createBtn = contentEl.querySelector('#sc-create');
-                if (createBtn) {
-                    createBtn.onclick = async () => {
-                        const ssd = el.querySelector('#sc-ssd')?.value;
-                        const hdd = el.querySelector('#sc-hdd')?.value;
-                        const mode = el.querySelector('#sc-mode')?.value || 'writeback';
-                        if (!ssd || !hdd) { toast(t('Wybierz SSD i HDD'), 'warning'); return; }
-                        if (!await confirmDialog(t('Utworzyć SSD cache?'), `SSD: ${ssd}\nHDD: ${hdd}\n${t('Tryb')}: ${mode}\n\n${t('Dane na SSD zostaną usunięte!')}`)) return;
-                        createBtn.disabled = true; createBtn.innerHTML = `<i class="fas fa-spinner fa-spin"></i> ${t('Tworzenie...')}`;
-                        try { await api('/storage/cache/create', { method: 'POST', body: { ssd, hdd, mode } }); toast(t('Cache utworzony!'), 'success'); loadCache(); } catch (e) { toast(t('Błąd: ') + e.message, 'error'); createBtn.disabled = false; createBtn.innerHTML = `<i class="fas fa-plus"></i> ${t('Utwórz cache')}`; }
-                    };
-                }
-            } catch (e) {
-                contentEl.innerHTML = `<div class="dr-warning"><i class="fas fa-times-circle"></i> ${t('Błąd:')} ${e.message}</div>`;
+                html += '</div>';
             }
+
+            /* Create new cache */
+            const hasDevices = ssds.length > 0 && hdds.length > 0;
+            if (hasDevices) {
+                const ssdOpts = ssds.map(s => `<option value="${s.device}">${s.name} — ${s.size} ${s.model || ''}</option>`).join('');
+                const hddOpts = hdds.map(h => `<option value="${h.device}">${h.name} — ${h.size} ${h.model || ''}</option>`).join('');
+                html += '<div style="background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:10px;padding:16px">';
+                html += '<h4 style="margin:0 0 12px;font-size:14px;font-weight:600"><i class="fas fa-plus-circle" style="color:#2ecc71;margin-right:6px"></i>' + t('Nowy cache') + '</h4>';
+                html += `<div style="display:flex;gap:12px;align-items:end;flex-wrap:wrap">
+                    <div><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">${t('Dysk SSD (cache)')}</label>
+                    <select id="sc-ssd" class="modal-input" style="min-width:160px">${ssdOpts}</select></div>
+                    <div><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">${t('Dysk HDD (backing)')}</label>
+                    <select id="sc-hdd" class="modal-input" style="min-width:160px">${hddOpts}</select></div>
+                    <div><label style="display:block;font-size:12px;color:var(--text-secondary);margin-bottom:4px">${t('Tryb')}</label>
+                    <select id="sc-mode" class="modal-input"><option value="writethrough">${t('Write-through (bezpieczny)')}</option><option value="writeback">${t('Write-back (szybszy)')}</option><option value="writearound">${t('Write-around')}</option></select></div>
+                    <button class="fm-toolbar-btn" id="sc-create"><i class="fas fa-plus"></i> ${t('Utwórz')}</button>
+                </div>`;
+                html += `<div style="margin-top:10px;padding:8px;background:rgba(239,68,68,.08);border-radius:6px;font-size:12px;color:#e74c3c"><i class="fas fa-exclamation-triangle"></i> <b>${t('UWAGA:')}</b> ${t('Dane na obu dyskach zostaną usunięte!')}</div>`;
+                html += '</div>';
+            } else if (!configured.length) {
+                html = '<div style="text-align:center;padding:40px;color:var(--text-secondary)"><i class="fas fa-info-circle" style="font-size:24px;margin-bottom:8px"></i><div>' + t('Brak dostępnych dysków SSD lub HDD do konfiguracji cache.') + '</div></div>';
+            }
+
+            contentEl.innerHTML = html;
+
+            /* Bind event handlers */
+            setTimeout(() => {
+                el.querySelectorAll('.sc-detach').forEach(btn => {
+                    btn.onclick = async () => {
+                        const backing = btn.dataset.backing;
+                        if (!await confirmDialog(t('Odłączyć SSD cache od') + ' ' + backing + '?')) return;
+                        const r = await api('/cache/detach', { method: 'POST', body: { backing_device: backing } });
+                        if (r.error) { toast(r.error, 'error'); return; }
+                        toast(t('Cache odłączony'), 'success'); loadCache();
+                    };
+                });
+                el.querySelectorAll('.sc-mode-sel').forEach(sel => {
+                    sel.onchange = async () => {
+                        const r = await api('/cache/mode', { method: 'PUT', body: { backing_device: sel.dataset.backing, mode: sel.value } });
+                        if (r.error) { toast(r.error, 'error'); return; }
+                        toast(t('Tryb zmieniony: ') + sel.value, 'success');
+                    };
+                });
+                const createBtn = el.querySelector('#sc-create');
+                if (createBtn) createBtn.onclick = async () => {
+                    const ssd = el.querySelector('#sc-ssd')?.value;
+                    const hdd = el.querySelector('#sc-hdd')?.value;
+                    const mode = el.querySelector('#sc-mode')?.value;
+                    if (!ssd || !hdd) { toast(t('Wybierz oba dyski'), 'warning'); return; }
+                    if (ssd === hdd) { toast(t('SSD i HDD muszą być różnymi dyskami'), 'warning'); return; }
+                    if (!await confirmDialog(t('Utworzyć SSD cache? Dane na obu dyskach zostaną usunięte!'))) return;
+                    const r = await api('/cache/create', { method: 'POST', body: { cache_device: ssd, backing_device: hdd, mode } });
+                    if (r.error) { toast(r.error, 'error'); return; }
+                    toast(t('SSD Cache utworzony!'), 'success'); loadCache();
+                };
+            }, 50);
+        } catch (e) {
+            contentEl.innerHTML = '<div style="color:#e74c3c;padding:20px"><i class="fas fa-exclamation-triangle"></i> ' + (e.message || t('Błąd ładowania')) + '</div>';
         }
-
-        loadCache();
-        return null;
     }
-
-} /* end renderStorageManager */
+    loadCache();
+    return null;
+}
