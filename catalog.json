@@ -71,7 +71,7 @@
         {
             "id": "gallery",
             "name": "Gallery",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-images",
             "color": "#ec4899",
             "category": "Media",
@@ -603,7 +603,7 @@
         {
             "id": "photos-ai",
             "name": "Photos AI",
-            "version": "0.0.3",
+            "version": "0.0.4",
             "icon": "fa-brain",
             "color": "#8b5cf6",
             "category": "Media",
@@ -620,7 +620,8 @@
             ],
             "install_endpoint": "/api/photos-ai/install",
             "uninstall_endpoint": "/api/photos-ai/uninstall",
-            "status_endpoint": "/api/photos-ai/pkg-status"
+            "status_endpoint": "/api/photos-ai/pkg-status",
+            "hidden": true
         },
         {
             "id": "security-advisor",
@@ -636,6 +637,23 @@
             "simple": true,
             "core": true,
             "status_endpoint": "/api/security-advisor/pkg-status"
+        },
+        {
+            "id": "video-station",
+            "name": "Video Station",
+            "version": "0.0.1",
+            "icon": "fa-film",
+            "color": "#7c3aed",
+            "category": "Media",
+            "admin_only": false,
+            "description": "Biblioteka filmow z miniaturkami, streamingiem i sledzeniem postepu.",
+            "apt_deps": [
+                "ffmpeg"
+            ],
+            "pip_deps": [],
+            "install_endpoint": "/api/video-station/install",
+            "uninstall_endpoint": "/api/video-station/uninstall",
+            "status_endpoint": "/api/video-station/pkg-status"
         }
     ]
 }

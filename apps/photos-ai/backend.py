@@ -301,25 +301,38 @@ def _exif_tags(path, conn):
                     'INSERT INTO tags (photo_path,tag,tag_pl,confidence,source) VALUES (?,?,?,?,?)',
                     (path, 'camera:' + cam, 'aparat:' + cam, 1.0, 'exif'))
 
-def _process_image(path, conn, yolo):
-    ff = tf = 0
+def _detect_faces_and_objects(path, yolo):
+    """CPU-heavy ML work — runs in threadpool to avoid blocking gevent event loop."""
+    faces = []
+    tags = []
     try:
-        for f in _detect_faces(path):
-            conn.execute(
-                'INSERT INTO faces (photo_path,x,y,w,h,embedding) VALUES (?,?,?,?,?,?)',
-                (path, f['x'], f['y'], f['w'], f['h'], _emb2blob(f['embedding'])))
-            ff += 1
+        faces = _detect_faces(path)
     except Exception as e:
         log.debug('Face fail %s: %s', path, e)
     if yolo:
         try:
-            for obj in _detect_objects(yolo, path):
-                conn.execute(
-                    'INSERT INTO tags (photo_path,tag,tag_pl,confidence,source) VALUES (?,?,?,?,?)',
-                    (path, obj['tag'], obj['tag_pl'], obj['confidence'], 'yolo'))
-                tf += 1
+            tags = _detect_objects(yolo, path)
         except Exception as e:
             log.debug('YOLO fail %s: %s', path, e)
+    return faces, tags
+
+
+def _process_image(path, conn, yolo):
+    from gevent.threadpool import ThreadPool
+    if not hasattr(_process_image, '_pool'):
+        _process_image._pool = ThreadPool(1)
+    ff = tf = 0
+    faces, tags = _process_image._pool.apply(_detect_faces_and_objects, (path, yolo))
+    for f in faces:
+        conn.execute(
+            'INSERT INTO faces (photo_path,x,y,w,h,embedding) VALUES (?,?,?,?,?,?)',
+            (path, f['x'], f['y'], f['w'], f['h'], _emb2blob(f['embedding'])))
+        ff += 1
+    for obj in tags:
+        conn.execute(
+            'INSERT INTO tags (photo_path,tag,tag_pl,confidence,source) VALUES (?,?,?,?,?)',
+            (path, obj['tag'], obj['tag_pl'], obj['confidence'], 'yolo'))
+        tf += 1
     try:
         _exif_tags(path, conn)
     except Exception:
@@ -409,10 +422,15 @@ def _scan_worker(folders):
     import gevent
     t0 = time.time()
     imgs = _collect_images(folders)
+    total_all = len(imgs)
     conn = _get_db()
     todo = [p for p in imgs if _needs_scan(conn, p)]
-    _scan_state.update(total=len(todo), processed=0, faces_found=0, tags_found=0, started_at=t0)
-    _persist_scan_state({'folders': folders, 'total': len(todo), 'processed': 0,
+    already_done = total_all - len(todo)
+    _scan_state.update(total=total_all, processed=already_done,
+                       faces_found=0, tags_found=0, started_at=t0,
+                       already_scanned=already_done)
+    _persist_scan_state({'folders': folders, 'total': total_all,
+                         'processed': already_done,
                          'faces_found': 0, 'tags_found': 0, 'started_at': t0})
     _emit_progress()
     if not todo:
@@ -426,6 +444,9 @@ def _scan_worker(folders):
                 'duration': 0, 'message': 'Brak nowych zdjec do skanowania.'})
         conn.close()
         return
+    if already_done:
+        log.info('Scan: skipping %d already-scanned, %d remaining of %d total',
+                 already_done, len(todo), total_all)
     yolo = None
     if os.path.isfile(_YOLO_MODEL):
         try:
@@ -436,17 +457,18 @@ def _scan_worker(folders):
         if _scan_state.get('stop_requested'):
             break
         _scan_state['current_file'] = path
-        gevent.sleep(0)
+        gevent.sleep(0.3)  # throttle: yield CPU between images so server stays responsive
         ff, tf = _process_image(path, conn, yolo)
-        _scan_state['processed'] = i + 1
+        _scan_state['processed'] = already_done + i + 1
         _scan_state['faces_found'] += ff
         _scan_state['tags_found'] += tf
         if (i + 1) % 5 == 0 or i == 0:
             _emit_progress()
-            _persist_scan_state({'folders': folders, 'total': len(todo),
-                                 'processed': i + 1, 'faces_found': _scan_state['faces_found'],
+            _persist_scan_state({'folders': folders, 'total': total_all,
+                                 'processed': already_done + i + 1,
+                                 'faces_found': _scan_state['faces_found'],
                                  'tags_found': _scan_state['tags_found'], 'started_at': t0})
-            gevent.sleep(0)
+            gevent.sleep(0.1)
     np_ = 0
     try:
         np_ = _run_clustering(conn)
@@ -595,17 +617,6 @@ def list_people():
         })
     conn.close()
     return jsonify({'people': result})
-
-@photos_ai_bp.route('/people/<int:pid>/name', methods=['POST'])
-def rename_person(pid):
-    name = (request.json or {}).get('name', '').strip()
-    if not name:
-        return jsonify({'error': 'Podaj imie.'}), 400
-    conn = _get_db()
-    conn.execute('UPDATE people SET name=? WHERE id=?', (name, pid))
-    conn.commit()
-    conn.close()
-    return jsonify({'ok': True})
 
 @photos_ai_bp.route('/people/merge', methods=['POST'])
 @admin_required
