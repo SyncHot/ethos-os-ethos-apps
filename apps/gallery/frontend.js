@@ -82,6 +82,9 @@ async function renderGallery(body, launchOpts) {
           <div class="gal-nav-item" data-view="map">
             <i class="fa-solid fa-map-location-dot"></i> ${t('Mapa')}
           </div>
+          <div class="gal-nav-item" data-view="people">
+            <i class="fa-solid fa-users"></i> ${t('Osoby')}
+          </div>
         </div>
         <div class="gal-sidebar-section">
           <div class="gal-sidebar-title">${t('Typ')}</div>
@@ -102,6 +105,16 @@ async function renderGallery(body, launchOpts) {
             <button class="gal-add-album-btn" title="${t('Nowy album')}"><i class="fa-solid fa-plus"></i></button>
           </div>
           <div class="gal-custom-albums-list"></div>
+        </div>
+        <div class="gal-sidebar-section gal-ai-section">
+          <div class="gal-sidebar-title"><i class="fa-solid fa-brain"></i> ${t('AI')}</div>
+          <button class="btn btn-sm gal-ai-scan-btn" style="width:100%">
+            <i class="fa-solid fa-satellite-dish"></i> ${t('Skanuj twarze')}
+          </button>
+          <div class="gal-ai-progress" style="display:none">
+            <div class="gal-ai-progress-bar"><div class="gal-ai-progress-fill"></div></div>
+            <div class="gal-ai-progress-text"></div>
+          </div>
         </div>
       </div>
       <div class="gal-main">
@@ -132,6 +145,7 @@ async function renderGallery(body, launchOpts) {
           <div class="gal-timeline-view" style="display:none"></div>
           <div class="gal-favorites-view" style="display:none"></div>
           <div class="gal-map-view" style="display:none"></div>
+          <div class="gal-people-view" style="display:none"></div>
           <div class="gal-empty" style="display:none">
             <i class="fa-solid fa-images"></i>
             <p>${t('Brak mediów')}</p>
@@ -210,6 +224,14 @@ async function renderGallery(body, launchOpts) {
       }
     }
   });
+
+  // AI scan button + socket progress
+  body.querySelector('.gal-ai-scan-btn').addEventListener('click', _galStartAiScan);
+  if (NAS.socket) {
+    NAS.socket.on('photos_ai_progress', _galOnAiProgress);
+    NAS.socket.on('photos_ai_done', _galOnAiDone);
+  }
+  _galCheckAiScanStatus();
 
   // Load sources then initial data
   await _galLoadSources();
@@ -359,20 +381,22 @@ async function _galShowFolderPicker() {
 /* ━━━━  VIEW SWITCHING  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 function _galSetView(view) {
   GAL.view = view;
-  GAL.subfolder = '';  // clear album filter when switching views
-  if (!GAL.monthFilter) GAL.monthFilter = '';  // preserve if set by timeline click
+  GAL.subfolder = '';
+  if (!GAL.monthFilter) GAL.monthFilter = '';
   GAL.root.querySelectorAll('.gal-nav-item').forEach(el => el.classList.toggle('active', el.dataset.view === view));
   GAL.root.querySelector('.gal-grid').style.display = view === 'grid' ? '' : 'none';
   GAL.root.querySelector('.gal-albums').style.display = view === 'albums' ? '' : 'none';
   GAL.root.querySelector('.gal-timeline-view').style.display = view === 'timeline' ? '' : 'none';
   GAL.root.querySelector('.gal-favorites-view').style.display = view === 'favorites' ? '' : 'none';
   GAL.root.querySelector('.gal-map-view').style.display = view === 'map' ? '' : 'none';
+  GAL.root.querySelector('.gal-people-view').style.display = view === 'people' ? '' : 'none';
 
   if (view === 'grid') _galReload();
   else if (view === 'albums') _galLoadAlbums();
   else if (view === 'timeline') _galLoadTimeline();
   else if (view === 'favorites') _galLoadFavorites();
   else if (view === 'map') _galLoadMap();
+  else if (view === 'people') _galLoadPeople();
 }
 
 function _galSetType(type) {
@@ -675,6 +699,294 @@ async function _galUpdateFavBtn() {
   } catch(e) {}
 }
 
+/* ━━━━  PEOPLE VIEW (AI)  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+async function _galLoadPeople() {
+  const container = GAL.root.querySelector('.gal-people-view');
+  container.innerHTML = '<div class="gal-spinner" style="margin:60px auto"></div>';
+  const d = await api('/photos-ai/people');
+  if (d.error) {
+    container.innerHTML = `<div class="gal-empty" style="display:flex">
+      <i class="fa-solid fa-brain"></i>
+      <p>${_esc(d.error)}</p>
+      <p class="gal-empty-hint">${t('Zainstaluj Photos AI lub uruchom skan AI z paska bocznego.')}</p>
+    </div>`;
+    return;
+  }
+  const people = d.people || [];
+  if (!people.length) {
+    container.innerHTML = `<div class="gal-empty" style="display:flex">
+      <i class="fa-solid fa-users"></i>
+      <p>${t('Brak rozpoznanych osób')}</p>
+      <p class="gal-empty-hint">${t('Kliknij "Skanuj twarze" w panelu AI, aby wykryć osoby na zdjęciach.')}</p>
+    </div>`;
+    return;
+  }
+  container.innerHTML = `<div class="gal-people-grid">${people.map(p => {
+    const thumbUrl = p.cover_face_id ? `/api/photos-ai/face-thumb/${p.cover_face_id}` : '';
+    const name = p.name || t('Osoba') + ' ' + p.id;
+    return `<div class="gal-person-card" data-pid="${p.id}">
+      <div class="gal-person-avatar">${thumbUrl
+        ? `<img src="${thumbUrl}" alt="">`
+        : `<i class="fa-solid fa-user"></i>`}</div>
+      <div class="gal-person-name">${_esc(name)}</div>
+      <div class="gal-person-count">${p.photo_count || 0} ${t('zdjęć')}</div>
+    </div>`;
+  }).join('')}</div>`;
+
+  container.querySelectorAll('.gal-person-card').forEach(card => {
+    card.addEventListener('click', () => _galPersonDetail(parseInt(card.dataset.pid), container));
+  });
+}
+
+async function _galPersonDetail(pid, container) {
+  container.innerHTML = '<div class="gal-spinner" style="margin:60px auto"></div>';
+
+  const [pData, photosData] = await Promise.all([
+    api('/photos-ai/people'),
+    api(`/photos-ai/people/${pid}/photos?limit=200`),
+  ]);
+  const person = (pData.people || []).find(p => p.id === pid);
+  if (!person) { _galLoadPeople(); return; }
+  const name = person.name || t('Osoba') + ' ' + pid;
+
+  // Get all face thumbnails for this person
+  const facesData = await api(`/photos-ai/people/${pid}/faces`);
+  const faces = facesData.faces || [];
+  const photos = photosData.items || photosData.photos || [];
+
+  container.innerHTML = `
+    <div class="gal-person-detail">
+      <div class="gal-person-header">
+        <button class="btn btn-sm gal-person-back"><i class="fa-solid fa-arrow-left"></i> ${t('Osoby')}</button>
+        <div class="gal-person-title">
+          <div class="gal-person-big-avatar">${person.cover_face_id
+            ? `<img src="/api/photos-ai/face-thumb/${person.cover_face_id}" alt="">`
+            : `<i class="fa-solid fa-user"></i>`}</div>
+          <div>
+            <h2 class="gal-person-edit-name" contenteditable="true" spellcheck="false" title="${t('Kliknij aby zmienić imię')}">${_esc(name)}</h2>
+            <span style="color:var(--text-secondary);font-size:13px">${faces.length} ${t('twarzy')} · ${photos.length} ${t('zdjęć')}</span>
+          </div>
+        </div>
+        <div class="gal-person-actions">
+          <button class="btn btn-sm gal-person-select-mode"><i class="fa-solid fa-check-double"></i> ${t('Zaznacz')}</button>
+          <button class="btn btn-sm btn-danger gal-person-delete" style="display:none"><i class="fa-solid fa-user-xmark"></i> ${t('Usuń zaznaczone')}</button>
+          <button class="btn btn-sm gal-person-move" style="display:none"><i class="fa-solid fa-people-arrows"></i> ${t('Przenieś do…')}</button>
+        </div>
+      </div>
+      <div class="gal-person-faces-section">
+        <h3 style="margin:0 0 10px;font-size:14px;color:var(--text-secondary)">
+          <i class="fa-solid fa-face-smile"></i> ${t('Twarze')}
+          <span style="font-weight:normal;font-size:12px;margin-left:6px">${t('Zaznacz błędnie przypisane twarze i usuń lub przenieś')}</span>
+        </h3>
+        <div class="gal-person-faces-grid">${faces.map(f => `
+          <div class="gal-pf-thumb" data-face-id="${f.id}">
+            <img src="/api/photos-ai/face-thumb/${f.id}" alt="">
+            <div class="gal-pf-check" style="display:none"><i class="fa-solid fa-check"></i></div>
+          </div>
+        `).join('')}</div>
+      </div>
+      <div class="gal-person-photos-section">
+        <h3 style="margin:16px 0 10px;font-size:14px;color:var(--text-secondary)">
+          <i class="fa-solid fa-images"></i> ${t('Zdjęcia')}
+        </h3>
+        <div class="gal-person-photos-grid">${photos.map((ph, i) => `
+          <div class="gal-card gal-person-photo" data-idx="${i}">
+            <div class="gal-card-img-wrap">
+              <img loading="lazy" src="/api/files/preview?path=${encodeURIComponent(ph.path)}&w=200&h=200" alt="">
+            </div>
+          </div>
+        `).join('')}</div>
+      </div>
+    </div>`;
+
+  // State for multi-select
+  let selectMode = false;
+  const selectedFaces = new Set();
+
+  // Back button
+  container.querySelector('.gal-person-back').addEventListener('click', () => _galLoadPeople());
+
+  // Rename on blur
+  const nameEl = container.querySelector('.gal-person-edit-name');
+  nameEl.addEventListener('blur', async () => {
+    const newName = nameEl.textContent.trim();
+    if (newName && newName !== name) {
+      await api(`/photos-ai/people/${pid}/rename`, { method: 'POST', body: { name: newName } });
+    }
+  });
+  nameEl.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); nameEl.blur(); } });
+
+  // Select mode toggle
+  const selectBtn = container.querySelector('.gal-person-select-mode');
+  const deleteBtn = container.querySelector('.gal-person-delete');
+  const moveBtn = container.querySelector('.gal-person-move');
+
+  selectBtn.addEventListener('click', () => {
+    selectMode = !selectMode;
+    selectedFaces.clear();
+    selectBtn.classList.toggle('btn-primary', selectMode);
+    container.querySelectorAll('.gal-pf-check').forEach(el => {
+      el.style.display = selectMode ? '' : 'none';
+      el.classList.remove('checked');
+    });
+    container.querySelectorAll('.gal-pf-thumb').forEach(el => el.classList.remove('selected'));
+    deleteBtn.style.display = 'none';
+    moveBtn.style.display = 'none';
+  });
+
+  // Face thumbnail click → select / open lightbox
+  container.querySelectorAll('.gal-pf-thumb').forEach(el => {
+    el.addEventListener('click', () => {
+      if (!selectMode) return;
+      const fid = parseInt(el.dataset.faceId);
+      if (selectedFaces.has(fid)) {
+        selectedFaces.delete(fid);
+        el.classList.remove('selected');
+        el.querySelector('.gal-pf-check').classList.remove('checked');
+      } else {
+        selectedFaces.add(fid);
+        el.classList.add('selected');
+        el.querySelector('.gal-pf-check').classList.add('checked');
+      }
+      const has = selectedFaces.size > 0;
+      deleteBtn.style.display = has ? '' : 'none';
+      moveBtn.style.display = has ? '' : 'none';
+    });
+  });
+
+  // Delete selected faces (unassign from person)
+  deleteBtn.addEventListener('click', async () => {
+    if (!selectedFaces.size) return;
+    confirmDialog(t('Usunąć {n} zaznaczonych twarzy z tej osoby?', { n: selectedFaces.size }), async () => {
+      for (const fid of selectedFaces) {
+        await api('/photos-ai/assign-face', { method: 'POST', body: { face_id: fid, unassign: true } });
+      }
+      toast(t('Usunięto {n} twarzy', { n: selectedFaces.size }), 'success');
+      _galPersonDetail(pid, container);
+    });
+  });
+
+  // Move selected faces to another person
+  moveBtn.addEventListener('click', async () => {
+    if (!selectedFaces.size) return;
+    const ppl = (pData.people || []).filter(p => p.id !== pid);
+    _galShowMoveModal(ppl, selectedFaces, pid, container);
+  });
+
+  // Photo grid → lightbox
+  const photoItems = photos.map(ph => ({ path: ph.path, name: ph.path.split('/').pop(), type: 'image' }));
+  container.querySelectorAll('.gal-person-photo').forEach(card => {
+    card.addEventListener('click', () => {
+      const idx = parseInt(card.dataset.idx);
+      GAL.lightboxItems = photoItems;
+      GAL.lightboxIdx = idx;
+      _galRenderLightbox();
+    });
+  });
+}
+
+function _galShowMoveModal(people, selectedFaces, currentPid, container) {
+  const modal = document.createElement('div');
+  modal.className = 'gal-face-modal';
+  modal.innerHTML = `
+    <div class="gal-face-modal-backdrop"></div>
+    <div class="gal-face-modal-content">
+      <h3><i class="fa-solid fa-people-arrows"></i> ${t('Przenieś {n} twarzy do…', { n: selectedFaces.size })}</h3>
+      <p class="gal-face-modal-hint">${t('Wybierz osobę lub utwórz nową:')}</p>
+      <div class="gal-face-matches" style="max-height:300px;overflow-y:auto">
+        ${people.map(p => `
+          <div class="gal-face-match" data-person-id="${p.id}">
+            ${p.cover_face_id
+              ? `<img src="/api/photos-ai/face-thumb/${p.cover_face_id}" alt="">`
+              : `<span style="width:40px;height:40px;display:flex;align-items:center;justify-content:center;background:var(--bg-tertiary);border-radius:50%"><i class="fa-solid fa-user"></i></span>`}
+            <div>
+              <div class="gal-face-match-name">${_esc(p.name || t('Osoba') + ' ' + p.id)}</div>
+              <div class="gal-face-match-conf">${p.photo_count || 0} ${t('zdjęć')}</div>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+      <div class="gal-face-new-name">
+        <input type="text" class="gal-face-name-input" placeholder="${t('Lub nowe imię…')}">
+        <button class="btn btn-sm btn-primary gal-face-save-btn">${t('Utwórz')}</button>
+      </div>
+      <button class="btn btn-sm gal-face-modal-close">${t('Anuluj')}</button>
+    </div>`;
+  document.body.appendChild(modal);
+
+  const doMove = async (targetPid, newName) => {
+    modal.remove();
+    for (const fid of selectedFaces) {
+      const body = newName ? { face_id: fid, new_name: newName } : { face_id: fid, person_id: targetPid };
+      await api('/photos-ai/assign-face', { method: 'POST', body });
+    }
+    toast(t('Przeniesiono {n} twarzy', { n: selectedFaces.size }), 'success');
+    _galPersonDetail(currentPid, container);
+  };
+
+  modal.querySelectorAll('.gal-face-match').forEach(el => {
+    el.addEventListener('click', () => doMove(parseInt(el.dataset.personId), null));
+  });
+  modal.querySelector('.gal-face-save-btn').addEventListener('click', () => {
+    const name = modal.querySelector('.gal-face-name-input').value.trim();
+    if (name) doMove(null, name);
+  });
+  modal.querySelector('.gal-face-modal-close').addEventListener('click', () => modal.remove());
+  modal.querySelector('.gal-face-modal-backdrop').addEventListener('click', () => modal.remove());
+}
+
+/* ━━━━  AI SCAN CONTROLS  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+async function _galStartAiScan() {
+  const btn = GAL.root.querySelector('.gal-ai-scan-btn');
+  btn.disabled = true;
+  btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${t('Skanowanie…')}`;
+  const r = await api('/photos-ai/scan', { method: 'POST' });
+  if (r.error) {
+    toast(r.error, 'error');
+    btn.disabled = false;
+    btn.innerHTML = `<i class="fa-solid fa-satellite-dish"></i> ${t('Skanuj twarze')}`;
+    return;
+  }
+  const prog = GAL.root.querySelector('.gal-ai-progress');
+  if (prog) prog.style.display = 'block';
+}
+
+function _galOnAiProgress(data) {
+  const prog = GAL.root?.querySelector('.gal-ai-progress');
+  if (!prog) return;
+  prog.style.display = 'block';
+  const pct = data.total > 0 ? Math.round(data.processed / data.total * 100) : 0;
+  const fill = prog.querySelector('.gal-ai-progress-fill');
+  const txt = prog.querySelector('.gal-ai-progress-text');
+  if (fill) fill.style.width = pct + '%';
+  if (txt) txt.textContent = `${data.processed}/${data.total} · ${t('Twarzy')}: ${data.faces_found}`;
+}
+
+function _galOnAiDone(data) {
+  const btn = GAL.root?.querySelector('.gal-ai-scan-btn');
+  if (btn) {
+    btn.disabled = false;
+    btn.innerHTML = `<i class="fa-solid fa-satellite-dish"></i> ${t('Skanuj twarze')}`;
+  }
+  const prog = GAL.root?.querySelector('.gal-ai-progress');
+  if (prog) prog.style.display = 'none';
+  toast(`${t('Skan AI zakończony')}: ${data.total_processed} ${t('zdjęć')}, ${data.faces} ${t('twarzy')}, ${data.people} ${t('osób')}`, 'success');
+  if (GAL.view === 'people') _galLoadPeople();
+}
+
+async function _galCheckAiScanStatus() {
+  try {
+    const st = await api('/photos-ai/scan-status');
+    if (st.running) {
+      const btn = GAL.root?.querySelector('.gal-ai-scan-btn');
+      if (btn) { btn.disabled = true; btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin"></i> ${t('Skanowanie…')}`; }
+      _galOnAiProgress(st);
+    }
+  } catch(e) {}
+}
+
 /* ━━━━  LIGHTBOX  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 function _galOpenLightbox(idx) {
   GAL.lightboxIdx = idx;
@@ -706,6 +1018,7 @@ function _galRenderLightbox() {
         <span class="gal-lb-counter">${GAL.lightboxIdx + 1} / ${GAL.lightboxItems.length}</span>
       </div>
       <div class="gal-lb-actions">
+        <button class="gal-lb-btn gal-lb-faces-btn" title="${t('Twarze (AI)')}"><i class="fa-solid fa-face-smile"></i></button>
         <button class="gal-lb-btn gal-lb-info-btn" title="Informacje"><i class="fa-solid fa-circle-info"></i></button>
         <button class="gal-lb-btn gal-lb-fav-btn" title="Ulubione (F)"><i class="fa-regular fa-star"></i></button>
         <button class="gal-lb-btn gal-lb-show-fm-btn" title="${t('Pokaż w Menedżerze plików')}"><i class="fa-solid fa-folder-open"></i></button>
@@ -733,6 +1046,9 @@ function _galRenderLightbox() {
     <div class="gal-lb-exif" id="gal-lb-exif" style="display:none">
       <div class="gal-lb-exif-content"></div>
     </div>
+    <div class="gal-lb-faces-panel" id="gal-lb-faces-panel" style="display:none">
+      <div class="gal-lb-faces-content"></div>
+    </div>
   `;
 
   document.body.appendChild(lb);
@@ -755,6 +1071,9 @@ function _galRenderLightbox() {
 
   // Info panel
   lb.querySelector('.gal-lb-info-btn').addEventListener('click', () => _galToggleExif(item));
+
+  // Face detection panel
+  lb.querySelector('.gal-lb-faces-btn').addEventListener('click', () => _galToggleFaces(item));
 
   // Favorite button
   lb.querySelector('.gal-lb-fav-btn').addEventListener('click', () => _galToggleFavorite(item));
@@ -903,12 +1222,14 @@ function _galRenderLightbox() {
 function _galLightboxNav(dir) {
   const newIdx = GAL.lightboxIdx + dir;
   if (newIdx < 0 || newIdx >= GAL.lightboxItems.length) return;
+  _galClearFaceOverlay();
   GAL.lightboxIdx = newIdx;
   _galRenderLightbox();
 }
 
 function _galCloseLightbox() {
   _galStopSlideshow();
+  _galClearFaceOverlay();
   _galRemoveLightbox();
 }
 
@@ -964,6 +1285,248 @@ async function _galToggleExif(item) {
   } catch (err) {
     content.innerHTML = `<p style="color:#ef4444">${t('Nie udało się odczytać danych EXIF')}</p>`;
   }
+}
+
+/* ━━━━  FACE DETECTION OVERLAY  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+
+async function _galToggleFaces(item) {
+  const panel = document.getElementById('gal-lb-faces-panel');
+  const exifPanel = document.getElementById('gal-lb-exif');
+  if (!panel) return;
+
+  // Toggle off
+  if (panel.style.display !== 'none') {
+    panel.style.display = 'none';
+    _galClearFaceOverlay();
+    return;
+  }
+
+  // Close EXIF if open
+  if (exifPanel) exifPanel.style.display = 'none';
+  panel.style.display = 'flex';
+
+  const content = panel.querySelector('.gal-lb-faces-content');
+  content.innerHTML = '<div class="gal-spinner" style="margin:20px auto"></div>';
+
+  if (item.type !== 'image') {
+    content.innerHTML = `<p style="color:var(--text-secondary)">${t('Detekcja twarzy działa tylko na zdjęciach')}</p>`;
+    return;
+  }
+
+  try {
+    const data = await api('/photos-ai/photo-ai?path=' + encodeURIComponent(item.path));
+    const faces = data.faces || [];
+    const tags = data.tags || [];
+
+    // Draw bounding boxes on image
+    _galDrawFaceBoxes(faces);
+
+    // Build panel content
+    let html = `<h4><i class="fa-solid fa-face-smile"></i> ${t('Twarze')} (${faces.length})</h4>`;
+
+    if (!faces.length) {
+      html += `<p class="gal-faces-empty">${t('Nie wykryto twarzy na tym zdjęciu.')}</p>`;
+      if (!tags.length) html += `<p class="gal-faces-hint">${t('Uruchom skan w Photos AI, aby wykryć twarze.')}</p>`;
+    } else {
+      html += '<div class="gal-faces-list">';
+      for (const face of faces) {
+        const thumbUrl = '/api/photos-ai/face-thumb/' + face.id;
+        const name = face.person_name || t('Nieznana osoba');
+        html += `
+          <div class="gal-face-item" data-face-id="${face.id}" data-person-id="${face.person_id || ''}">
+            <img class="gal-face-thumb" src="${thumbUrl}" alt="">
+            <div class="gal-face-info">
+              <div class="gal-face-name">${_esc(name)}</div>
+              <button class="gal-face-identify-btn" data-face-id="${face.id}">
+                <i class="fa-solid fa-user-tag"></i> ${face.person_name ? t('Zmień') : t('Kto to?')}
+              </button>
+            </div>
+          </div>`;
+      }
+      html += '</div>';
+    }
+
+    // Tags section
+    if (tags.length) {
+      const yoloTags = tags.filter(t => t.source === 'yolo');
+      if (yoloTags.length) {
+        html += `<h4 style="margin-top:16px"><i class="fa-solid fa-tags"></i> ${t('Obiekty')}</h4>`;
+        html += '<div class="gal-faces-tags">';
+        for (const tag of yoloTags) {
+          html += `<span class="gal-face-tag">${_esc(tag.tag_pl || tag.tag)} <small>${Math.round(tag.confidence * 100)}%</small></span>`;
+        }
+        html += '</div>';
+      }
+    }
+
+    content.innerHTML = html;
+
+    // Wire "Who is this?" buttons
+    content.querySelectorAll('.gal-face-identify-btn').forEach(btn => {
+      btn.addEventListener('click', () => _galIdentifyFace(parseInt(btn.dataset.faceId), item));
+    });
+
+    // Wire face item hover → highlight box
+    content.querySelectorAll('.gal-face-item').forEach(el => {
+      el.addEventListener('mouseenter', () => {
+        const fid = el.dataset.faceId;
+        const box = document.querySelector('.gal-face-box[data-face-id="' + fid + '"]');
+        if (box) box.classList.add('gal-face-box-active');
+      });
+      el.addEventListener('mouseleave', () => {
+        document.querySelectorAll('.gal-face-box-active').forEach(b => b.classList.remove('gal-face-box-active'));
+      });
+    });
+  } catch (err) {
+    content.innerHTML = `<p style="color:#ef4444">${t('Błąd: ') + err.message}</p>`;
+  }
+}
+
+function _galDrawFaceBoxes(faces) {
+  _galClearFaceOverlay();
+  const img = document.querySelector('.gal-lb-img');
+  const media = document.getElementById('gal-lb-media');
+  if (!img || !media || !faces.length) return;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'gal-face-overlay';
+  overlay.style.cssText = `position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none;`;
+
+  // Calculate scale: image natural size vs displayed size
+  const rect = img.getBoundingClientRect();
+  const mediaRect = media.getBoundingClientRect();
+  const scaleX = rect.width / img.naturalWidth;
+  const scaleY = rect.height / img.naturalHeight;
+  const offsetX = rect.left - mediaRect.left;
+  const offsetY = rect.top - mediaRect.top;
+
+  for (const face of faces) {
+    const box = document.createElement('div');
+    box.className = 'gal-face-box';
+    box.dataset.faceId = face.id;
+    box.style.cssText = `
+      position:absolute; pointer-events:auto; cursor:pointer;
+      left:${offsetX + face.x * scaleX}px;
+      top:${offsetY + face.y * scaleY}px;
+      width:${face.w * scaleX}px;
+      height:${face.h * scaleY}px;
+    `;
+    // Name label
+    const label = document.createElement('span');
+    label.className = 'gal-face-label';
+    label.textContent = face.person_name || '?';
+    box.appendChild(label);
+
+    box.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const item = GAL.lightboxItems[GAL.lightboxIdx];
+      _galIdentifyFace(face.id, item);
+    });
+
+    overlay.appendChild(box);
+  }
+  media.style.position = 'relative';
+  media.appendChild(overlay);
+}
+
+async function _galRefreshFaces(item) {
+  const panel = document.getElementById('gal-lb-faces-panel');
+  if (!panel || panel.style.display === 'none') return;
+  panel.style.display = 'none';
+  _galClearFaceOverlay();
+  await _galToggleFaces(item);
+}
+
+function _galClearFaceOverlay() {
+  document.querySelectorAll('.gal-face-overlay').forEach(o => o.remove());
+}
+
+async function _galIdentifyFace(faceId, item) {
+  // Fetch matching people
+  const data = await api('/photos-ai/identify-face', {
+    method: 'POST', body: { face_id: faceId },
+  });
+  if (data.error) { toast(data.error, 'error'); return; }
+
+  const matches = data.matches || [];
+  const currentPid = data.current_person_id;
+
+  // Build a modal for selecting or naming the person
+  const modal = document.createElement('div');
+  modal.className = 'gal-face-modal';
+  modal.innerHTML = `
+    <div class="gal-face-modal-backdrop"></div>
+    <div class="gal-face-modal-content">
+      <h3><i class="fa-solid fa-user-tag"></i> ${t('Kto to jest?')}</h3>
+      <div class="gal-face-modal-thumb">
+        <img src="/api/photos-ai/face-thumb/${faceId}" alt="">
+      </div>
+      ${matches.length ? `
+        <p class="gal-face-modal-hint">${t('Wybierz osobę lub wpisz nowe imię:')}</p>
+        <div class="gal-face-matches">
+          ${matches.slice(0, 6).map(m => `
+            <div class="gal-face-match${m.person_id === currentPid ? ' gal-face-match-current' : ''}"
+                 data-person-id="${m.person_id}">
+              <img src="/api/photos-ai/face-thumb/${m.cover_face_id || 0}" alt=""
+                   onerror="this.replaceWith(document.createTextNode('👤'))">
+              <div>
+                <div class="gal-face-match-name">${_esc(m.name)}</div>
+                <div class="gal-face-match-conf">${m.confidence}% ${t('zgodności')} · ${m.photo_count} ${t('zdjęć')}</div>
+              </div>
+            </div>
+          `).join('')}
+        </div>
+      ` : `<p class="gal-face-modal-hint">${t('Brak dopasowań. Wpisz imię:')}</p>`}
+      <div class="gal-face-new-name">
+        <input type="text" class="gal-face-name-input" placeholder="${t('Nowe imię...')}" autofocus>
+        <button class="btn btn-sm btn-primary gal-face-save-btn">${t('Zapisz')}</button>
+      </div>
+      <button class="btn btn-sm gal-face-modal-close">${t('Anuluj')}</button>
+    </div>
+  `;
+
+  document.body.appendChild(modal);
+
+  // Wire match clicks
+  modal.querySelectorAll('.gal-face-match').forEach(el => {
+    el.addEventListener('click', async () => {
+      const pid = parseInt(el.dataset.personId);
+      const r = await api('/photos-ai/assign-face', {
+        method: 'POST', body: { face_id: faceId, person_id: pid },
+      });
+      if (r.ok) {
+        toast(t('Przypisano!'), 'success');
+        modal.remove();
+        _galRefreshFaces(item);
+      } else {
+        toast(r.error || t('Błąd'), 'error');
+      }
+    });
+  });
+
+  // Wire new name save
+  const saveBtn = modal.querySelector('.gal-face-save-btn');
+  const nameInput = modal.querySelector('.gal-face-name-input');
+  const doSave = async () => {
+    const name = nameInput.value.trim();
+    if (!name) { nameInput.focus(); return; }
+    const r = await api('/photos-ai/assign-face', {
+      method: 'POST', body: { face_id: faceId, new_name: name },
+    });
+    if (r.ok) {
+      toast(t('Zapisano: ') + name, 'success');
+      modal.remove();
+      _galRefreshFaces(item);
+    } else {
+      toast(r.error || t('Błąd'), 'error');
+    }
+  };
+  saveBtn.addEventListener('click', doSave);
+  nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') doSave(); });
+
+  // Wire close
+  modal.querySelector('.gal-face-modal-close').addEventListener('click', () => modal.remove());
+  modal.querySelector('.gal-face-modal-backdrop').addEventListener('click', () => modal.remove());
 }
 
 /* ━━━━  SLIDESHOW  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */

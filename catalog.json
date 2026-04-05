@@ -71,7 +71,7 @@
         {
             "id": "gallery",
             "name": "Gallery",
-            "version": "1.0.0",
+            "version": "1.0.1",
             "icon": "fa-images",
             "color": "#ec4899",
             "category": "Media",
@@ -603,7 +603,7 @@
         {
             "id": "photos-ai",
             "name": "Photos AI",
-            "version": "0.0.2",
+            "version": "0.0.3",
             "icon": "fa-brain",
             "color": "#8b5cf6",
             "category": "Media",

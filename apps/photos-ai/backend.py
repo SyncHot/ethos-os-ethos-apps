@@ -61,6 +61,42 @@ _scan_state = {'running':False,'stop_requested':False,'total':0,'processed':0,
                'faces_found':0,'tags_found':0,'current_file':'','started_at':0}
 
 
+def _persist_scan_state(state_dict):
+    """Save scan progress to DB so it survives restarts."""
+    try:
+        conn = _get_db()
+        conn.execute('INSERT OR REPLACE INTO scan_state (key, value) VALUES (?,?)',
+                     ('progress', json.dumps(state_dict)))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _clear_persisted_scan():
+    """Remove persisted scan state (scan finished or stopped)."""
+    try:
+        conn = _get_db()
+        conn.execute("DELETE FROM scan_state WHERE key='progress'")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _load_persisted_scan():
+    """Load interrupted scan state from DB. Returns dict or None."""
+    try:
+        conn = _get_db()
+        row = conn.execute("SELECT value FROM scan_state WHERE key='progress'").fetchone()
+        conn.close()
+        if row:
+            return json.loads(row['value'])
+    except Exception:
+        pass
+    return None
+
+
 def _get_db():
     conn = sqlite3.connect(_DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
@@ -95,6 +131,8 @@ def _init_db():
         CREATE INDEX IF NOT EXISTS idx_faces_person ON faces(person_id);
         CREATE INDEX IF NOT EXISTS idx_tags_photo ON tags(photo_path);
         CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
+        CREATE TABLE IF NOT EXISTS scan_state (
+            key TEXT PRIMARY KEY, value TEXT);
     """)
     conn.commit()
     conn.close()
@@ -103,6 +141,30 @@ try:
     _init_db()
 except Exception:
     pass
+
+
+def resume_interrupted_scan():
+    """Called on app startup to resume a scan that was interrupted by a restart.
+    Uses gevent.spawn_later to wait for full app init before starting."""
+    saved = _load_persisted_scan()
+    if not saved:
+        return
+    folders = saved.get('folders', [])
+    if not folders:
+        _clear_persisted_scan()
+        return
+    deps = _check_deps()
+    if not deps.get('ready'):
+        _clear_persisted_scan()
+        return
+    log.info('Resuming interrupted scan (%d processed before restart), folders: %s',
+             saved.get('processed', 0), folders)
+    with _scan_lock:
+        if _scan_state['running']:
+            return
+        _scan_state['running'] = True
+        _scan_state['stop_requested'] = False
+    _launch_scan(folders)
 
 
 def _safe_path(user_path):
@@ -350,9 +412,12 @@ def _scan_worker(folders):
     conn = _get_db()
     todo = [p for p in imgs if _needs_scan(conn, p)]
     _scan_state.update(total=len(todo), processed=0, faces_found=0, tags_found=0, started_at=t0)
+    _persist_scan_state({'folders': folders, 'total': len(todo), 'processed': 0,
+                         'faces_found': 0, 'tags_found': 0, 'started_at': t0})
     _emit_progress()
     if not todo:
         _scan_state['running'] = False
+        _clear_persisted_scan()
         _emit_progress()
         s = _sio()
         if s:
@@ -371,13 +436,16 @@ def _scan_worker(folders):
         if _scan_state.get('stop_requested'):
             break
         _scan_state['current_file'] = path
-        gevent.sleep(0)  # yield to event loop before CPU-heavy ML
+        gevent.sleep(0)
         ff, tf = _process_image(path, conn, yolo)
         _scan_state['processed'] = i + 1
         _scan_state['faces_found'] += ff
         _scan_state['tags_found'] += tf
-        if (i + 1) % 2 == 0 or i == 0:
+        if (i + 1) % 5 == 0 or i == 0:
             _emit_progress()
+            _persist_scan_state({'folders': folders, 'total': len(todo),
+                                 'processed': i + 1, 'faces_found': _scan_state['faces_found'],
+                                 'tags_found': _scan_state['tags_found'], 'started_at': t0})
             gevent.sleep(0)
     np_ = 0
     try:
@@ -387,6 +455,7 @@ def _scan_worker(folders):
     conn.close()
     dur = time.time() - t0
     _scan_state.update(running=False, stop_requested=False, current_file='')
+    _clear_persisted_scan()
     s = _sio()
     if s:
         s.emit('photos_ai_done', {
@@ -465,28 +534,35 @@ def uninstall_deps():
 @photos_ai_bp.route('/scan', methods=['POST'])
 @admin_required
 def start_scan():
-    if _scan_state['running']:
-        return jsonify({'error': 'Skanowanie juz trwa.'}), 409
-    deps = _check_deps()
-    if not deps['ready']:
-        return jsonify({'error': 'Zaleznosci nie zainstalowane.'}), 400
-    folders = _gallery_folders()
-    if not folders:
-        return jsonify({'error': 'Brak folderow zrodlowych w Galerii.'}), 400
-    _scan_state['running'] = True
-    _scan_state['stop_requested'] = False
+    with _scan_lock:
+        if _scan_state['running']:
+            return jsonify({'error': 'Skanowanie juz trwa.'}), 409
+        deps = _check_deps()
+        if not deps['ready']:
+            return jsonify({'error': 'Zaleznosci nie zainstalowane.'}), 400
+        folders = _gallery_folders()
+        if not folders:
+            return jsonify({'error': 'Brak folderow zrodlowych w Galerii.'}), 400
+        _scan_state['running'] = True
+        _scan_state['stop_requested'] = False
+    _launch_scan(folders)
+    return jsonify({'ok': True, 'message': 'Skanowanie AI rozpoczete.'})
+
+
+def _launch_scan(folders):
+    """Start scan worker in background (used by both manual scan and auto-resume)."""
     s = _sio()
     if s:
         s.start_background_task(_scan_worker, folders)
     else:
         import gevent
         gevent.spawn(_scan_worker, folders)
-    return jsonify({'ok': True, 'message': 'Skanowanie AI rozpoczete.'})
 
 @photos_ai_bp.route('/stop-scan', methods=['POST'])
 @admin_required
 def stop_scan():
     _scan_state['stop_requested'] = True
+    _clear_persisted_scan()
     return jsonify({'ok': True})
 
 @photos_ai_bp.route('/scan-status', methods=['GET'])
@@ -595,6 +671,28 @@ def person_photos(pid):
         })
     conn.close()
     return jsonify({'items': items, 'total': total})
+
+@photos_ai_bp.route('/people/<int:pid>/faces', methods=['GET'])
+def person_faces(pid):
+    """Return all face thumbnails for a given person (for false-positive management)."""
+    conn = _get_db()
+    rows = conn.execute(
+        'SELECT id, photo_path FROM faces WHERE person_id=? ORDER BY id', (pid,)
+    ).fetchall()
+    conn.close()
+    return jsonify({'faces': [{'id': r['id'], 'photo_path': r['photo_path']} for r in rows]})
+
+@photos_ai_bp.route('/people/<int:pid>/rename', methods=['POST'])
+def rename_person(pid):
+    d = request.json or {}
+    name = d.get('name', '').strip()
+    if not name:
+        return jsonify({'error': 'Podaj imię.'}), 400
+    conn = _get_db()
+    conn.execute('UPDATE people SET name=? WHERE id=?', (name, pid))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True})
 
 @photos_ai_bp.route('/face-thumb/<int:face_id>', methods=['GET'])
 def face_thumbnail(face_id):
@@ -800,3 +898,152 @@ def ai_stats():
     }
     conn.close()
     return jsonify(stats)
+
+
+# ─── Face identification & merge suggestions ────────────────────
+
+@photos_ai_bp.route('/identify-face', methods=['POST'])
+def identify_face():
+    """Given a face_id, find top matching people by embedding similarity."""
+    import numpy as np
+    d = request.json or {}
+    face_id = d.get('face_id')
+    if not face_id:
+        return jsonify({'error': 'Podaj face_id.'}), 400
+    conn = _get_db()
+    row = conn.execute('SELECT embedding, person_id FROM faces WHERE id=?', (face_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify({'error': 'Twarz nie znaleziona.'}), 404
+    target_emb = np.array(_blob2emb(row['embedding']))
+    people_rows = conn.execute(
+        'SELECT id, name, cover_face_id, photo_count FROM people WHERE hidden=0'
+    ).fetchall()
+    results = []
+    for p in people_rows:
+        face_rows = conn.execute(
+            'SELECT embedding FROM faces WHERE person_id=? LIMIT 30', (p['id'],)
+        ).fetchall()
+        if not face_rows:
+            continue
+        embs = np.array([_blob2emb(f['embedding']) for f in face_rows])
+        centroid = embs.mean(axis=0)
+        dist = float(np.linalg.norm(target_emb - centroid))
+        results.append({
+            'person_id': p['id'],
+            'name': p['name'] or f'Osoba {p["id"]}',
+            'cover_face_id': p['cover_face_id'],
+            'photo_count': p['photo_count'],
+            'distance': round(dist, 3),
+            'confidence': round(max(0, 1.0 - dist) * 100, 1),
+        })
+    conn.close()
+    results.sort(key=lambda x: x['distance'])
+    return jsonify({'matches': results[:10], 'current_person_id': row['person_id']})
+
+
+@photos_ai_bp.route('/assign-face', methods=['POST'])
+def assign_face():
+    """Assign a face to an existing person, create a new one, or unassign."""
+    d = request.json or {}
+    face_id = d.get('face_id')
+    person_id = d.get('person_id')
+    new_name = d.get('new_name', '').strip()
+    unassign = d.get('unassign', False)
+    if not face_id:
+        return jsonify({'error': 'Podaj face_id.'}), 400
+    conn = _get_db()
+    face = conn.execute('SELECT id, person_id FROM faces WHERE id=?', (face_id,)).fetchone()
+    if not face:
+        conn.close()
+        return jsonify({'error': 'Twarz nie znaleziona.'}), 404
+
+    old_pid = face['person_id']
+
+    if unassign:
+        conn.execute('UPDATE faces SET person_id=NULL WHERE id=?', (face_id,))
+        if old_pid:
+            cnt = conn.execute(
+                'SELECT COUNT(DISTINCT photo_path) FROM faces WHERE person_id=?',
+                (old_pid,)).fetchone()[0]
+            conn.execute('UPDATE people SET photo_count=? WHERE id=?', (cnt, old_pid))
+            if cnt == 0:
+                conn.execute('DELETE FROM people WHERE id=?', (old_pid,))
+        conn.commit()
+        conn.close()
+        return jsonify({'ok': True})
+
+    if new_name and not person_id:
+        cur = conn.execute(
+            'INSERT INTO people (name, cover_face_id, photo_count) VALUES (?,?,1)',
+            (new_name, face_id))
+        person_id = cur.lastrowid
+    elif not person_id:
+        conn.close()
+        return jsonify({'error': 'Podaj person_id lub new_name.'}), 400
+
+    conn.execute('UPDATE faces SET person_id=? WHERE id=?', (person_id, face_id))
+    if old_pid:
+        cnt = conn.execute(
+            'SELECT COUNT(DISTINCT photo_path) FROM faces WHERE person_id=?',
+            (old_pid,)).fetchone()[0]
+        conn.execute('UPDATE people SET photo_count=? WHERE id=?', (cnt, old_pid))
+        if cnt == 0:
+            conn.execute('DELETE FROM people WHERE id=?', (old_pid,))
+    cnt = conn.execute(
+        'SELECT COUNT(DISTINCT photo_path) FROM faces WHERE person_id=?',
+        (person_id,)).fetchone()[0]
+    conn.execute('UPDATE people SET photo_count=? WHERE id=?', (cnt, person_id))
+    conn.commit()
+    conn.close()
+    return jsonify({'ok': True, 'person_id': person_id})
+
+
+@photos_ai_bp.route('/merge-suggestions', methods=['GET'])
+def merge_suggestions():
+    """Find pairs of people clusters that might be duplicates."""
+    import numpy as np
+    conn = _get_db()
+    people = conn.execute('SELECT id, name FROM people WHERE hidden=0').fetchall()
+    if len(people) < 2:
+        conn.close()
+        return jsonify({'suggestions': []})
+
+    centroids = {}
+    cover_faces = {}
+    for p in people:
+        rows = conn.execute(
+            'SELECT embedding FROM faces WHERE person_id=? LIMIT 30', (p['id'],)
+        ).fetchall()
+        if not rows:
+            continue
+        embs = np.array([_blob2emb(r['embedding']) for r in rows])
+        centroids[p['id']] = embs.mean(axis=0)
+        cf = conn.execute(
+            'SELECT id FROM faces WHERE person_id=? LIMIT 1', (p['id'],)
+        ).fetchone()
+        cover_faces[p['id']] = cf['id'] if cf else None
+
+    pids = list(centroids.keys())
+    pid_to_name = {p['id']: p['name'] or f'Osoba {p["id"]}' for p in people}
+    suggestions = []
+    threshold = 0.75
+    for i in range(len(pids)):
+        for j in range(i + 1, len(pids)):
+            dist = float(np.linalg.norm(centroids[pids[i]] - centroids[pids[j]]))
+            if dist < threshold:
+                suggestions.append({
+                    'person_a': {
+                        'id': pids[i], 'name': pid_to_name[pids[i]],
+                        'cover_face_id': cover_faces.get(pids[i]),
+                    },
+                    'person_b': {
+                        'id': pids[j], 'name': pid_to_name[pids[j]],
+                        'cover_face_id': cover_faces.get(pids[j]),
+                    },
+                    'distance': round(dist, 3),
+                    'confidence': round(max(0, 1.0 - dist) * 100, 1),
+                })
+    conn.close()
+    suggestions.sort(key=lambda x: x['distance'])
+    return jsonify({'suggestions': suggestions[:20]})
