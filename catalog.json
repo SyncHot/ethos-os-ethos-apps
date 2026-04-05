@@ -603,7 +603,7 @@
         {
             "id": "photos-ai",
             "name": "Photos AI",
-            "version": "0.0.1",
+            "version": "0.0.2",
             "icon": "fa-brain",
             "color": "#8b5cf6",
             "category": "Media",
@@ -621,6 +621,21 @@
             "install_endpoint": "/api/photos-ai/install",
             "uninstall_endpoint": "/api/photos-ai/uninstall",
             "status_endpoint": "/api/photos-ai/pkg-status"
+        },
+        {
+            "id": "security-advisor",
+            "name": "Security Advisor",
+            "version": "0.0.1",
+            "icon": "fa-user-shield",
+            "color": "#059669",
+            "category": "Security",
+            "admin_only": true,
+            "description": "Skaner bezpieczenstwa systemu z wynikiem 0-100 i automatycznymi poprawkami.",
+            "apt_deps": [],
+            "pip_deps": [],
+            "simple": true,
+            "core": true,
+            "status_endpoint": "/api/security-advisor/pkg-status"
         }
     ]
 }
