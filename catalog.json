@@ -599,6 +599,28 @@
             "install_endpoint": "/api/med-assistant/install",
             "uninstall_endpoint": "/api/med-assistant/uninstall",
             "status_endpoint": "/api/med-assistant/pkg-status"
+        },
+        {
+            "id": "photos-ai",
+            "name": "Photos AI",
+            "version": "0.0.1",
+            "icon": "fa-brain",
+            "color": "#8b5cf6",
+            "category": "Media",
+            "admin_only": false,
+            "description": "Rozpoznawanie twarzy, wykrywanie obiektow i inteligentne albumy dla Galerii.",
+            "apt_deps": [
+                "cmake",
+                "libopenblas-dev"
+            ],
+            "pip_deps": [
+                "face_recognition",
+                "onnxruntime",
+                "scipy"
+            ],
+            "install_endpoint": "/api/photos-ai/install",
+            "uninstall_endpoint": "/api/photos-ai/uninstall",
+            "status_endpoint": "/api/photos-ai/pkg-status"
         }
     ]
 }
