@@ -4,7 +4,7 @@
         {
             "id": "surveillance",
             "name": "Surveillance",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-video",
             "color": "#dc2626",
             "category": "Security",
@@ -23,7 +23,7 @@
         {
             "id": "ai-chat",
             "name": "AI Assistant",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-robot",
             "color": "#8b5cf6",
             "category": "Tools",
@@ -42,7 +42,7 @@
         {
             "id": "doc-anonymizer",
             "name": "Document Anonymizer",
-            "version": "1.1.1",
+            "version": "1.1.2",
             "icon": "fa-user-shield",
             "color": "#0ea5e9",
             "category": "Tools",
@@ -71,7 +71,7 @@
         {
             "id": "gallery",
             "name": "Gallery",
-            "version": "1.0.2",
+            "version": "1.0.3",
             "icon": "fa-images",
             "color": "#ec4899",
             "category": "Media",
@@ -86,7 +86,7 @@
         {
             "id": "download-manager",
             "name": "Download Manager",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-cloud-download-alt",
             "color": "#10b981",
             "category": "Tools",
@@ -101,7 +101,7 @@
         {
             "id": "printer",
             "name": "Print Server",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-print",
             "color": "#ef4444",
             "category": "Tools",
@@ -120,7 +120,7 @@
         {
             "id": "docker-manager",
             "name": "Docker Manager",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-cubes",
             "color": "#2496ed",
             "category": "System",
@@ -135,7 +135,7 @@
         {
             "id": "vm-manager",
             "name": "VM Manager",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-desktop",
             "color": "#8b5cf6",
             "category": "System",
@@ -154,7 +154,7 @@
         {
             "id": "doc-editor",
             "name": "Documents",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-file-word",
             "color": "#2563eb",
             "category": "Tools",
@@ -174,7 +174,7 @@
         {
             "id": "code-editor",
             "name": "Code Editor",
-            "version": "1.0.0",
+            "version": "1.0.1",
             "icon": "fa-code",
             "color": "#22d3ee",
             "category": "Tools",
@@ -200,7 +200,7 @@
         {
             "id": "usb-flasher",
             "name": "USB Creator",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-usb",
             "color": "#a855f7",
             "category": "Tools",
@@ -215,7 +215,7 @@
         {
             "id": "builder",
             "name": "Builder",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-hammer",
             "color": "#f97316",
             "category": "System",
@@ -234,7 +234,7 @@
         {
             "id": "disk-repair",
             "name": "Disk Repair",
-            "version": "1.0.11",
+            "version": "1.0.12",
             "icon": "fa-wrench",
             "color": "#ef4444",
             "category": "Storage",
@@ -252,7 +252,7 @@
         {
             "id": "remote-log",
             "name": "Remote Logs",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-satellite-dish",
             "color": "#0891b2",
             "category": "System",
@@ -267,7 +267,7 @@
         {
             "id": "sharing-samba",
             "name": "File Sharing (Samba)",
-            "version": "1.0.11",
+            "version": "1.0.12",
             "icon": "fa-windows",
             "color": "#6366f1",
             "category": "Network",
@@ -284,7 +284,7 @@
         {
             "id": "sharing-nfs",
             "name": "NFS",
-            "version": "1.0.11",
+            "version": "1.0.12",
             "icon": "fa-network-wired",
             "color": "#6366f1",
             "category": "Network",
@@ -301,7 +301,7 @@
         {
             "id": "sharing-dlna",
             "name": "DLNA (MiniDLNA)",
-            "version": "1.0.11",
+            "version": "1.0.12",
             "icon": "fa-photo-video",
             "color": "#6366f1",
             "category": "Media",
@@ -318,7 +318,7 @@
         {
             "id": "sharing-webdav",
             "name": "WebDAV",
-            "version": "1.0.11",
+            "version": "1.0.12",
             "icon": "fa-globe",
             "color": "#6366f1",
             "category": "Network",
@@ -335,7 +335,7 @@
         {
             "id": "sharing-sftp",
             "name": "SFTP",
-            "version": "1.0.11",
+            "version": "1.0.12",
             "icon": "fa-lock",
             "color": "#6366f1",
             "category": "Network",
@@ -352,7 +352,7 @@
         {
             "id": "sharing-ftp",
             "name": "FTP",
-            "version": "1.0.11",
+            "version": "1.0.12",
             "icon": "fa-upload",
             "color": "#6366f1",
             "category": "Network",
@@ -369,7 +369,7 @@
         {
             "id": "domains-manager",
             "name": "Domains & SSL",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-globe",
             "color": "#059669",
             "category": "Network",
@@ -384,7 +384,7 @@
         {
             "id": "websites",
             "name": "Websites",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-globe-americas",
             "color": "#14b8a6",
             "category": "Tools",
@@ -399,7 +399,7 @@
         {
             "id": "cloud-backup",
             "name": "Cloud Backup",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-cloud-upload-alt",
             "color": "#0ea5e9",
             "category": "Storage",
@@ -416,7 +416,7 @@
         {
             "id": "raid-lvm",
             "name": "RAID / LVM",
-            "version": "1.0.10",
+            "version": "1.0.11",
             "icon": "fa-layer-group",
             "color": "#f59e0b",
             "category": "Storage",
@@ -434,7 +434,7 @@
         {
             "id": "wireguard",
             "name": "VPN (WireGuard)",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-shield-halved",
             "color": "#7c3aed",
             "category": "Network",
@@ -453,7 +453,7 @@
         {
             "id": "antivirus",
             "name": "Antivirus (ClamAV)",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-shield-virus",
             "color": "#16a34a",
             "category": "Security",
@@ -471,7 +471,7 @@
         {
             "id": "rollback",
             "name": "Rollback",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-history",
             "color": "#f97316",
             "category": "System",
@@ -510,7 +510,7 @@
         {
             "id": "cron",
             "name": "Scheduler",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-clock",
             "color": "#6366f1",
             "category": "System",
@@ -523,7 +523,7 @@
         {
             "id": "ups",
             "name": "UPS",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-battery-full",
             "color": "#f59e0b",
             "category": "System",
@@ -536,7 +536,7 @@
         {
             "id": "family-hub",
             "name": "Family Hub",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-house-user",
             "color": "#f472b6",
             "category": "Tools",
@@ -549,7 +549,7 @@
         {
             "id": "sticky-notes",
             "name": "Sticky Notes",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-sticky-note",
             "color": "#fbbf24",
             "category": "Tools",
@@ -575,7 +575,7 @@
         {
             "id": "med-assistant",
             "name": "Medical Assistant",
-            "version": "0.0.1",
+            "version": "0.0.2",
             "icon": "fa-user-md",
             "color": "#06b6d4",
             "category": "Tools",
@@ -603,7 +603,7 @@
         {
             "id": "photos-ai",
             "name": "Photos AI",
-            "version": "0.0.4",
+            "version": "0.0.5",
             "icon": "fa-brain",
             "color": "#8b5cf6",
             "category": "Media",
@@ -626,7 +626,7 @@
         {
             "id": "security-advisor",
             "name": "Security Advisor",
-            "version": "0.0.1",
+            "version": "0.0.2",
             "icon": "fa-user-shield",
             "color": "#059669",
             "category": "Security",
@@ -641,7 +641,7 @@
         {
             "id": "video-station",
             "name": "Video Station",
-            "version": "0.0.2",
+            "version": "0.0.3",
             "icon": "fa-film",
             "color": "#7c3aed",
             "category": "Media",
@@ -658,7 +658,7 @@
         {
             "id": "radio-music",
             "name": "Radio & Music",
-            "version": "0.0.1",
+            "version": "0.0.2",
             "icon": "fa-broadcast-tower",
             "color": "#10b981",
             "category": "Media",

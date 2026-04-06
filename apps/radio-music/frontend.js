@@ -15,6 +15,199 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     let _ytdlpReady = null;    // null = unknown, true/false
     let _seekInterval = null;  // interval for updating seekbar
     let _playlists = [];       // user's playlists
+    let _saveStateInterval = null;
+
+    // ── Chromecast state ──
+    let _isCasting = false;
+    let _castSession = null;
+    let _castAvail = false;
+    let _preCastVolume = 0.8;
+    let _castPlayer = null;
+    let _castController = null;
+    let _advanceLock = false;   // debounce double-advance from Cast + local onended
+    let _castQueueActive = false; // true when Cast queue manages playlist advancement
+
+    const _cl = (level, msg, details) => typeof NAS !== 'undefined' && NAS.logClient
+        ? NAS.logClient('radio-music', level, msg, details) : console.log('[radio-music]', msg, details || '');
+
+    const _LS_KEY = 'rm_playback_state';
+    let _savePending = false;
+
+    const _POD_GENRES = [
+        {key:'', label:'Wszystkie'}, {key:'truecrime', label:'True Crime'}, {key:'comedy', label:'Komedia'},
+        {key:'news', label:'Wiadomości'}, {key:'society', label:'Społeczeństwo'}, {key:'education', label:'Edukacja'},
+        {key:'technology', label:'Technologia'}, {key:'business', label:'Biznes'}, {key:'health', label:'Zdrowie'},
+        {key:'history', label:'Historia'}, {key:'science', label:'Nauka'}, {key:'sports', label:'Sport'},
+        {key:'music', label:'Muzyka'}, {key:'arts', label:'Sztuka'}, {key:'fiction', label:'Fikcja'},
+        {key:'kids', label:'Dla dzieci'}, {key:'tv', label:'TV i Film'},
+    ];
+    const _POD_COUNTRIES = [
+        {code:'pl',name:'Polska'},{code:'us',name:'USA'},{code:'gb',name:'UK'},{code:'de',name:'Niemcy'},
+        {code:'fr',name:'Francja'},{code:'es',name:'Hiszpania'},{code:'it',name:'Włochy'},
+        {code:'br',name:'Brazylia'},{code:'ca',name:'Kanada'},{code:'au',name:'Australia'},
+        {code:'jp',name:'Japonia'},{code:'se',name:'Szwecja'},{code:'nl',name:'Holandia'},
+    ];
+    const _MUSIC_GENRES = [
+        {q:'top hits 2024 2025', label:'🔥 Hity'},
+        {q:'pop music', label:'Pop'}, {q:'rock music', label:'Rock'},
+        {q:'hip hop rap', label:'Hip-Hop'}, {q:'electronic dance music', label:'Electronic'},
+        {q:'r&b soul music', label:'R&B'}, {q:'jazz music', label:'Jazz'},
+        {q:'classical music', label:'Klasyczna'}, {q:'reggae music', label:'Reggae'},
+        {q:'metal music', label:'Metal'}, {q:'indie alternative', label:'Indie'},
+        {q:'polish music polskie', label:'🇵🇱 Polskie'},
+    ];
+
+    let _npOverlay = null;
+    let _npSeekDragging = false;
+    let _lockOverlay = null;
+
+    const _AUDIOBOOK_CATEGORIES = [
+        {q: 'najlepsze audiobooki dla dzieci po polsku 2024 2025', label: '🏆 Top bajki'},
+        {q: 'bajki dla dzieci audiobook po polsku', label: '🇵🇱 Bajki po polsku'},
+        {q: 'bajki na dobranoc dla dzieci audiobook', label: '🌙 Na dobranoc'},
+        {q: 'baśnie braci grimm audiobook dla dzieci', label: '📖 Baśnie Grimm'},
+        {q: 'baśnie andersena audiobook dla dzieci', label: '👑 Andersen'},
+        {q: 'harry potter audiobook po polsku', label: '⚡ Harry Potter'},
+        {q: 'władca pierścieni audiobook po polsku', label: '💍 Władca Pierścieni'},
+        {q: 'narnia audiobook po polsku', label: '🦁 Opowieści z Narnii'},
+        {q: 'mały książę audiobook po polsku', label: '🌹 Mały Książę'},
+        {q: 'pippi langstrumpf audiobook po polsku', label: '🧦 Pippi'},
+        {q: 'muminki audiobook po polsku', label: '🏔️ Muminki'},
+        {q: 'kubuś puchatek audiobook', label: '🍯 Kubuś Puchatek'},
+        {q: 'smerfy audiobook bajka po polsku', label: '🔵 Smerfy'},
+        {q: 'masza i niedźwiedź bajka audiobook po polsku', label: '🐻 Masza'},
+        {q: 'franklin żółw audiobook bajka po polsku', label: '🐢 Franklin'},
+        {q: 'bolek i lolek audiobook bajka', label: '👦 Bolek i Lolek'},
+        {q: 'reksio audiobook bajka po polsku', label: '🐕 Reksio'},
+        {q: 'przygody audiobook dla dzieci po polsku', label: '🏴‍☠️ Przygody'},
+        {q: 'bajki zwierzęta audiobook dla dzieci', label: '🦊 Zwierzęta'},
+        {q: 'audiobook dla dzieci edukacyjny', label: '🎓 Edukacyjne'},
+        {q: 'pan tadeusz audiobook lektura', label: '📚 Lektury'},
+        {q: 'audiobook children english fairy tales', label: '🇬🇧 English'},
+    ];
+
+    function _buildPlaybackState() {
+        if (!_playing) return null;
+        return {
+            playing: _playing,
+            queue: _musicQueue.slice(0, 200),
+            queueIdx: _musicQueueIdx,
+            repeatMode: _repeatMode,
+            shuffle: _shuffle,
+            currentTime: _audio ? _audio.currentTime : 0,
+            duration: _audio && isFinite(_audio.duration) ? _audio.duration : 0,
+            ts: Date.now(),
+        };
+    }
+
+    function _savePlaybackState() {
+        const state = _buildPlaybackState();
+        if (!state) { localStorage.removeItem(_LS_KEY); return; }
+        try { localStorage.setItem(_LS_KEY, JSON.stringify(state)); } catch (e) {}
+        // Debounce server save (max once per 5s)
+        if (!_savePending) {
+            _savePending = true;
+            setTimeout(() => {
+                _savePending = false;
+                const s = _buildPlaybackState();
+                if (s) api('/radio-music/playback-state', { method: 'POST', body: s }).catch(() => {});
+            }, 3000);
+        }
+    }
+
+    async function _restorePlaybackState() {
+        // Try localStorage first (fast)
+        try {
+            const raw = localStorage.getItem(_LS_KEY);
+            if (raw) {
+                const state = JSON.parse(raw);
+                if (state && state.playing && (Date.now() - (state.ts || 0)) < 7 * 86400000) return state;
+            }
+        } catch (e) {}
+        // Fall back to server (cross-device)
+        try {
+            const data = await api('/radio-music/playback-state');
+            if (data && data.playing && (Date.now() - (data.ts || 0)) < 7 * 86400000) return data;
+        } catch (e) {}
+        return null;
+    }
+
+    async function _restoreAndShowLastTrack(body) {
+        const state = await _restorePlaybackState();
+        if (!state) return;
+        const item = state.playing;
+
+        // Restore queue and mode settings
+        _musicQueue = state.queue || [];
+        _musicQueueIdx = state.queueIdx ?? -1;
+        _repeatMode = state.repeatMode || 0;
+        _shuffle = !!state.shuffle;
+        _playing = item;
+
+        // Show player bar in paused state
+        const player = body.querySelector('#rm-player');
+        player.style.display = 'flex';
+        body.querySelector('#rm-player-name').textContent = item.name;
+        body.querySelector('#rm-player-meta').textContent = item.meta || '';
+        body.querySelector('#rm-play-pause').innerHTML = '<i class="fas fa-play"></i>';
+
+        // Player art
+        const art = body.querySelector('#rm-player-art');
+        const isMusic = item.type === 'music' || item.type === 'local';
+        if (isMusic && item.image) {
+            art.innerHTML = '<img src="' + escH(item.image) + '" onerror="this.outerHTML=\'<i class=\\\'fas fa-music\\\'></i>\'">';
+        } else if (item.image || item.favicon) {
+            art.innerHTML = '<img src="' + escH(item.image || item.favicon) + '" onerror="this.outerHTML=\'<i class=\\\'fas fa-music\\\'></i>\'">';
+        }
+
+        // Show seekbar with saved position
+        const savedTime = state.currentTime || 0;
+        const savedDur = state.duration || 0;
+        if (savedDur > 0) {
+            const seekbar = body.querySelector('#rm-seekbar');
+            if (seekbar) {
+                seekbar.classList.add('visible');
+                const pct = (savedTime / savedDur) * 100;
+                const fill = seekbar.querySelector('#rm-seek-fill');
+                const thumb = seekbar.querySelector('#rm-seek-thumb');
+                if (fill) fill.style.width = pct + '%';
+                if (thumb) thumb.style.left = pct + '%';
+                const curEl = seekbar.querySelector('#rm-seek-cur');
+                const durEl = seekbar.querySelector('#rm-seek-dur');
+                if (curEl) curEl.textContent = _fmtTime(savedTime);
+                if (durEl) durEl.textContent = _fmtTime(savedDur);
+            }
+        }
+
+        // Override play/pause to resume from saved position on first click
+        const playPauseBtn = body.querySelector('#rm-play-pause');
+        const _origHandler = playPauseBtn.onclick;
+        playPauseBtn.onclick = () => {
+            playPauseBtn.onclick = _origHandler;
+            // Start playback from saved position
+            playAudio(item);
+            // Seek to saved position once audio is ready
+            if (savedTime > 1) {
+                const _onReady = () => {
+                    if (_audio && isFinite(_audio.duration) && savedTime < _audio.duration) {
+                        _audio.currentTime = savedTime;
+                    }
+                    if (_audio) _audio.removeEventListener('canplay', _onReady);
+                };
+                if (_audio) _audio.addEventListener('canplay', _onReady, { once: true });
+            }
+        };
+
+        // Sync repeat/shuffle button states
+        const repeatBtn = body.querySelector('#rm-repeat-btn');
+        if (repeatBtn) {
+            repeatBtn.classList.toggle('rm-mode-active', _repeatMode > 0);
+            repeatBtn.innerHTML = _repeatMode === 2 ? '<i class="fas fa-redo"></i><span style="font-size:9px;position:absolute;font-weight:700">1</span>' : '<i class="fas fa-redo"></i>';
+            repeatBtn.style.position = _repeatMode === 2 ? 'relative' : '';
+        }
+        const shuffleBtn = body.querySelector('#rm-shuffle-btn');
+        if (shuffleBtn) shuffleBtn.classList.toggle('rm-mode-active', _shuffle);
+    }
 
     const escH = s => s ? s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') : '';
 
@@ -152,6 +345,9 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 '.rm-player-btn.rm-mode-active{color:#1DB954}',
 '.rm-player-btn.rm-btn-play{font-size:20px;width:40px;height:40px;display:flex;align-items:center;justify-content:center;background:#1DB954;color:#000;border-radius:50%;box-shadow:0 2px 8px rgba(29,185,84,.3)}',
 '.rm-player-btn.rm-btn-play:hover{background:#1ed760;transform:scale(1.06)}',
+'.rm-cast-btn{font-size:15px;transition:color .2s}',
+'.rm-cast-btn.rm-casting{color:#1DB954;animation:rm-cast-pulse 2s ease-in-out infinite}',
+'@keyframes rm-cast-pulse{0%,100%{opacity:1}50%{opacity:.5}}',
 '.rm-vol-wrap{display:flex;align-items:center;gap:6px}',
 '.rm-vol-wrap i{font-size:13px;color:rgba(255,255,255,.5)}',
 '.rm-vol-slider{width:80px;accent-color:#1DB954;height:4px}',
@@ -280,7 +476,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 '.rm-add-folder-btn:hover{border-color:#1DB954;color:#1DB954}',
 
 /* ── Now Playing overlay ───────────────────────── */
-'.rm-np-overlay{position:absolute;inset:0;z-index:100;display:flex;flex-direction:column;overflow:hidden}',
+'.rm-np-overlay{position:absolute;inset:0;z-index:100;display:flex;flex-direction:column;overflow:hidden;background:#0a0a0a}',
 '.rm-np-bg{position:absolute;inset:-40px;background-size:cover;background-position:center;filter:blur(40px) brightness(.25) saturate(1.4);z-index:0}',
 '.rm-np-inner{position:relative;z-index:1;flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;gap:16px;overflow-y:auto}',
 '.rm-np-close{position:absolute;top:12px;left:12px;background:rgba(255,255,255,.08);border:none;color:#fff;font-size:18px;cursor:pointer;padding:8px 12px;border-radius:50%;z-index:2;backdrop-filter:blur(8px);transition:background .15s}',
@@ -393,6 +589,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     <div class="rm-sidebar-label">${t('Muzyka')}</div>
     <div class="rm-sidebar-item" data-section="music"><i class="fab fa-youtube"></i> ${t('Szukaj')}</div>
     <div class="rm-sidebar-item" data-section="local"><i class="fas fa-folder-open"></i> ${t('Lokalna muzyka')}</div>
+    <div class="rm-sidebar-item" data-section="local-audiobooks"><i class="fas fa-book-reader"></i> ${t('Lokalne audiobooki')}</div>
     <div class="rm-sidebar-item" data-section="playlists"><i class="fas fa-list"></i> ${t('Playlisty')}</div>
     <div class="rm-sidebar-item" data-section="queue"><i class="fas fa-list-ol"></i> ${t('Kolejka')}</div>
     <div class="rm-sidebar-label">${t('Radio')}</div>
@@ -405,6 +602,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     <div class="rm-sidebar-item" data-section="subscriptions"><i class="fas fa-rss"></i> ${t('Subskrypcje')}</div>
     <div class="rm-sidebar-label">${t('Inne')}</div>
     <div class="rm-sidebar-item active" data-section="most-played"><i class="fas fa-fire"></i> ${t('Najczęściej grane')}</div>
+    <div class="rm-sidebar-item" data-section="audiobooks"><i class="fas fa-book-open"></i> ${t('Audiobooki')}</div>
     <div class="rm-sidebar-item" data-section="history"><i class="fas fa-history"></i> ${t('Historia')}</div>
   </div>
   <div class="rm-main">
@@ -418,6 +616,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         <div class="rm-more-sheet-handle"></div>
         <div class="rm-more-sheet-grid">
           <button class="rm-more-btn" data-section="local"><i class="fas fa-folder-open"></i><span>${t('Lokalne')}</span></button>
+          <button class="rm-more-btn" data-section="local-audiobooks"><i class="fas fa-book-reader"></i><span>${t('Audiobooki lok.')}</span></button>
           <button class="rm-more-btn" data-section="playlists"><i class="fas fa-list"></i><span>${t('Playlisty')}</span></button>
           <button class="rm-more-btn" data-section="queue"><i class="fas fa-list-ol"></i><span>${t('Kolejka')}</span></button>
           <button class="rm-more-btn" data-section="history"><i class="fas fa-history"></i><span>${t('Historia')}</span></button>
@@ -449,6 +648,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         <button class="rm-player-btn rm-btn-play" id="rm-play-pause"><i class="fas fa-play"></i></button>
         <button class="rm-player-btn" id="rm-next-btn" title="${t('Następna')}"><i class="fas fa-step-forward"></i></button>
         <button class="rm-player-btn" id="rm-repeat-btn" title="${t('Powtarzaj')}"><i class="fas fa-redo"></i></button>
+        <button class="rm-player-btn rm-cast-btn" id="rm-cast-btn" title="Chromecast"><i class="fab fa-chromecast"></i></button>
       </div>
       <div class="rm-vol-wrap">
         <i class="fas fa-volume-up"></i>
@@ -481,7 +681,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             if (_isMobile) _enterFullscreen();
 
             // Sections accessible via the "More" bottom sheet on mobile
-            const _MORE_SECTIONS = ['local','playlists','queue','history'];
+            const _MORE_SECTIONS = ['local','local-audiobooks','playlists','queue','history'];
             function _syncMobileNav(section) {
                 body.querySelectorAll('#rm-mobile-nav > .rm-mnav-btn').forEach(b => {
                     if (b.dataset.section === 'more') {
@@ -565,6 +765,9 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             body.querySelector('#rm-prev-btn').onclick = () => _skipStation(-1);
             body.querySelector('#rm-next-btn').onclick = () => _skipStation(1);
 
+            // Cast button
+            body.querySelector('#rm-cast-btn').onclick = () => _toggleCast();
+
             // Repeat: off → repeat all → repeat one → off
             function _syncRepeatBtn() {
                 const btn = body.querySelector('#rm-repeat-btn');
@@ -601,8 +804,15 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             };
 
             loadSection('most-played');
+
+            // Initialize Google Cast SDK (wrapped so failures don't break the app)
+            try { _initCast(); } catch(e) { _cl('error', 'Cast init failed', { error: e.message }); }
+
+            // Restore previous playback state (paused, showing last track)
+            _restoreAndShowLastTrack(body);
         },
         onClose() {
+            _savePlaybackState();
             stopPlayback();
             _hideLockScreen();
             document.body.classList.remove('app-fullscreen-active');
@@ -625,6 +835,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             case 'subscriptions': loadSubscriptions(content); break;
             case 'music': loadMusic(toolbar, content); break;
             case 'local': loadLocal(toolbar, content); break;
+            case 'local-audiobooks': loadLocalAudiobooks(toolbar, content); break;
             case 'playlists': loadPlaylists(toolbar, content); break;
             case 'most-played': loadMostPlayed(content); break;
             case 'queue': loadQueue(content); break;
@@ -848,21 +1059,6 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     }
 
     /* ── Podcasts Browse ──────────────────────────── */
-
-    const _POD_GENRES = [
-        {key:'', label:'Wszystkie'}, {key:'truecrime', label:'True Crime'}, {key:'comedy', label:'Komedia'},
-        {key:'news', label:'Wiadomości'}, {key:'society', label:'Społeczeństwo'}, {key:'education', label:'Edukacja'},
-        {key:'technology', label:'Technologia'}, {key:'business', label:'Biznes'}, {key:'health', label:'Zdrowie'},
-        {key:'history', label:'Historia'}, {key:'science', label:'Nauka'}, {key:'sports', label:'Sport'},
-        {key:'music', label:'Muzyka'}, {key:'arts', label:'Sztuka'}, {key:'fiction', label:'Fikcja'},
-        {key:'kids', label:'Dla dzieci'}, {key:'tv', label:'TV i Film'},
-    ];
-    const _POD_COUNTRIES = [
-        {code:'pl',name:'Polska'},{code:'us',name:'USA'},{code:'gb',name:'UK'},{code:'de',name:'Niemcy'},
-        {code:'fr',name:'Francja'},{code:'es',name:'Hiszpania'},{code:'it',name:'Włochy'},
-        {code:'br',name:'Brazylia'},{code:'ca',name:'Kanada'},{code:'au',name:'Australia'},
-        {code:'jp',name:'Japonia'},{code:'se',name:'Szwecja'},{code:'nl',name:'Holandia'},
-    ];
 
     async function loadPodcasts(toolbar, content) {
         let _podCountry = localStorage.getItem('rm-pod-country') || 'pl', _podGenre = '';
@@ -1095,16 +1291,6 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     }
 
     /* ── Music (YouTube / yt-dlp) ─────────────────── */
-
-    const _MUSIC_GENRES = [
-        {q:'top hits 2024 2025', label:'🔥 Hity'},
-        {q:'pop music', label:'Pop'}, {q:'rock music', label:'Rock'},
-        {q:'hip hop rap', label:'Hip-Hop'}, {q:'electronic dance music', label:'Electronic'},
-        {q:'r&b soul music', label:'R&B'}, {q:'jazz music', label:'Jazz'},
-        {q:'classical music', label:'Klasyczna'}, {q:'reggae music', label:'Reggae'},
-        {q:'metal music', label:'Metal'}, {q:'indie alternative', label:'Indie'},
-        {q:'polish music polskie', label:'🇵🇱 Polskie'},
-    ];
 
     async function loadMusic(toolbar, content) {
         // Check yt-dlp dependency first
@@ -1461,6 +1647,97 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             if (plBtn) plBtn.onclick = (e) => {
                 e.stopPropagation();
                 _showAddToPlaylistModal(localItem);
+            };
+        });
+    }
+
+    /* ── Local Audiobooks ──────────────────────────────── */
+
+    async function loadLocalAudiobooks(toolbar, content) {
+        toolbar.innerHTML = '';
+        content.innerHTML = '<div class="rm-empty"><i class="fas fa-spinner fa-spin"></i></div>';
+
+        const scanData = await api('/radio-music/local/scan?scope=audiobooks');
+        const items = scanData.items || [];
+
+        if (!items.length) {
+            content.innerHTML = '<div class="rm-empty"><i class="fas fa-book-reader"></i><p>'
+                + t('Brak pobranych audiobooków') + '</p><p style="font-size:12px;color:var(--text-muted)">'
+                + t('Pobierz audiobooki z sekcji Audiobooki (YouTube)') + '</p></div>';
+            return;
+        }
+
+        // Group by folder (artist/uploader)
+        const byFolder = {};
+        items.forEach(it => {
+            const rel = it.relative || it.filename;
+            const parts = rel.split('/');
+            const group = parts.length > 1 ? parts[0] : it.folder.split('/').pop() || 'Audiobooki';
+            if (!byFolder[group]) byFolder[group] = [];
+            byFolder[group].push(it);
+        });
+
+        let html = '';
+        for (const [folder, files] of Object.entries(byFolder)) {
+            html += '<div class="rm-section-title"><i class="fas fa-book-open"></i> ' + escH(folder)
+                + ' <span style="font-size:11px;color:var(--text-muted);font-weight:400">(' + files.length + ')</span></div>';
+            html += '<div style="display:flex;flex-direction:column;gap:4px;margin-bottom:16px">';
+            files.forEach((file, i) => {
+                const artUrl = file.has_art ? '/api/radio-music/local/artwork?path=' + encodeURIComponent(file.path) + '&token=' + (NAS.token || '') : '';
+                const metaParts = [];
+                if (file.artist) metaParts.push(file.artist);
+                if (file.album) metaParts.push(file.album);
+                if (!metaParts.length) metaParts.push(file.filename);
+                const durStr = file.duration ? _fmtSecs(file.duration) : '';
+                html += '<div class="rm-track rm-lab-track" data-group="' + escH(folder) + '" data-idx="' + i + '">'
+                    + (artUrl
+                        ? '<img class="rm-track-thumb" src="' + escH(artUrl) + '" loading="lazy" onerror="this.outerHTML=\'<div class=\\\'rm-track-thumb\\\' style=\\\'display:flex;align-items:center;justify-content:center;background:#1a1a2e\\\'><i class=\\\'fas fa-book\\\' style=\\\'color:var(--text-muted)\\\'></i></div>\'">'
+                        : '<div class="rm-track-thumb" style="display:flex;align-items:center;justify-content:center;background:#1a1a2e"><i class="fas fa-book" style="color:var(--text-muted)"></i></div>')
+                    + '<div class="rm-track-info"><div class="rm-track-title">' + escH(file.name) + '</div>'
+                    + '<div class="rm-track-meta">' + escH(metaParts.join(' · ')) + '</div></div>'
+                    + (durStr ? '<span class="rm-track-dur">' + durStr + '</span>' : '')
+                    + '<div class="rm-track-actions">'
+                    + '<button class="rm-track-btn rm-add-queue-btn" title="' + t('Kolejka') + '"><i class="fas fa-plus"></i></button>'
+                    + '</div></div>';
+            });
+            html += '</div>';
+        }
+        content.innerHTML = html;
+
+        // Wire clicks
+        content.querySelectorAll('.rm-lab-track').forEach(el => {
+            const group = el.dataset.group;
+            const idx = parseInt(el.dataset.idx);
+            const file = byFolder[group][idx];
+            el.onclick = (e) => {
+                if (e.target.closest('.rm-track-btn')) return;
+                const groupFiles = byFolder[group];
+                _musicQueue = groupFiles.slice(idx).map(f => {
+                    const fArt = f.has_art ? '/api/radio-music/local/artwork?path=' + encodeURIComponent(f.path) + '&token=' + (NAS.token || '') : '';
+                    return {
+                        id: f.path, title: f.name, channel: [f.artist, f.album].filter(Boolean).join(' · ') || f.filename,
+                        url: f.path, thumbnail: fArt, duration: f.duration || 0, duration_fmt: f.duration ? _fmtSecs(f.duration) : '',
+                        source: 'local',
+                    };
+                });
+                _musicQueueIdx = 0;
+                const fileArt = file.has_art ? '/api/radio-music/local/artwork?path=' + encodeURIComponent(file.path) + '&token=' + (NAS.token || '') : '';
+                playAudio({
+                    name: file.name, type: 'local', path: file.path,
+                    url: '/api/radio-music/local/stream?path=' + encodeURIComponent(file.path) + '&token=' + (NAS.token || ''),
+                    meta: [file.artist, file.album].filter(Boolean).join(' · ') || file.filename,
+                    image: fileArt,
+                });
+            };
+            el.querySelector('.rm-add-queue-btn').onclick = (e) => {
+                e.stopPropagation();
+                const fArt = file.has_art ? '/api/radio-music/local/artwork?path=' + encodeURIComponent(file.path) + '&token=' + (NAS.token || '') : '';
+                _musicQueue.push({
+                    id: file.path, title: file.name, channel: [file.artist, file.album].filter(Boolean).join(' · ') || file.filename,
+                    url: file.path, thumbnail: fArt, duration: file.duration || 0, duration_fmt: file.duration ? _fmtSecs(file.duration) : '',
+                    source: 'local',
+                });
+                toast(t('Dodano do kolejki: ') + file.name, 'success');
             };
         });
     }
@@ -1879,31 +2156,6 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
     /* ── Audiobooks for Kids ───────────────────────── */
 
-    const _AUDIOBOOK_CATEGORIES = [
-        {q: 'najlepsze audiobooki dla dzieci po polsku 2024 2025', label: '🏆 Top bajki'},
-        {q: 'bajki dla dzieci audiobook po polsku', label: '🇵🇱 Bajki po polsku'},
-        {q: 'bajki na dobranoc dla dzieci audiobook', label: '🌙 Na dobranoc'},
-        {q: 'baśnie braci grimm audiobook dla dzieci', label: '📖 Baśnie Grimm'},
-        {q: 'baśnie andersena audiobook dla dzieci', label: '👑 Andersen'},
-        {q: 'harry potter audiobook po polsku', label: '⚡ Harry Potter'},
-        {q: 'władca pierścieni audiobook po polsku', label: '💍 Władca Pierścieni'},
-        {q: 'narnia audiobook po polsku', label: '🦁 Opowieści z Narnii'},
-        {q: 'mały książę audiobook po polsku', label: '🌹 Mały Książę'},
-        {q: 'pippi langstrumpf audiobook po polsku', label: '🧦 Pippi'},
-        {q: 'muminki audiobook po polsku', label: '🏔️ Muminki'},
-        {q: 'kubuś puchatek audiobook', label: '🍯 Kubuś Puchatek'},
-        {q: 'smerfy audiobook bajka po polsku', label: '🔵 Smerfy'},
-        {q: 'masza i niedźwiedź bajka audiobook po polsku', label: '🐻 Masza'},
-        {q: 'franklin żółw audiobook bajka po polsku', label: '🐢 Franklin'},
-        {q: 'bolek i lolek audiobook bajka', label: '👦 Bolek i Lolek'},
-        {q: 'reksio audiobook bajka po polsku', label: '🐕 Reksio'},
-        {q: 'przygody audiobook dla dzieci po polsku', label: '🏴‍☠️ Przygody'},
-        {q: 'bajki zwierzęta audiobook dla dzieci', label: '🦊 Zwierzęta'},
-        {q: 'audiobook dla dzieci edukacyjny', label: '🎓 Edukacyjne'},
-        {q: 'pan tadeusz audiobook lektura', label: '📚 Lektury'},
-        {q: 'audiobook children english fairy tales', label: '🇬🇧 English'},
-    ];
-
     async function loadAudiobooks(toolbar, content) {
         if (_ytdlpReady === null) {
             const deps = await api('/radio-music/music/check-deps');
@@ -2029,11 +2281,59 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         };
     }
 
+    // Advance to next track in queue (used by onended, Cast media ended, and error recovery)
+    function _advanceQueue() {
+        if (_advanceLock) return false;
+        if (!_musicQueue.length || _musicQueueIdx < 0) return false;
+        _advanceLock = true;
+        setTimeout(() => { _advanceLock = false; }, 500);
+        _cl('debug', 'advanceQueue', { from: _musicQueueIdx, queueLen: _musicQueue.length, shuffle: _shuffle, repeat: _repeatMode });
+
+        let nextIdx;
+        if (_shuffle) {
+            if (_musicQueue.length === 1) nextIdx = 0;
+            else { do { nextIdx = Math.floor(Math.random() * _musicQueue.length); } while (nextIdx === _musicQueueIdx); }
+        } else {
+            nextIdx = _musicQueueIdx + 1;
+        }
+        if (nextIdx < _musicQueue.length) {
+            _musicQueueIdx = nextIdx;
+            const nxt = _musicQueue[nextIdx];
+            nxt._plItem ? _playTrackFromPlaylist(nxt) : playMusicTrack(nxt);
+            return true;
+        }
+        if (_repeatMode === 1 && _musicQueue.length > 0) {
+            _musicQueueIdx = _shuffle ? Math.floor(Math.random() * _musicQueue.length) : 0;
+            const nxt = _musicQueue[_musicQueueIdx];
+            nxt._plItem ? _playTrackFromPlaylist(nxt) : playMusicTrack(nxt);
+            return true;
+        }
+        _advanceLock = false;
+        return false;
+    }
+
     function playAudio(item) {
-        if (_audio) { _audio.pause(); _audio.src = ''; }
+        // Safety: reset stuck _isCasting if no real Cast session exists
+        if (_isCasting) {
+            let realSession = null;
+            try { realSession = window.cast && cast.framework ? cast.framework.CastContext.getInstance().getCurrentSession() : null; } catch(e) {}
+            if (!realSession) {
+                _cl('warning', 'playAudio: _isCasting was true but no real Cast session — resetting');
+                _isCasting = false; _castSession = null; _castQueueActive = false;
+                _syncCastBtnUi(false);
+            }
+        }
+        _cl('info', 'playAudio', { name: item?.name, type: item?.type, isCasting: _isCasting, hasPath: !!item?.path, queueLen: _musicQueue.length, queueIdx: _musicQueueIdx });
+        if (_audio) {
+            _audio.onended = null; _audio.onerror = null;
+            _audio.onplay = null; _audio.onpause = null;
+            _audio.ontimeupdate = null; _audio.onloadedmetadata = null;
+            _audio.onwaiting = null; _audio.onplaying = null;
+            _audio.pause(); _audio.src = '';
+        }
         _clearSeek();
         _audio = new Audio();
-        _audio.volume = (bodyEl.querySelector('#rm-vol')?.value || 80) / 100;
+        _audio.volume = _isCasting ? 0 : (bodyEl.querySelector('#rm-vol')?.value || 80) / 100;
         _playing = item;
 
         // Build ordered list of URLs to try (primary + fallbacks)
@@ -2068,14 +2368,15 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
         function tryUrl(idx) {
             if (idx >= urls.length) {
+                _cl('error', 'All URLs failed', { name: item?.name, type: item?.type, urlCount: urls.length });
                 toast(t('Nie udało się odtworzyć żadnego źródła'), 'error');
                 _showEq(false);
                 _setBuffering(false);
+                setTimeout(() => _advanceQueue(), 800);
                 return;
             }
             let src;
             if (isLocal) {
-                // Local files already have a full URL with token
                 src = item.url;
             } else if (isMusic) {
                 src = '/api/radio-music/music/stream?url=' + encodeURIComponent(urls[idx])
@@ -2085,9 +2386,10 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                     + '&token=' + (NAS.token || '');
             }
 
+            _cl('debug', 'tryUrl(' + idx + '/' + urls.length + ')', { src: src?.substring(0, 120) });
             _audio.src = src;
             _audio.play().catch(err => {
-                console.warn('Play error:', err?.message, 'url:', urls[idx]);
+                _cl('warning', 'play() rejected', { idx, error: err?.message, src: src?.substring(0, 80) });
                 tryUrl(idx + 1);
             });
         }
@@ -2098,63 +2400,76 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             bodyEl.querySelector('#rm-play-pause').innerHTML = '<i class="fas fa-pause"></i>';
             _showEq(!isMusic && !isLocal);
             _updateSeekbar();
+            _savePlaybackState();
+            _cl('info', 'Audio playing', { name: item?.name, volume: _audio?.volume });
         };
         _audio.onwaiting = () => _setBuffering(true);
         _audio.onplaying = () => _setBuffering(false);
         _audio.onpause = () => {
             bodyEl.querySelector('#rm-play-pause').innerHTML = '<i class="fas fa-play"></i>';
             _showEq(false);
+            _savePlaybackState();
         };
         _audio.onerror = () => {
+            const code = _audio?.error?.code;
+            const msg = _audio?.error?.message || '';
+            _cl('error', 'Audio error', { code, msg, hasPlayed, urlIdx, name: item?.name });
             if (!hasPlayed) {
                 urlIdx++;
                 tryUrl(urlIdx);
             } else {
-                toast(t('Strumień przerwany'), 'error');
                 _showEq(false);
                 _setBuffering(false);
+                setTimeout(() => _advanceQueue(), 800);
             }
         };
+        let _endedHandled = false;
         _audio.onended = () => {
+            if (_endedHandled) return;
+            _endedHandled = true;
+            _cl('info', 'Audio ended', { name: item?.name, isCasting: _isCasting });
             _showEq(false);
             _clearSeek();
 
             // Repeat one — replay current track
             if (_repeatMode === 2) {
+                _endedHandled = false;
                 _audio.currentTime = 0;
                 _audio.play().then(() => _showEq(true)).catch(() => {});
                 return;
             }
 
-            // Auto-play next in queue (music/local)
-            if (_musicQueue.length && _musicQueueIdx >= 0) {
-                let nextIdx;
-                if (_shuffle) {
-                    if (_musicQueue.length === 1) { nextIdx = 0; }
-                    else {
-                        do { nextIdx = Math.floor(Math.random() * _musicQueue.length); } while (nextIdx === _musicQueueIdx);
-                    }
-                } else {
-                    nextIdx = _musicQueueIdx + 1;
-                }
-                if (nextIdx < _musicQueue.length) {
-                    _musicQueueIdx = nextIdx;
-                    const nxt = _musicQueue[nextIdx];
-                    nxt._plItem ? _playTrackFromPlaylist(nxt) : playMusicTrack(nxt);
-                    return;
-                }
-                // End of queue — repeat all wraps around
-                if (_repeatMode === 1 && _musicQueue.length > 0) {
-                    _musicQueueIdx = _shuffle ? Math.floor(Math.random() * _musicQueue.length) : 0;
-                    const nxt = _musicQueue[_musicQueueIdx];
-                    nxt._plItem ? _playTrackFromPlaylist(nxt) : playMusicTrack(nxt);
-                    return;
-                }
-            }
+            // Auto-play next in queue
+            if (_advanceQueue()) return;
             bodyEl.querySelector('#rm-play-pause').innerHTML = '<i class="fas fa-play"></i>';
         };
-        _audio.ontimeupdate = () => _updateSeekbar();
-        _audio.onloadedmetadata = () => _updateSeekbar();
+        _audio.ontimeupdate = () => {
+            _updateSeekbar();
+            // Fallback: detect track finished (onended may not fire for proxied streams)
+            if (!_endedHandled && _audio && isFinite(_audio.duration) && _audio.duration > 1
+                && _audio.currentTime >= _audio.duration - 0.5) {
+                _endedHandled = true;
+                setTimeout(() => {
+                    // Double-check: audio truly stopped (not just buffering near end)
+                    if (_audio && (_audio.ended || _audio.paused || _audio.currentTime >= _audio.duration - 0.5)) {
+                        _showEq(false); _clearSeek();
+                        if (_repeatMode === 2) {
+                            _endedHandled = false;
+                            _audio.currentTime = 0;
+                            _audio.play().then(() => _showEq(true)).catch(() => {});
+                            return;
+                        }
+                        if (_advanceQueue()) return;
+                        bodyEl.querySelector('#rm-play-pause').innerHTML = '<i class="fas fa-play"></i>';
+                    } else { _endedHandled = false; }
+                }, 1500);
+            }
+        };
+        _audio.onloadedmetadata = () => { _updateSeekbar(); _savePlaybackState(); };
+
+        // Periodic save of playback position
+        if (_saveStateInterval) clearInterval(_saveStateInterval);
+        _saveStateInterval = setInterval(_savePlaybackState, 5000);
 
         // Update player bar — show immediately with buffering indicator
         const player = bodyEl.querySelector('#rm-player');
@@ -2185,6 +2500,28 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
         // Start playback with fallback chain
         tryUrl(0);
+
+        // If casting, send current track to Chromecast
+        if (_isCasting) _castLoadCurrentTrack();
+    }
+
+    // Update player bar UI without starting playback (for Cast queue sync)
+    function _updatePlayerBar(item) {
+        if (!item || !bodyEl) return;
+        const nameEl = bodyEl.querySelector('#rm-player-name');
+        if (nameEl) nameEl.textContent = item.name || item.title || '';
+        const metaEl = bodyEl.querySelector('#rm-player-meta');
+        if (metaEl) metaEl.textContent = item.meta || item.channel || '';
+        const art = bodyEl.querySelector('#rm-player-art');
+        if (art) {
+            const img = item.image || item.thumbnail;
+            if (img) {
+                art.innerHTML = '<img src="' + escH(img) + '" onerror="this.outerHTML=\'<i class=\\\'fas fa-music\\\'></i>\'">';
+            } else {
+                art.innerHTML = '<i class="fas fa-music"></i>';
+            }
+        }
+        _savePlaybackState();
     }
 
     function _skipStation(dir) {
@@ -2227,6 +2564,13 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     }
 
     function stopPlayback() {
+        _savePlaybackState();
+        if (_saveStateInterval) { clearInterval(_saveStateInterval); _saveStateInterval = null; }
+        if (_castSession) { try { _castSession.endSession(true); } catch(e) {} }
+        _castSession = null;
+        _isCasting = false;
+        _castQueueActive = false;
+        _syncCastBtnUi(false);
         if (_audio) {
             _audio.pause();
             _audio.src = '';
@@ -2244,6 +2588,286 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     function _showEq(show) {
         const eq = bodyEl?.querySelector('#rm-player-eq');
         if (eq) eq.style.display = show ? 'flex' : 'none';
+    }
+
+    /* ── Chromecast / Google Cast SDK ──────────────────── */
+
+    function _initCast() {
+        function _setupCastFramework() {
+            _castAvail = true;
+            try {
+                const ctx = cast.framework.CastContext.getInstance();
+                ctx.setOptions({
+                    receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
+                    autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED,
+                });
+                if (window._rmCastSessionCb) {
+                    try { ctx.removeEventListener(cast.framework.CastContextEventType.SESSION_STATE_CHANGED, window._rmCastSessionCb); } catch(e) {}
+                }
+                window._rmCastSessionCb = _onCastSessionChanged;
+                ctx.addEventListener(cast.framework.CastContextEventType.SESSION_STATE_CHANGED, _onCastSessionChanged);
+
+                _castPlayer = new cast.framework.RemotePlayer();
+                _castController = new cast.framework.RemotePlayerController(_castPlayer);
+                if (window._rmCastPlayerCb) {
+                    try { _castController.removeEventListener(cast.framework.RemotePlayerEventType.PLAYER_STATE_CHANGED, window._rmCastPlayerCb); } catch(e) {}
+                }
+                window._rmCastPlayerCb = _onCastPlayerStateChanged;
+                _castController.addEventListener(cast.framework.RemotePlayerEventType.PLAYER_STATE_CHANGED, _onCastPlayerStateChanged);
+                _cl('info', 'Cast SDK initialized, _castAvail=true');
+            } catch (e) {
+                _cl('error', 'Cast framework init error', { error: e.message || String(e) });
+                _castAvail = false;
+            }
+        }
+
+        window['__onGCastApiAvailable'] = function(isAvailable) {
+            _cl('info', 'Cast API available: ' + isAvailable);
+            if (!isAvailable) { _castAvail = false; return; }
+            _setupCastFramework();
+        };
+        if (!document.querySelector('script[src*="cast_sender"]')) {
+            const s = document.createElement('script');
+            s.src = 'https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1';
+            s.async = true;
+            s.onerror = () => _cl('error', 'Cast SDK script failed to load (CSP or network)');
+            document.head.appendChild(s);
+            _cl('info', 'Loading Cast SDK script...');
+        } else if (window.cast && cast.framework) {
+            _cl('info', 'Cast SDK already loaded, running setup');
+            _setupCastFramework();
+        } else {
+            _cl('warning', 'Cast script tag exists but cast.framework not available');
+        }
+    }
+
+    function _onCastPlayerStateChanged() {
+        if (!_isCasting || !_castPlayer) return;
+        _cl('debug', 'Cast player state: ' + _castPlayer.playerState);
+        if (_castPlayer.playerState === 'IDLE') {
+            const session = cast.framework.CastContext.getInstance().getCurrentSession();
+            const media = session?.getMediaSession();
+            const reason = media?.idleReason || 'unknown';
+            _cl('info', 'Cast IDLE, reason: ' + reason);
+            if (reason === 'FINISHED') {
+                _advanceQueue();
+            }
+        }
+    }
+
+    function _onCastSessionChanged(event) {
+        const state = event.sessionState;
+        _cl('info', 'Cast session: ' + state);
+        if (state === cast.framework.SessionState.SESSION_STARTED ||
+            state === cast.framework.SessionState.SESSION_RESUMED) {
+            _castSession = cast.framework.CastContext.getInstance().getCurrentSession();
+            _isCasting = true;
+            _syncCastBtnUi(true);
+            toast(t('Połączono z Chromecast'), 'success');
+            const deviceName = _castSession?.getCastDevice?.()?.friendlyName || '?';
+            _cl('info', 'Cast connected to: ' + deviceName);
+            _castLoadCurrentTrack();
+        } else if (state === cast.framework.SessionState.SESSION_ENDED) {
+            _castSession = null;
+            _isCasting = false;
+            _castQueueActive = false;
+            _syncCastBtnUi(false);
+            if (_audio) _audio.volume = _preCastVolume;
+            _cl('info', 'Cast disconnected, restored local playback');
+        }
+    }
+
+    async function _castLoadCurrentTrack() {
+        if (window.cast && cast.framework) {
+            _castSession = cast.framework.CastContext.getInstance().getCurrentSession();
+        }
+        if (!_castSession || !_playing) {
+            _cl('warning', 'Cast loadTrack skipped: session=' + !!_castSession + ' playing=' + !!_playing);
+            if (!_castSession && _isCasting) {
+                _cl('warning', 'Resetting stuck _isCasting from _castLoadCurrentTrack');
+                _isCasting = false; _castQueueActive = false;
+                _syncCastBtnUi(false);
+                if (_audio) _audio.volume = (bodyEl.querySelector('#rm-vol')?.value || 80) / 100;
+            }
+            return;
+        }
+
+        let mediaUrl, ct;
+
+        if (_playing.type === 'music' && _playing.url && !_playing.url.startsWith('/api/')) {
+            try {
+                const data = await api('/radio-music/music/direct-url?url=' + encodeURIComponent(_playing.url));
+                if (data.audio_url) {
+                    mediaUrl = data.audio_url;
+                    ct = data.content_type || 'audio/mp4';
+                }
+            } catch (e) { _cl('error', 'Cast direct-url resolve failed', { error: e.message }); }
+        }
+
+        if (!mediaUrl && _playing.type === 'local' && _playing.path) {
+            mediaUrl = location.origin + '/api/radio-music/local/stream?path='
+                + encodeURIComponent(_playing.path) + '&token=' + (NAS.token || '');
+            ct = 'audio/mpeg';
+        }
+
+        if (!mediaUrl && _playing.type === 'radio' && _playing.url) {
+            mediaUrl = _playing.url;
+            ct = 'audio/mpeg';
+        }
+
+        if (!mediaUrl && _audio?.src) {
+            mediaUrl = _audio.src;
+            ct = 'audio/mpeg';
+        }
+        if (!mediaUrl) {
+            _cl('warning', 'Cast loadTrack: no URL resolved', { type: _playing.type, name: _playing.name });
+            return;
+        }
+
+        _cl('info', 'Cast loadMedia', { url: mediaUrl.substring(0, 100), type: ct, track: _playing.name });
+        const mediaInfo = new chrome.cast.media.MediaInfo(mediaUrl, ct);
+        mediaInfo.metadata = new chrome.cast.media.MusicTrackMediaMetadata();
+        if (_playing) {
+            mediaInfo.metadata.title = _playing.name || '';
+            mediaInfo.metadata.artist = _playing.meta || '';
+            if (_playing.image) {
+                const imgUrl = _playing.image.startsWith('http') ? _playing.image : (location.origin + _playing.image);
+                mediaInfo.metadata.images = [new chrome.cast.Image(imgUrl)];
+            }
+        }
+        const request = new chrome.cast.media.LoadRequest(mediaInfo);
+        request.autoplay = true;
+        if (_audio && _audio.currentTime > 1) request.currentTime = _audio.currentTime;
+
+        try {
+            await _castSession.loadMedia(request);
+            _cl('info', 'Cast loadMedia SUCCESS: ' + (_playing.name || '?'));
+            _preCastVolume = (bodyEl.querySelector('#rm-vol')?.value || 80) / 100;
+            if (_audio) _audio.volume = 0;
+        } catch (err) {
+            _cl('error', 'Cast loadMedia FAILED', { error: err?.message || String(err), track: _playing.name });
+            toast(t('Cast: nie udało się załadować utworu'), 'error');
+        }
+    }
+
+    // Resolve a track to an absolute URL accessible by Chromecast
+    async function _resolveCastMediaUrl(tr) {
+        if (tr.type === 'music' && tr.url && !tr.url.startsWith('/api/')) {
+            try {
+                const data = await api('/radio-music/music/direct-url?url=' + encodeURIComponent(tr.url));
+                if (data.audio_url) return { url: data.audio_url, ct: data.content_type || 'audio/mp4' };
+            } catch (e) {}
+            // Fallback: proxy URL (Chromecast → NAS → yt-dlp)
+            return {
+                url: location.origin + '/api/radio-music/music/stream?url=' + encodeURIComponent(tr.url) + '&token=' + (NAS.token || ''),
+                ct: 'audio/mp4'
+            };
+        }
+        if (tr.type === 'local') {
+            const path = tr.path || (tr.url?.match(/[?&]path=([^&]+)/)?.[1]);
+            if (path) {
+                return {
+                    url: location.origin + '/api/radio-music/local/stream?path=' + path + '&token=' + (NAS.token || ''),
+                    ct: 'audio/mpeg'
+                };
+            }
+        }
+        if (tr.type === 'radio' && tr.url) {
+            return { url: tr.url, ct: 'audio/mpeg' };
+        }
+        return null;
+    }
+
+    // Load full playlist queue on Chromecast (plays autonomously even when phone sleeps)
+    async function _castLoadQueue(startIdx) {
+        if (!_castSession) return _castLoadCurrentTrack();
+        const session = _castSession.getSessionObj ? _castSession.getSessionObj() : null;
+        if (!session || !session.queueLoad || _musicQueue.length <= 1) {
+            return _castLoadCurrentTrack();
+        }
+
+        // Resolve URLs for all queue items in parallel
+        const urlResults = await Promise.all(_musicQueue.map(tr => _resolveCastMediaUrl(tr)));
+
+        const items = [];
+        urlResults.forEach((resolved, i) => {
+            if (!resolved) return;
+            const tr = _musicQueue[i];
+            const mediaInfo = new chrome.cast.media.MediaInfo(resolved.url, resolved.ct);
+            mediaInfo.metadata = new chrome.cast.media.MusicTrackMediaMetadata();
+            mediaInfo.metadata.title = tr.name || tr.title || '';
+            mediaInfo.metadata.artist = tr.meta || tr.channel || '';
+            const img = tr.image || tr.thumbnail;
+            if (img) {
+                const imgUrl = img.startsWith('http') ? img : (location.origin + img);
+                mediaInfo.metadata.images = [new chrome.cast.Image(imgUrl)];
+            }
+            items.push(new chrome.cast.media.QueueItem(mediaInfo));
+        });
+
+        if (!items.length) return _castLoadCurrentTrack();
+
+        const queueRequest = new chrome.cast.media.QueueLoadRequest(items);
+        queueRequest.startIndex = startIdx ?? _musicQueueIdx ?? 0;
+        queueRequest.repeatMode = _repeatMode === 1 ? chrome.cast.media.RepeatMode.ALL
+            : _repeatMode === 2 ? chrome.cast.media.RepeatMode.SINGLE
+            : chrome.cast.media.RepeatMode.OFF;
+
+        try {
+            await new Promise((resolve, reject) => session.queueLoad(queueRequest, resolve, reject));
+            _castQueueActive = true;
+            _preCastVolume = (bodyEl.querySelector('#rm-vol')?.value || 80) / 100;
+            if (_audio) _audio.volume = 0;
+        } catch (err) {
+            console.warn('Cast queueLoad error:', err);
+            _castQueueActive = false;
+            return _castLoadCurrentTrack();
+        }
+    }
+
+    function _toggleCast() {
+        _cl('info', 'Cast toggle', { castAvail: _castAvail, isCasting: _isCasting, hasSession: !!_castSession });
+        if (!_audio) {
+            toast(t('Najpierw włącz muzykę'), 'info');
+            return;
+        }
+        if (_isCasting && _castSession) {
+            _cl('info', 'Disconnecting Cast');
+            _castSession.endSession(true);
+            _isCasting = false;
+            _castSession = null;
+            _castQueueActive = false;
+            _syncCastBtnUi(false);
+            if (_audio) _audio.volume = _preCastVolume;
+            return;
+        }
+        if (_castAvail) {
+            _cl('info', 'Requesting Cast session via SDK');
+            cast.framework.CastContext.getInstance().requestSession().catch(err => {
+                _cl('error', 'Cast requestSession failed', { error: String(err) });
+                if (err !== 'cancel') toast(t('Nie udało się połączyć z Chromecast'), 'error');
+            });
+            return;
+        }
+        // Fallback: Remote Playback API (limited — no auto-advance)
+        _cl('warning', 'Cast SDK not available, trying Remote Playback API fallback');
+        if (_audio.remote) {
+            _audio.remote.prompt().catch(err => {
+                if (err.name === 'NotAllowedError') return;
+                _cl('warning', 'Remote Playback API failed', { error: err.message });
+                toast(t('Chromecast niedostępny — użyj Chrome'), 'info');
+            });
+            return;
+        }
+        _cl('warning', 'No Cast method available');
+        toast(t('Chromecast niedostępny — użyj Chrome'), 'info');
+    }
+
+    function _syncCastBtnUi(casting) {
+        const btn = bodyEl?.querySelector('#rm-cast-btn');
+        if (btn) btn.classList.toggle('rm-casting', casting);
+        const npBtn = _npOverlay?.querySelector('#rm-np-cast');
+        if (npBtn) npBtn.classList.toggle('rm-lyrics-active', casting);
     }
 
     function _updateSeekbar() {
@@ -2282,9 +2906,6 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     }
 
     /* ── Now Playing Overlay ──────────────────────── */
-
-    let _npOverlay = null;
-    let _npSeekDragging = false;
 
     function _showNowPlaying() {
         if (!_playing) return;
@@ -2326,6 +2947,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                     <button class="rm-np-action" id="rm-np-queue-btn"><i class="fas fa-list-ol"></i> ${t('Kolejka')}</button>
                     <button class="rm-np-action" id="rm-np-lyrics"><i class="fas fa-align-left"></i> ${t('Tekst')}</button>
                     <button class="rm-np-action" id="rm-np-addpl"><i class="fas fa-plus"></i> ${t('Playlista')}</button>
+                    <button class="rm-np-action rm-np-cast-action" id="rm-np-cast"><i class="fab fa-chromecast"></i> Chromecast</button>
                     <button class="rm-np-action" id="rm-np-lock"><i class="fas fa-lock"></i> ${t('Blokada')}</button>
                     <button class="rm-np-action" id="rm-np-close2"><i class="fas fa-times"></i> ${t('Zamknij')}</button>
                 </div>
@@ -2513,24 +3135,33 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         // Lock screen — blocks all touches until swipe-up unlock
         ov.querySelector('#rm-np-lock').onclick = () => _showLockScreen();
 
+        // Cast button in NP overlay
+        const npCastBtn = ov.querySelector('#rm-np-cast');
+        if (npCastBtn) {
+            npCastBtn.onclick = () => _toggleCast();
+            if (_isCasting) npCastBtn.classList.add('rm-lyrics-active');
+        }
+
         // Seekbar for overlay
         if (hasSeek) {
             const npTrack = ov.querySelector('#rm-np-track');
+            const _seekTo = (pct) => {
+                if (_audio && isFinite(_audio.duration)) {
+                    _audio.currentTime = pct * _audio.duration;
+                }
+            };
             npTrack.onclick = (e) => {
-                if (!_audio || !isFinite(_audio.duration)) return;
                 const rect = npTrack.getBoundingClientRect();
-                const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                _audio.currentTime = pct * _audio.duration;
+                _seekTo(Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)));
             };
 
             // Touch drag for seek thumb
             const npThumb = ov.querySelector('#rm-np-thumb');
             npThumb.addEventListener('touchstart', () => { _npSeekDragging = true; }, { passive: true });
             document.addEventListener('touchmove', (e) => {
-                if (!_npSeekDragging || !_audio || !isFinite(_audio.duration)) return;
+                if (!_npSeekDragging) return;
                 const rect = npTrack.getBoundingClientRect();
-                const pct = Math.max(0, Math.min(1, (e.touches[0].clientX - rect.left) / rect.width));
-                _audio.currentTime = pct * _audio.duration;
+                _seekTo(Math.max(0, Math.min(1, (e.touches[0].clientX - rect.left) / rect.width)));
             }, { passive: true });
             document.addEventListener('touchend', () => { _npSeekDragging = false; }, { passive: true });
         }
@@ -2558,7 +3189,6 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         }
     }
 
-    let _lockOverlay = null;
     function _showLockScreen() {
         if (_lockOverlay) return;
         const item = _playing;

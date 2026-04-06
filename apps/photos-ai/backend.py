@@ -57,8 +57,21 @@ _MIN_YOLO_CONFIDENCE = 0.35
 _CLUSTER_THRESHOLD = 0.6
 
 _scan_lock = threading.Lock()
-_scan_state = {'running':False,'stop_requested':False,'total':0,'processed':0,
+_scan_state = {'running':False,'stop_requested':False,'paused':False,'total':0,'processed':0,
                'faces_found':0,'tags_found':0,'current_file':'','started_at':0}
+
+_AI_SETTINGS_FILE = os.path.join(DATA_ROOT, 'photos_ai_settings.json')
+
+def _load_ai_settings():
+    try:
+        with open(_AI_SETTINGS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _save_ai_settings(d):
+    with open(_AI_SETTINGS_FILE, 'w') as f:
+        json.dump(d, f)
 
 
 def _persist_scan_state(state_dict):
@@ -146,6 +159,10 @@ except Exception:
 def resume_interrupted_scan():
     """Called on app startup to resume a scan that was interrupted by a restart.
     Uses gevent.spawn_later to wait for full app init before starting."""
+    settings = _load_ai_settings()
+    if settings.get('auto_scan') is False:
+        log.info('AI auto-scan disabled by user setting, skipping resume')
+        return
     saved = _load_persisted_scan()
     if not saved:
         return
@@ -164,6 +181,7 @@ def resume_interrupted_scan():
             return
         _scan_state['running'] = True
         _scan_state['stop_requested'] = False
+        _scan_state['paused'] = False
     _launch_scan(folders)
 
 
@@ -327,6 +345,8 @@ def _process_image(path, conn, yolo):
         conn.execute(
             'INSERT INTO faces (photo_path,x,y,w,h,embedding) VALUES (?,?,?,?,?,?)',
             (path, f['x'], f['y'], f['w'], f['h'], _emb2blob(f['embedding'])))
+        face_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        _try_assign_face(conn, face_id, f['embedding'])
         ff += 1
     for obj in tags:
         conn.execute(
@@ -345,6 +365,35 @@ def _process_image(path, conn, yolo):
     except Exception:
         pass
     return ff, tf
+
+
+def _try_assign_face(conn, face_id, embedding):
+    """Incrementally assign a new face to an existing person by embedding similarity."""
+    import numpy as np
+    people = conn.execute(
+        'SELECT id FROM people WHERE hidden=0').fetchall()
+    if not people:
+        return
+    target = np.array(embedding)
+    best_pid, best_dist = None, _CLUSTER_THRESHOLD
+    for p in people:
+        rows = conn.execute(
+            'SELECT embedding FROM faces WHERE person_id=? LIMIT 30', (p['id'],)
+        ).fetchall()
+        if not rows:
+            continue
+        embs = np.array([_blob2emb(r['embedding']) for r in rows])
+        centroid = embs.mean(axis=0)
+        dist = float(np.linalg.norm(target - centroid))
+        if dist < best_dist:
+            best_dist = dist
+            best_pid = p['id']
+    if best_pid is not None:
+        conn.execute('UPDATE faces SET person_id=? WHERE id=?', (best_pid, face_id))
+        cnt = conn.execute(
+            'SELECT COUNT(DISTINCT photo_path) FROM faces WHERE person_id=?',
+            (best_pid,)).fetchone()[0]
+        conn.execute('UPDATE people SET photo_count=? WHERE id=?', (cnt, best_pid))
 
 
 # -- Clustering --
@@ -456,6 +505,11 @@ def _scan_worker(folders):
     for i, path in enumerate(todo):
         if _scan_state.get('stop_requested'):
             break
+        # Pause support: spin-wait while paused
+        while _scan_state.get('paused') and not _scan_state.get('stop_requested'):
+            gevent.sleep(1)
+        if _scan_state.get('stop_requested'):
+            break
         _scan_state['current_file'] = path
         gevent.sleep(0.3)  # throttle: yield CPU between images so server stays responsive
         ff, tf = _process_image(path, conn, yolo)
@@ -469,6 +523,13 @@ def _scan_worker(folders):
                                  'faces_found': _scan_state['faces_found'],
                                  'tags_found': _scan_state['tags_found'], 'started_at': t0})
             gevent.sleep(0.1)
+        # Run full clustering every 500 photos so new faces get grouped
+        if (i + 1) % 500 == 0:
+            try:
+                _run_clustering(conn)
+                log.info('Interim clustering at %d/%d photos', already_done + i + 1, total_all)
+            except Exception as e:
+                log.warning('Interim cluster: %s', e)
     np_ = 0
     try:
         np_ = _run_clustering(conn)
@@ -476,7 +537,7 @@ def _scan_worker(folders):
         log.warning('Cluster: %s', e)
     conn.close()
     dur = time.time() - t0
-    _scan_state.update(running=False, stop_requested=False, current_file='')
+    _scan_state.update(running=False, stop_requested=False, paused=False, current_file='')
     _clear_persisted_scan()
     s = _sio()
     if s:
@@ -584,13 +645,85 @@ def _launch_scan(folders):
 @admin_required
 def stop_scan():
     _scan_state['stop_requested'] = True
+    _scan_state['paused'] = False
     _clear_persisted_scan()
+    return jsonify({'ok': True})
+
+@photos_ai_bp.route('/pause-scan', methods=['POST'])
+@admin_required
+def pause_scan():
+    if not _scan_state['running']:
+        return jsonify({'error': 'Skanowanie nie jest uruchomione.'}), 400
+    _scan_state['paused'] = True
+    return jsonify({'ok': True})
+
+@photos_ai_bp.route('/resume-scan', methods=['POST'])
+@admin_required
+def resume_scan():
+    if not _scan_state['running']:
+        return jsonify({'error': 'Skanowanie nie jest uruchomione.'}), 400
+    _scan_state['paused'] = False
+    return jsonify({'ok': True})
+
+@photos_ai_bp.route('/rescan', methods=['POST'])
+@admin_required
+def rescan_from_scratch():
+    """Stop current scan, wipe scan_log, then start fresh scan."""
+    with _scan_lock:
+        if _scan_state['running']:
+            _scan_state['stop_requested'] = True
+            _scan_state['paused'] = False
+    # Wait for scan to stop (max 10s)
+    import gevent
+    for _ in range(20):
+        if not _scan_state['running']:
+            break
+        gevent.sleep(0.5)
+    deps = _check_deps()
+    if not deps.get('ready'):
+        return jsonify({'error': 'Zaleznosci nie zainstalowane.'}), 400
+    folders = _gallery_folders()
+    if not folders:
+        return jsonify({'error': 'Brak folderow zrodlowych w Galerii.'}), 400
+    # Wipe scan log so everything is rescanned
+    try:
+        conn = _get_db()
+        conn.execute('DELETE FROM scan_log')
+        conn.commit()
+        conn.close()
+        log.info('Wiped scan_log for full rescan')
+    except Exception as e:
+        log.warning('Failed to wipe scan_log: %s', e)
+    _clear_persisted_scan()
+    with _scan_lock:
+        _scan_state['running'] = True
+        _scan_state['stop_requested'] = False
+        _scan_state['paused'] = False
+    _launch_scan(folders)
+    return jsonify({'ok': True, 'message': 'Reskan od poczatku rozpoczety.'})
+
+@photos_ai_bp.route('/ai-settings', methods=['GET'])
+def get_ai_settings():
+    settings = _load_ai_settings()
+    return jsonify({
+        'auto_scan': settings.get('auto_scan', True),
+    })
+
+@photos_ai_bp.route('/ai-settings', methods=['POST'])
+@admin_required
+def set_ai_settings():
+    d = request.json or {}
+    settings = _load_ai_settings()
+    if 'auto_scan' in d:
+        settings['auto_scan'] = bool(d['auto_scan'])
+    _save_ai_settings(settings)
     return jsonify({'ok': True})
 
 @photos_ai_bp.route('/scan-status', methods=['GET'])
 def scan_status():
     return jsonify({
         'running': _scan_state['running'],
+        'paused': _scan_state.get('paused', False),
         'total': _scan_state['total'],
         'processed': _scan_state['processed'],
         'faces_found': _scan_state['faces_found'],

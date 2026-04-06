@@ -20,6 +20,7 @@ Routes:
   GET  /api/radio-music/music/check-deps   - check if yt-dlp is installed
   POST /api/radio-music/music/install-deps - install yt-dlp
   GET  /api/radio-music/music/search       - search YouTube music (?q=, ?limit=)
+  GET  /api/radio-music/music/direct-url   - get direct CDN audio URL for Chromecast (?url=)
   GET  /api/radio-music/music/stream       - proxy audio from YouTube (?url=)
   POST /api/radio-music/music/download     - download track to music folder
   POST /api/radio-music/music/download-playlist - download all tracks in a playlist
@@ -38,6 +39,8 @@ Routes:
   GET  /api/radio-music/history            - recently played items
   POST /api/radio-music/history            - add to history
   GET  /api/radio-music/most-played        - most played items by count
+  GET  /api/radio-music/playback-state     - get saved playback state (cross-device resume)
+  POST /api/radio-music/playback-state     - save playback state
   GET  /api/radio-music/lyrics             - fetch song lyrics (?title=, ?artist=)
 """
 
@@ -666,7 +669,28 @@ def most_played():
     return jsonify({'items': ranked[:limit]})
 
 
-@radio_music_bp.route('/lyrics', methods=['GET'])
+# ── Playback state (cross-device resume) ────────────────────
+
+@radio_music_bp.route('/playback-state', methods=['GET'])
+def get_playback_state():
+    """Return saved playback state for cross-device resume."""
+    pfile = _user_file('playback_state.json')
+    state = _load_json(pfile, {})
+    return jsonify(state)
+
+
+@radio_music_bp.route('/playback-state', methods=['POST'])
+def save_playback_state():
+    """Save current playback state for cross-device resume."""
+    data = request.get_json(silent=True) or {}
+    if not data.get('playing'):
+        return jsonify({'ok': True})
+    # Cap queue to 200 items
+    if 'queue' in data and len(data['queue']) > 200:
+        data['queue'] = data['queue'][:200]
+    pfile = _user_file('playback_state.json')
+    _save_json(pfile, data)
+    return jsonify({'ok': True})
 def lyrics_search():
     """Fetch song lyrics from lrclib.net (free, no API key needed)."""
     title = request.args.get('title', '').strip()
@@ -747,6 +771,12 @@ def _default_music_dir():
     return os.path.join('/home', username, 'Music')
 
 
+def _default_audiobooks_dir():
+    """User's home Audiobooks folder."""
+    username = getattr(g, 'username', None) or 'default'
+    return os.path.join('/home', username, 'Audiobooks')
+
+
 def _get_music_folders():
     """Return list of configured music folders + user home Music (always)."""
     folders = _load_json(_music_folders_file(), [])
@@ -755,6 +785,18 @@ def _get_music_folders():
     if home_music not in folders:
         folders.insert(0, home_music)
     return folders
+
+
+def _get_audiobook_folders():
+    """Return the audiobook folder list (just the default for now)."""
+    d = _default_audiobooks_dir()
+    os.makedirs(d, exist_ok=True)
+    return [d]
+
+
+def _get_all_local_folders():
+    """All allowed local folders (music + audiobooks) for path validation."""
+    return _get_music_folders() + _get_audiobook_folders()
 
 
 @radio_music_bp.route('/local/folders', methods=['GET'])
@@ -836,8 +878,13 @@ def _probe_audio(fpath):
 
 @radio_music_bp.route('/local/scan', methods=['GET'])
 def local_scan():
-    """Scan configured music folders for audio files with metadata."""
-    folders = _get_music_folders()
+    """Scan configured music/audiobook folders for audio files with metadata.
+    ?scope=audiobooks → scan Audiobooks folder; default → Music folders."""
+    scope = request.args.get('scope', 'music').strip()
+    if scope == 'audiobooks':
+        folders = _get_audiobook_folders()
+    else:
+        folders = _get_music_folders()
     items = []
     for base in folders:
         if not os.path.isdir(base):
@@ -879,13 +926,13 @@ def local_scan():
 @radio_music_bp.route('/local/stream', methods=['GET'])
 def local_stream():
     """Stream a local audio file."""
-    fpath = request.args.get('path', '').strip()
+    fpath = request.args.get('path', '').lstrip()
     if not fpath:
         return jsonify({'error': 'Brak ścieżki'}), 400
 
-    # Validate path is within one of the configured music folders
+    # Validate path is within one of the configured music or audiobook folders
     fpath = os.path.abspath(fpath)
-    folders = _get_music_folders()
+    folders = _get_all_local_folders()
     allowed = False
     for base in folders:
         try:
@@ -907,12 +954,12 @@ def local_stream():
 @radio_music_bp.route('/local/artwork', methods=['GET'])
 def local_artwork():
     """Extract embedded cover art from an audio file via ffmpeg."""
-    fpath = request.args.get('path', '').strip()
+    fpath = request.args.get('path', '').lstrip()
     if not fpath:
         return jsonify({'error': 'Brak ścieżki'}), 400
 
     fpath = os.path.abspath(fpath)
-    folders = _get_music_folders()
+    folders = _get_all_local_folders()
     allowed = False
     for base in folders:
         try:
@@ -1367,6 +1414,18 @@ def _extract_audio_url(video_url):
         if _YTDLP_URL_CACHE[k][2] < now:
             del _YTDLP_URL_CACHE[k]
     return audio_url, ct
+
+
+@radio_music_bp.route('/music/direct-url', methods=['GET'])
+def music_direct_url():
+    """Return the direct CDN audio URL (for Chromecast — bypasses proxy)."""
+    url = request.args.get('url', '').strip()
+    if not url:
+        return jsonify({'error': 'Brak URL'}), 400
+    audio_url, ct = _extract_audio_url(url)
+    if not audio_url:
+        return jsonify({'error': 'Extraction failed'}), 502
+    return jsonify({'ok': True, 'audio_url': audio_url, 'content_type': ct or 'audio/mp4'})
 
 
 @radio_music_bp.route('/music/stream', methods=['GET'])
