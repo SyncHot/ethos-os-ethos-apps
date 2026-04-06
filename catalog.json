@@ -42,7 +42,7 @@
         {
             "id": "doc-anonymizer",
             "name": "Document Anonymizer",
-            "version": "1.1.2",
+            "version": "1.1.3",
             "icon": "fa-user-shield",
             "color": "#0ea5e9",
             "category": "Tools",
@@ -301,7 +301,7 @@
         {
             "id": "sharing-dlna",
             "name": "DLNA (MiniDLNA)",
-            "version": "1.0.12",
+            "version": "1.0.13",
             "icon": "fa-photo-video",
             "color": "#6366f1",
             "category": "Media",
@@ -399,7 +399,7 @@
         {
             "id": "cloud-backup",
             "name": "Cloud Backup",
-            "version": "1.0.2",
+            "version": "1.0.3",
             "icon": "fa-cloud-upload-alt",
             "color": "#0ea5e9",
             "category": "Storage",
@@ -416,7 +416,7 @@
         {
             "id": "raid-lvm",
             "name": "RAID / LVM",
-            "version": "1.0.11",
+            "version": "1.0.12",
             "icon": "fa-layer-group",
             "color": "#f59e0b",
             "category": "Storage",
@@ -523,7 +523,7 @@
         {
             "id": "ups",
             "name": "UPS",
-            "version": "1.0.2",
+            "version": "1.0.3",
             "icon": "fa-battery-full",
             "color": "#f59e0b",
             "category": "System",
@@ -575,7 +575,7 @@
         {
             "id": "med-assistant",
             "name": "Medical Assistant",
-            "version": "0.0.2",
+            "version": "0.0.3",
             "icon": "fa-user-md",
             "color": "#06b6d4",
             "category": "Tools",
@@ -603,7 +603,7 @@
         {
             "id": "photos-ai",
             "name": "Photos AI",
-            "version": "0.0.5",
+            "version": "0.0.6",
             "icon": "fa-brain",
             "color": "#8b5cf6",
             "category": "Media",
@@ -641,7 +641,7 @@
         {
             "id": "video-station",
             "name": "Video Station",
-            "version": "0.0.3",
+            "version": "0.0.4",
             "icon": "fa-film",
             "color": "#7c3aed",
             "category": "Media",
