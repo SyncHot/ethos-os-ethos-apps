@@ -5,19 +5,31 @@ Routes:
   GET  /api/video-station/pkg-status      - dependency & library status
   POST /api/video-station/install         - install ffmpeg
   POST /api/video-station/uninstall       - cleanup
-  GET  /api/video-station/library         - list videos
+  GET  /api/video-station/library         - list videos (?watched=0|1 filter)
+  GET  /api/video-station/continue-watching - in-progress videos (position>0, not watched)
   GET  /api/video-station/folders         - configured library folders
   POST /api/video-station/folders         - save library folders
   POST /api/video-station/scan            - start background library scan
   GET  /api/video-station/scan-status     - scan progress
   POST /api/video-station/scan-stop       - stop running scan
-  GET  /api/video-station/info/<int:vid>  - detailed video metadata
-  GET  /api/video-station/stream/<int:vid>- stream video file
+  GET  /api/video-station/info/<int:vid>  - detailed video metadata (with TMDb credits)
+  GET  /api/video-station/stream/<int:vid>- stream video file (raw)
+  GET  /api/video-station/transcode/<int:vid> - transcode video (?audio=N, ?start=S)
+  POST /api/video-station/hls/<int:vid>/start - start HLS transcoding session
+  GET  /api/video-station/hls/<sid>/playlist.m3u8 - HLS playlist
+  GET  /api/video-station/hls/<sid>/<segment>  - HLS segment (.ts)
+  POST /api/video-station/hls/<sid>/stop       - stop HLS session
   GET  /api/video-station/thumb/<int:vid> - video thumbnail
   GET  /api/video-station/poster/<int:vid>- TMDb poster image
+  GET  /api/video-station/backdrop/<int:vid> - TMDb backdrop image
+  GET  /api/video-station/thumbstrip/<int:vid> - seekbar thumbnail sprite (VTT+image)
   GET  /api/video-station/recent          - recently added videos
   GET  /api/video-station/collections     - auto-generated collections
   POST /api/video-station/watched/<int:vid> - mark as watched / update position
+  POST /api/video-station/rescan-metadata - re-probe videos with empty codec info
+  POST /api/video-station/remove/<int:vid> - remove video from library (keeps file)
+  GET  /api/video-station/subtitles/<int:vid> - find subtitle files next to video
+  GET  /api/video-station/subtitle-file/<int:vid>/<filename> - serve subtitle (srt→vtt)
   GET  /api/video-station/tmdb-config     - get TMDb API key status
   POST /api/video-station/tmdb-config     - save TMDb API key
   POST /api/video-station/tmdb-match/<int:vid> - manually trigger TMDb match for a video
@@ -34,6 +46,8 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
+import tempfile
 import time
 import urllib.request
 import urllib.parse
@@ -43,11 +57,7 @@ from flask import Blueprint, jsonify, request, Response, send_file
 
 from host import host_run, q, data_path, app_path
 
-try:
-    from blueprints.admin_required import admin_required, require_auth
-except ImportError:
-    def admin_required(f): return f
-    def require_auth(f): return f
+from blueprints.admin_required import admin_required
 
 log = logging.getLogger('ethos.video_station')
 
@@ -56,15 +66,55 @@ video_station_bp = Blueprint('video-station', __name__, url_prefix='/api/video-s
 _DB_PATH = data_path('video_station.db')
 _THUMB_DIR = data_path('video_thumbs')
 _POSTER_DIR = data_path('video_posters')
+_BACKDROP_DIR = data_path('video_backdrops')
+_THUMBSTRIP_DIR = data_path('video_thumbstrips')
 _TMDB_CONF = data_path('video_tmdb.json')
 
 VIDEO_EXTS = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v',
               '.mpg', '.mpeg', '.ts', '.3gp', '.ogv', '.vob'}
 
+# Audio codecs that browsers can natively decode inside <video>
+_BROWSER_AUDIO_CODECS = {'aac', 'mp3', 'opus', 'vorbis', 'flac'}
+
+# Containers that browsers can play natively in <video>
+_BROWSER_CONTAINERS = {'.mp4', '.webm', '.m4v', '.ogg', '.ogv', '.mov'}
+
 _scan_state = {
     'running': False, 'stop_requested': False,
     'total': 0, 'processed': 0, 'current_file': '',
 }
+
+# ── HLS transcoding sessions ──────────────────────────────────
+_hls_sessions = {}   # session_id → {proc, tmpdir, vid, created}
+_HLS_MAX_AGE = 4 * 3600   # auto-cleanup after 4 hours
+
+
+def _cleanup_hls(session_id):
+    """Stop ffmpeg and remove temp dir for an HLS session."""
+    sess = _hls_sessions.pop(session_id, None)
+    if not sess:
+        return
+    proc = sess.get('proc')
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        except Exception:
+            pass
+    tmpdir = sess.get('tmpdir')
+    if tmpdir and os.path.isdir(tmpdir):
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _cleanup_stale_hls():
+    """Remove HLS sessions older than _HLS_MAX_AGE."""
+    now = time.time()
+    for sid in list(_hls_sessions):
+        if now - _hls_sessions[sid].get('created', 0) > _HLS_MAX_AGE:
+            _cleanup_hls(sid)
 
 
 # --- Database ---
@@ -73,6 +123,7 @@ def _get_db():
     conn = sqlite3.connect(_DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA foreign_keys=ON')
     return conn
 
 
@@ -107,6 +158,7 @@ def _init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_videos_folder ON videos(folder);
         CREATE INDEX IF NOT EXISTS idx_videos_filename ON videos(filename);
+        CREATE INDEX IF NOT EXISTS idx_videos_added_at ON videos(added_at);
     """)
     conn.commit()
     conn.close()
@@ -132,6 +184,11 @@ def _migrate_db():
             ('tmdb_genres', 'TEXT'),
             ('tmdb_poster_path', 'TEXT'),
             ('poster_ok', 'INTEGER DEFAULT 0'),
+            ('tmdb_backdrop_path', 'TEXT'),
+            ('backdrop_ok', 'INTEGER DEFAULT 0'),
+            ('tmdb_cast', 'TEXT'),
+            ('tmdb_director', 'TEXT'),
+            ('tmdb_media_type', 'TEXT'),
         ]
         for col_name, col_def in migrations:
             if col_name not in cols:
@@ -178,7 +235,8 @@ def _load_folders():
     p = data_path('video_folders.json')
     if os.path.isfile(p):
         try:
-            return json.loads(open(p).read())
+            with open(p) as f:
+                return json.loads(f.read())
         except Exception:
             pass
     return []
@@ -207,19 +265,34 @@ def _collect_videos(folders):
 def _probe_video(path):
     try:
         cmd = 'ffprobe -v quiet -print_format json -show_format -show_streams ' + q(path)
-        out = host_run(cmd, timeout=30)
-        data = json.loads(out)
+        result = host_run(cmd, timeout=30)
+        if result.returncode != 0:
+            log.debug('ffprobe non-zero exit for %s: %s', path, result.stderr)
+            return {}
+        data = json.loads(result.stdout)
         fmt = data.get('format', {})
         vstream = next((s for s in data.get('streams', []) if s.get('codec_type') == 'video'), {})
-        astream = next((s for s in data.get('streams', []) if s.get('codec_type') == 'audio'), {})
+        astreams = [s for s in data.get('streams', []) if s.get('codec_type') == 'audio']
+        first_audio = astreams[0] if astreams else {}
+        audio_tracks = []
+        for i, a in enumerate(astreams):
+            tags = a.get('tags', {})
+            audio_tracks.append({
+                'index': a.get('index', i),
+                'codec': a.get('codec_name', ''),
+                'channels': a.get('channels', 0),
+                'language': tags.get('language', ''),
+                'title': tags.get('title', ''),
+            })
         return {
             'duration': float(fmt.get('duration', 0)),
             'width': int(vstream.get('width', 0)),
             'height': int(vstream.get('height', 0)),
             'codec': vstream.get('codec_name', ''),
-            'audio_codec': astream.get('codec_name', ''),
+            'audio_codec': first_audio.get('codec_name', ''),
             'bitrate': int(fmt.get('bit_rate', 0)),
             'title': fmt.get('tags', {}).get('title', ''),
+            'audio_tracks': audio_tracks,
         }
     except Exception as e:
         log.debug('ffprobe failed for %s: %s', path, e)
@@ -232,8 +305,8 @@ def _generate_thumb(path, video_id, duration=0):
     seek = min(duration * 0.1, 30) if duration > 10 else 2
     try:
         cmd = 'ffmpeg -y -ss %.1f -i %s -vframes 1 -vf scale=320:-1 -q:v 4 %s' % (seek, q(path), q(thumb_path))
-        host_run(cmd, timeout=30)
-        return os.path.isfile(thumb_path)
+        result = host_run(cmd, timeout=30)
+        return result.returncode == 0 and os.path.isfile(thumb_path)
     except Exception:
         return False
 
@@ -253,6 +326,7 @@ def _format_duration(secs):
 
 _TMDB_BASE = 'https://api.themoviedb.org/3'
 _TMDB_IMG_BASE = 'https://image.tmdb.org/t/p/w500'
+_TMDB_BACKDROP_BASE = 'https://image.tmdb.org/t/p/w1280'
 
 # Common noise tokens stripped from filenames before TMDb search
 _NOISE_RE = re.compile(
@@ -291,7 +365,8 @@ def _parse_filename(filename):
 def _load_tmdb_key():
     if os.path.isfile(_TMDB_CONF):
         try:
-            return json.loads(open(_TMDB_CONF).read()).get('api_key', '')
+            with open(_TMDB_CONF) as f:
+                return json.loads(f.read()).get('api_key', '')
         except Exception:
             pass
     return ''
@@ -334,6 +409,7 @@ def _tmdb_search(title, year='', api_key=''):
                     'tmdb_rating': r.get('vote_average', 0),
                     'tmdb_genres': ','.join(str(g) for g in r.get('genre_ids', [])),
                     'tmdb_poster_path': r.get('poster_path', ''),
+                    'tmdb_backdrop_path': r.get('backdrop_path', ''),
                     'media_type': 'movie' if is_movie else 'tv',
                 }
         except Exception as e:
@@ -359,20 +435,64 @@ def _download_poster(poster_path, video_id):
         return False
 
 
+def _download_backdrop(backdrop_path, video_id):
+    """Download TMDb backdrop and save locally."""
+    if not backdrop_path:
+        return False
+    os.makedirs(_BACKDROP_DIR, exist_ok=True)
+    local = os.path.join(_BACKDROP_DIR, str(video_id) + '.jpg')
+    try:
+        url = _TMDB_BACKDROP_BASE + backdrop_path
+        req = urllib.request.Request(url, headers={'User-Agent': 'EthOS/1.0'})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            with open(local, 'wb') as f:
+                f.write(resp.read())
+        return os.path.isfile(local)
+    except Exception as e:
+        log.debug('Backdrop download failed for vid %s: %s', video_id, e)
+        return False
+
+
+def _fetch_tmdb_credits(tmdb_id, media_type, api_key):
+    """Fetch cast + director from TMDb credits API."""
+    if not tmdb_id or not api_key:
+        return '', ''
+    try:
+        url = '%s/%s/%d/credits?api_key=%s' % (
+            _TMDB_BASE, media_type, tmdb_id, urllib.parse.quote(api_key))
+        req = urllib.request.Request(url, headers={'User-Agent': 'EthOS/1.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        cast_names = [c['name'] for c in (data.get('cast') or [])[:10]]
+        directors = [c['name'] for c in (data.get('crew') or [])
+                     if c.get('job') == 'Director']
+        return ', '.join(cast_names), ', '.join(directors)
+    except Exception as e:
+        log.debug('TMDb credits fetch failed for %s/%s: %s', media_type, tmdb_id, e)
+        return '', ''
+
+
 def _tmdb_match_video(conn, video_id, filename, api_key=''):
-    """Parse filename, search TMDb, update DB, download poster."""
+    """Parse filename, search TMDb, update DB, download poster & backdrop, fetch credits."""
     title, year = _parse_filename(filename)
     if not title:
         return None
     result = _tmdb_search(title, year, api_key)
     if not result:
         return None
+
+    # Fetch credits (cast + director)
+    media_type = result.get('media_type', 'movie')
+    cast, director = _fetch_tmdb_credits(result['tmdb_id'], media_type, api_key)
+
     conn.execute(
         'UPDATE videos SET tmdb_id=?, tmdb_title=?, tmdb_overview=?, '
-        'tmdb_year=?, tmdb_rating=?, tmdb_genres=?, tmdb_poster_path=? WHERE id=?',
+        'tmdb_year=?, tmdb_rating=?, tmdb_genres=?, tmdb_poster_path=?, '
+        'tmdb_backdrop_path=?, tmdb_cast=?, tmdb_director=?, tmdb_media_type=? WHERE id=?',
         (result['tmdb_id'], result['tmdb_title'], result['tmdb_overview'],
          result['tmdb_year'], result['tmdb_rating'], result['tmdb_genres'],
-         result['tmdb_poster_path'], video_id))
+         result['tmdb_poster_path'], result.get('tmdb_backdrop_path', ''),
+         cast, director, media_type, video_id))
     conn.commit()
     # Update display title to TMDb title
     if result['tmdb_title']:
@@ -386,6 +506,12 @@ def _tmdb_match_video(conn, video_id, filename, api_key=''):
         ok = _download_poster(result['tmdb_poster_path'], video_id)
         if ok:
             conn.execute('UPDATE videos SET poster_ok=1 WHERE id=?', (video_id,))
+            conn.commit()
+    # Download backdrop
+    if result.get('tmdb_backdrop_path'):
+        ok = _download_backdrop(result['tmdb_backdrop_path'], video_id)
+        if ok:
+            conn.execute('UPDATE videos SET backdrop_ok=1 WHERE id=?', (video_id,))
             conn.commit()
     return result
 
@@ -483,11 +609,12 @@ def _scan_worker(folders, use_tmdb=False):
 # --- Routes ---
 
 @video_station_bp.route("/pkg-status", methods=["GET"])
-@require_auth
+
 def pkg_status():
     deps = _check_deps()
     stats = {}
     if os.path.isfile(_DB_PATH):
+        c = None
         try:
             c = _get_db()
             stats = {
@@ -495,9 +622,11 @@ def pkg_status():
                 "total_size": c.execute("SELECT COALESCE(SUM(file_size),0) FROM videos").fetchone()[0],
                 "watched": c.execute("SELECT COUNT(*) FROM watch_state WHERE watched=1").fetchone()[0],
             }
-            c.close()
         except Exception:
             pass
+        finally:
+            if c:
+                c.close()
     return jsonify({"installed": deps["ffmpeg"] and deps["ffprobe"], "deps": deps, "stats": stats, "scanning": _scan_state["running"]})
 
 
@@ -539,13 +668,13 @@ def uninstall_deps():
 
 
 @video_station_bp.route("/folders", methods=["GET"])
-@require_auth
+
 def get_folders():
     return jsonify({"folders": _load_folders()})
 
 
 @video_station_bp.route("/folders", methods=["POST"])
-@require_auth
+
 def save_folders():
     folders = (request.json or {}).get("folders", [])
     valid = []
@@ -560,7 +689,7 @@ def save_folders():
 
 
 @video_station_bp.route("/scan", methods=["POST"])
-@require_auth
+
 def start_scan():
     if _scan_state["running"]:
         return jsonify({"error": "Skan juz trwa."}), 409
@@ -577,14 +706,14 @@ def start_scan():
 
 
 @video_station_bp.route("/scan-stop", methods=["POST"])
-@require_auth
+
 def stop_scan():
     _scan_state["stop_requested"] = True
     return jsonify({"ok": True})
 
 
 @video_station_bp.route("/scan-status", methods=["GET"])
-@require_auth
+
 def scan_status():
     return jsonify({
         "running": _scan_state["running"],
@@ -594,8 +723,36 @@ def scan_status():
     })
 
 
+@video_station_bp.route("/continue-watching", methods=["GET"])
+
+def continue_watching():
+    """Return videos with saved position > 0 that are not yet marked as watched."""
+    conn = _get_db()
+    limit = min(int(request.args.get("limit", 20)), 60)
+    rows = conn.execute(
+        "SELECT v.*, ws.watched, ws.position FROM videos v "
+        "JOIN watch_state ws ON ws.video_id=v.id "
+        "WHERE ws.position > 0 AND (ws.watched=0 OR ws.watched IS NULL) "
+        "ORDER BY ws.updated_at DESC LIMIT ?", (limit,)).fetchall()
+    items = [{
+        "id": r["id"], "title": r["title"], "filename": r["filename"],
+        "path": r["path"], "duration": r["duration"],
+        "duration_fmt": _format_duration(r["duration"]),
+        "width": r["width"], "height": r["height"],
+        "thumb_ok": bool(r["thumb_ok"]),
+        "poster_ok": bool(r["poster_ok"]),
+        "tmdb_id": r["tmdb_id"] or 0,
+        "tmdb_title": r["tmdb_title"] or "",
+        "tmdb_year": r["tmdb_year"] or "",
+        "tmdb_rating": r["tmdb_rating"] or 0,
+        "watched": False, "position": r["position"] or 0,
+    } for r in rows]
+    conn.close()
+    return jsonify({"items": items})
+
+
 @video_station_bp.route("/library", methods=["GET"])
-@require_auth
+
 def library():
     conn = _get_db()
     offset = int(request.args.get("offset", 0))
@@ -603,6 +760,7 @@ def library():
     sort = request.args.get("sort", "added_desc")
     q_search = request.args.get("q", "").strip()
     folder_filter = request.args.get("folder", "")
+    watched_filter = request.args.get("watched", "")
     order_map = {
         "added_desc": "added_at DESC", "added_asc": "added_at ASC",
         "name_asc": "title ASC", "name_desc": "title DESC",
@@ -618,8 +776,14 @@ def library():
     if folder_filter:
         where.append("folder=?")
         params.append(folder_filter)
+    if watched_filter == '1':
+        where.append("COALESCE(ws.watched, 0)=1")
+    elif watched_filter == '0':
+        where.append("COALESCE(ws.watched, 0)=0")
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
-    total = conn.execute("SELECT COUNT(*) FROM videos " + where_sql, params).fetchone()[0]
+    total = conn.execute(
+        "SELECT COUNT(*) FROM videos v LEFT JOIN watch_state ws ON ws.video_id=v.id "
+        + where_sql, params).fetchone()[0]
     rows = conn.execute(
         "SELECT v.*, ws.watched, ws.position FROM videos v "
         "LEFT JOIN watch_state ws ON ws.video_id=v.id "
@@ -648,7 +812,7 @@ def library():
 
 
 @video_station_bp.route("/recent", methods=["GET"])
-@require_auth
+
 def recent():
     conn = _get_db()
     limit = min(int(request.args.get("limit", 20)), 60)
@@ -674,28 +838,28 @@ def recent():
 
 
 @video_station_bp.route("/collections", methods=["GET"])
-@require_auth
+
 def collections():
     conn = _get_db()
     rows = conn.execute(
-        "SELECT folder, COUNT(*) as cnt, SUM(duration) as total_dur "
-        "FROM videos GROUP BY folder ORDER BY cnt DESC LIMIT 50").fetchall()
+        "SELECT folder, COUNT(*) as cnt, SUM(duration) as total_dur, "
+        "(SELECT id FROM videos v2 WHERE v2.folder=v.folder AND v2.thumb_ok=1 LIMIT 1) as cover_id "
+        "FROM videos v GROUP BY folder ORDER BY cnt DESC LIMIT 50").fetchall()
     colls = []
     for r in rows:
         folder = r["folder"]
         name = os.path.basename(folder) or folder
-        cover = conn.execute("SELECT id FROM videos WHERE folder=? AND thumb_ok=1 LIMIT 1", (folder,)).fetchone()
         colls.append({
             "folder": folder, "name": name, "count": r["cnt"],
             "total_duration": _format_duration(r["total_dur"] or 0),
-            "cover_id": cover["id"] if cover else None,
+            "cover_id": r["cover_id"],
         })
     conn.close()
     return jsonify({"collections": colls})
 
 
 @video_station_bp.route("/info/<int:vid>", methods=["GET"])
-@require_auth
+
 def video_info(vid):
     conn = _get_db()
     r = conn.execute(
@@ -709,6 +873,27 @@ def video_info(vid):
         meta = json.loads(r["metadata_json"] or "{}")
     except Exception:
         pass
+    audio_codec = (r["audio_codec"] or "").lower()
+    ext = os.path.splitext(r["path"])[1].lower()
+    needs_tc = (bool(audio_codec) and audio_codec not in _BROWSER_AUDIO_CODECS) or \
+               (ext not in _BROWSER_CONTAINERS)
+    audio_tracks = meta.get("audio_tracks", [])
+
+    # Genre ID → name mapping (TMDb standard)
+    _GENRE_MAP = {
+        28: 'Akcja', 12: 'Przygodowy', 16: 'Animacja', 35: 'Komedia', 80: 'Kryminał',
+        99: 'Dokumentalny', 18: 'Dramat', 10751: 'Familijny', 14: 'Fantasy',
+        36: 'Historyczny', 27: 'Horror', 10402: 'Muzyczny', 9648: 'Tajemnica',
+        10749: 'Romans', 878: 'Sci-Fi', 10770: 'Film TV', 53: 'Thriller',
+        10752: 'Wojenny', 37: 'Western',
+        10759: 'Akcja i Przygoda', 10762: 'Dla dzieci', 10763: 'Informacyjny',
+        10764: 'Reality', 10765: 'Sci-Fi & Fantasy', 10766: 'Telenowela',
+        10767: 'Talk-show', 10768: 'Wojenny i Polityczny',
+    }
+    genre_ids = (r["tmdb_genres"] or "").split(",")
+    genre_names = [_GENRE_MAP.get(int(g.strip()), '') for g in genre_ids if g.strip().isdigit()]
+    genre_names = [g for g in genre_names if g]
+
     return jsonify({
         "id": r["id"], "title": r["title"], "filename": r["filename"],
         "path": r["path"], "folder": r["folder"],
@@ -718,19 +903,25 @@ def video_info(vid):
         "bitrate": r["bitrate"], "file_size": r["file_size"],
         "thumb_ok": bool(r["thumb_ok"]),
         "poster_ok": bool(r["poster_ok"]),
+        "backdrop_ok": bool(r["backdrop_ok"]) if "backdrop_ok" in r.keys() else False,
         "tmdb_id": r["tmdb_id"] or 0,
         "tmdb_title": r["tmdb_title"] or "",
         "tmdb_overview": r["tmdb_overview"] or "",
         "tmdb_year": r["tmdb_year"] or "",
         "tmdb_rating": r["tmdb_rating"] or 0,
         "tmdb_genres": r["tmdb_genres"] or "",
+        "genre_names": genre_names,
+        "tmdb_cast": r["tmdb_cast"] or "" if "tmdb_cast" in r.keys() else "",
+        "tmdb_director": r["tmdb_director"] or "" if "tmdb_director" in r.keys() else "",
         "watched": bool(r["watched"]), "position": r["position"] or 0,
         "added_at": r["added_at"], "metadata": meta,
+        "needs_transcode": needs_tc,
+        "audio_tracks": audio_tracks,
     })
 
 
 @video_station_bp.route("/thumb/<int:vid>", methods=["GET"])
-@require_auth
+
 def thumb(vid):
     p = os.path.join(_THUMB_DIR, str(vid) + ".jpg")
     if os.path.isfile(p):
@@ -739,7 +930,7 @@ def thumb(vid):
 
 
 @video_station_bp.route("/poster/<int:vid>", methods=["GET"])
-@require_auth
+
 def poster(vid):
     p = os.path.join(_POSTER_DIR, str(vid) + ".jpg")
     if os.path.isfile(p):
@@ -747,8 +938,115 @@ def poster(vid):
     return jsonify({"error": "Brak plakatu."}), 404
 
 
+@video_station_bp.route("/backdrop/<int:vid>", methods=["GET"])
+
+def backdrop(vid):
+    p = os.path.join(_BACKDROP_DIR, str(vid) + ".jpg")
+    if os.path.isfile(p):
+        return send_file(p, mimetype="image/jpeg")
+    return jsonify({"error": "Brak tła."}), 404
+
+
+_thumbstrip_generating = set()  # video IDs currently being generated
+
+
+@video_station_bp.route("/thumbstrip/<int:vid>", methods=["GET"])
+
+def thumbstrip(vid):
+    """Serve seekbar thumbnail sprite image.
+
+    Returns the sprite image (JPEG) if cached. If not cached, kicks off
+    background generation and returns 202 — client should retry later.
+    Sprite: 160x90 thumbnails every 30s, tiled 10 columns.
+    Uses fast keyframe-seek per thumbnail instead of decoding all frames.
+    """
+    conn = _get_db()
+    r = conn.execute("SELECT path, duration FROM videos WHERE id=?", (vid,)).fetchone()
+    conn.close()
+    if not r:
+        return jsonify({"error": "Nie znaleziono."}), 404
+
+    sprite_path = os.path.join(_THUMBSTRIP_DIR, str(vid) + ".jpg")
+
+    # Serve cached sprite
+    if os.path.isfile(sprite_path):
+        resp = send_file(sprite_path, mimetype="image/jpeg")
+        resp.headers["Cache-Control"] = "public, max-age=604800"
+        return resp
+
+    fp = os.path.realpath(r["path"])
+    if not os.path.isfile(fp):
+        return jsonify({"error": "Plik nie istnieje."}), 404
+
+    duration = r["duration"] or 0
+    if duration < 30:
+        return jsonify({"error": "Film za krótki."}), 400
+
+    if vid in _thumbstrip_generating:
+        return jsonify({"status": "generating"}), 202
+
+    # Start background generation
+    _thumbstrip_generating.add(vid)
+    import gevent
+    gevent.spawn(_generate_thumbstrip, vid, fp, duration, sprite_path)
+    return jsonify({"status": "generating"}), 202
+
+
+def _generate_thumbstrip(vid, fp, duration, sprite_path):
+    """Generate thumbnail sprite using fast keyframe seeks (background task)."""
+    tmpdir = None
+    try:
+        from PIL import Image
+        os.makedirs(_THUMBSTRIP_DIR, exist_ok=True)
+        interval = 30  # one thumb every 30 seconds
+        tmpdir = tempfile.mkdtemp(prefix="vs_ts_")
+        positions = list(range(0, int(duration), interval))
+        if not positions:
+            return
+
+        # Extract individual thumbnails using fast seek (-ss before -i)
+        thumb_w, thumb_h = 160, 90
+        cols = 10
+        frame_paths = []
+        for i, pos in enumerate(positions):
+            frame_path = os.path.join(tmpdir, "f%04d.jpg" % i)
+            cmd = 'ffmpeg -y -ss %d -i %s -vframes 1 -vf scale=%d:%d -q:v 6 %s' % (
+                pos, q(fp), thumb_w, thumb_h, q(frame_path))
+            result = host_run(cmd, timeout=30)
+            if result.returncode == 0 and os.path.isfile(frame_path):
+                frame_paths.append(frame_path)
+            else:
+                frame_paths.append(None)  # placeholder
+
+        valid = [p for p in frame_paths if p]
+        if not valid:
+            log.warning('Thumbstrip: no frames extracted for vid %s', vid)
+            return
+
+        # Tile into sprite using PIL (simple and reliable)
+        rows = (len(frame_paths) + cols - 1) // cols
+        sprite = Image.new('RGB', (cols * thumb_w, rows * thumb_h), (0, 0, 0))
+        for i, fpath in enumerate(frame_paths):
+            if fpath and os.path.isfile(fpath):
+                try:
+                    img = Image.open(fpath)
+                    sprite.paste(img, ((i % cols) * thumb_w, (i // cols) * thumb_h))
+                    img.close()
+                except Exception:
+                    pass  # black placeholder for failed frames
+        sprite.save(sprite_path, 'JPEG', quality=70)
+        log.info('Thumbstrip generated for vid %s: %d frames, %s',
+                 vid, len(valid), sprite_path)
+    except Exception as e:
+        log.warning('Thumbstrip generation error for vid %s: %s', vid, e)
+    finally:
+        _thumbstrip_generating.discard(vid)
+        if tmpdir and os.path.isdir(tmpdir):
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 @video_station_bp.route("/stream/<int:vid>", methods=["GET"])
-@require_auth
+
 def stream(vid):
     conn = _get_db()
     r = conn.execute("SELECT path FROM videos WHERE id=?", (vid,)).fetchone()
@@ -797,8 +1095,306 @@ def stream(vid):
     return send_file(fp, mimetype=mime)
 
 
+@video_station_bp.route("/transcode/<int:vid>", methods=["GET"])
+
+def transcode(vid):
+    """Stream video with audio re-encoded to AAC for browser compatibility.
+
+    Uses ffmpeg to copy the video stream (when h264) and transcode audio
+    to AAC, outputting fragmented MP4 suitable for progressive HTTP streaming.
+
+    Query params:
+        start  - seek to position in seconds before encoding
+        audio  - ffmpeg stream index for audio track (default: first audio)
+    """
+    conn = _get_db()
+    r = conn.execute("SELECT path, codec, audio_codec, metadata_json FROM videos WHERE id=?", (vid,)).fetchone()
+    conn.close()
+    if not r:
+        return jsonify({"error": "Nie znaleziono."}), 404
+    fp = os.path.realpath(r["path"])
+    if not os.path.isfile(fp):
+        return jsonify({"error": "Plik nie istnieje."}), 404
+    if not shutil.which("ffmpeg"):
+        return jsonify({"error": "ffmpeg nie jest zainstalowany."}), 500
+
+    vcodec = (r["codec"] or "").lower()
+    vcopy = vcodec in ("h264", "vp8", "vp9")
+    v_arg = "copy" if vcopy else "libx264"
+
+    start_sec = max(0.0, request.args.get("start", 0, type=float))
+    audio_idx = request.args.get("audio", None, type=int)
+
+    # Validate audio track index
+    if audio_idx is not None:
+        try:
+            tracks = json.loads(r["metadata_json"] or "{}").get("audio_tracks", [])
+        except Exception:
+            tracks = []
+        valid_indices = {t.get("index") for t in tracks} if tracks else set()
+        if valid_indices and audio_idx not in valid_indices:
+            return jsonify({"error": "Nieprawidłowy indeks ścieżki audio."}), 400
+
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    if start_sec > 0:
+        cmd += ["-ss", str(start_sec)]
+    cmd += ["-i", fp]
+    # Explicitly map first video + chosen audio to avoid subtitle stream issues
+    cmd += ["-map", "0:v:0"]
+    if audio_idx is not None:
+        cmd += ["-map", "0:%d" % audio_idx]
+    else:
+        cmd += ["-map", "0:a:0"]
+    cmd += [
+        "-c:v", v_arg,
+        "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+        "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+        "-f", "mp4",
+        "-"
+    ]
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def generate():
+        try:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        except (OSError, GeneratorExit):
+            pass
+        finally:
+            proc.stdout.close()
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            except Exception:
+                pass
+
+    return Response(generate(), mimetype="video/mp4",
+                    headers={
+                        "Cache-Control": "no-cache",
+                        "Accept-Ranges": "none",
+                        "X-Content-Type-Options": "nosniff",
+                    })
+
+
+# ── HLS endpoints ─────────────────────────────────────────────
+
+@video_station_bp.route("/hls/<int:vid>/start", methods=["POST"])
+def hls_start(vid):
+    """Start an HLS transcoding session.
+
+    POST body (JSON): {start: seconds, audio: track_index}
+    Returns: {ok, session_id}
+    """
+    _cleanup_stale_hls()
+
+    conn = _get_db()
+    r = conn.execute(
+        "SELECT path, codec, audio_codec, duration, metadata_json FROM videos WHERE id=?",
+        (vid,),
+    ).fetchone()
+    conn.close()
+    if not r:
+        return jsonify(error="Nie znaleziono."), 404
+    fp = os.path.realpath(r["path"])
+    if not os.path.isfile(fp):
+        return jsonify(error="Plik nie istnieje."), 404
+    if not shutil.which("ffmpeg"):
+        return jsonify(error="ffmpeg nie jest zainstalowany."), 500
+
+    data = request.get_json(silent=True) or {}
+    start_sec = max(0.0, float(data.get("start", 0)))
+    audio_idx = data.get("audio", None)
+
+    # Stop any existing HLS session for this video
+    for sid in list(_hls_sessions):
+        if _hls_sessions[sid].get("vid") == vid:
+            _cleanup_hls(sid)
+
+    vcodec = (r["codec"] or "").lower()
+    vcopy = vcodec in ("h264", "vp8", "vp9")
+    v_arg = "copy" if vcopy else "libx264 -preset ultrafast -crf 23"
+
+    session_id = "%d_%s" % (vid, os.urandom(4).hex())
+    tmpdir = tempfile.mkdtemp(prefix="vs_hls_")
+
+    cmd = "ffmpeg -hide_banner -loglevel error"
+    if start_sec > 0:
+        cmd += " -ss %s" % start_sec
+    cmd += " -i %s" % q(fp)
+    cmd += " -map 0:v:0"
+    if audio_idx is not None:
+        cmd += " -map 0:%d" % int(audio_idx)
+    else:
+        cmd += " -map 0:a:0"
+    cmd += " -c:v %s -c:a aac -b:a 192k -ac 2" % v_arg
+    cmd += " -f hls -hls_time 4 -hls_list_size 0"
+    cmd += " -hls_segment_type mpegts"
+    cmd += " -hls_segment_filename %s" % q(os.path.join(tmpdir, "seg%05d.ts"))
+    cmd += " -hls_flags append_list"
+    cmd += " -y %s" % q(os.path.join(tmpdir, "playlist.m3u8"))
+
+    log.info("HLS start vid=%d ss=%.1f cmd=%s", vid, start_sec, cmd[:200])
+
+    proc = subprocess.Popen(
+        ["bash", "-c", cmd],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+
+    _hls_sessions[session_id] = {
+        "proc": proc,
+        "tmpdir": tmpdir,
+        "vid": vid,
+        "start_offset": start_sec,
+        "duration": r["duration"] or 0,
+        "created": time.time(),
+    }
+
+    # Wait for first segment (up to 10s)
+    playlist_path = os.path.join(tmpdir, "playlist.m3u8")
+    for _ in range(100):
+        if os.path.exists(playlist_path) and os.path.getsize(playlist_path) > 20:
+            break
+        # Check if ffmpeg crashed
+        if proc.poll() is not None:
+            stderr = proc.stderr.read().decode(errors="replace")[:500] if proc.stderr else ""
+            _cleanup_hls(session_id)
+            log.error("HLS ffmpeg crashed: %s", stderr)
+            return jsonify(error="Transkodowanie nie powiodło się: " + stderr), 500
+        time.sleep(0.1)
+
+    return jsonify(ok=True, session_id=session_id, start_offset=start_sec)
+
+
+@video_station_bp.route("/hls/<session_id>/playlist.m3u8")
+def hls_playlist(session_id):
+    """Serve a VOD-style HLS playlist.
+
+    Reads the actual segments produced so far and appends estimated future
+    segments to fill the known total duration.  Always includes
+    #EXT-X-PLAYLIST-TYPE:VOD and #EXT-X-ENDLIST so hls.js shows a seekbar.
+    """
+    sess = _hls_sessions.get(session_id)
+    if not sess:
+        return "", 404
+    path = os.path.join(sess["tmpdir"], "playlist.m3u8")
+    if not os.path.exists(path):
+        return "", 404
+
+    with open(path, "r") as f:
+        raw = f.read()
+
+    total_duration = sess.get("duration", 0)
+    start_offset = sess.get("start_offset", 0)
+    effective_dur = max(0, total_duration - start_offset)
+
+    # Parse existing segment entries (lines: #EXTINF:x.xxx, / segNNNNN.ts)
+    seg_re = re.compile(r"#EXTINF:([\d.]+),?\s*\n(\S+\.ts)")
+    actual_segs = seg_re.findall(raw)
+    actual_total = sum(float(d) for d, _ in actual_segs)
+    num_actual = len(actual_segs)
+
+    proc = sess.get("proc")
+    finished = proc is None or proc.poll() is not None
+
+    if finished and effective_dur > 0 and actual_total > 0:
+        # ffmpeg done — playlist is accurate, just ensure ENDLIST
+        if "#EXT-X-ENDLIST" not in raw:
+            raw = raw.rstrip() + "\n#EXT-X-ENDLIST\n"
+        content = raw
+    else:
+        # Build a VOD playlist: real segments + estimated future segments
+        avg_seg = actual_total / num_actual if num_actual > 0 else 10.0
+        target_dur = max(10, int(avg_seg) + 1)
+
+        lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:3",
+            "#EXT-X-TARGETDURATION:%d" % target_dur,
+            "#EXT-X-MEDIA-SEQUENCE:0",
+            "#EXT-X-PLAYLIST-TYPE:VOD",
+        ]
+
+        # Add real segments
+        for dur, name in actual_segs:
+            lines.append("#EXTINF:%s," % dur)
+            lines.append(name)
+
+        # Add estimated future segments
+        remaining = max(0, effective_dur - actual_total)
+        if remaining > 1.0 and not finished:
+            next_idx = num_actual
+            produced = 0.0
+            while produced < remaining:
+                seg_dur = min(avg_seg, remaining - produced)
+                if seg_dur < 0.1:
+                    break
+                lines.append("#EXTINF:%.6f," % seg_dur)
+                lines.append("seg%05d.ts" % next_idx)
+                next_idx += 1
+                produced += seg_dur
+
+        lines.append("#EXT-X-ENDLIST")
+        content = "\n".join(lines) + "\n"
+
+    resp = Response(content, mimetype="application/vnd.apple.mpegurl")
+    resp.headers["Cache-Control"] = "no-cache, no-store"
+    return resp
+
+
+@video_station_bp.route("/hls/<session_id>/<filename>")
+def hls_segment(session_id, filename):
+    """Serve an HLS segment (.ts file).
+
+    If the segment hasn't been produced yet, wait up to 120s for ffmpeg
+    to catch up (with -c:v copy this is much faster than real-time).
+    """
+    sess = _hls_sessions.get(session_id)
+    if not sess:
+        return "", 404
+
+    # Security: only .ts files, no path traversal
+    if not filename.endswith(".ts") or "/" in filename or ".." in filename:
+        return "", 400
+
+    path = os.path.join(sess["tmpdir"], filename)
+
+    # Wait for segment to be produced by ffmpeg
+    if not os.path.exists(path):
+        proc = sess.get("proc")
+        for _ in range(1200):   # up to 120 seconds
+            if os.path.exists(path):
+                break
+            if proc and proc.poll() is not None:
+                # ffmpeg finished but segment doesn't exist
+                return "", 404
+            time.sleep(0.1)
+        else:
+            return "", 404
+        # Brief pause to let ffmpeg finish writing the segment
+        time.sleep(0.05)
+
+    resp = send_file(path, mimetype="video/MP2T")
+    resp.headers["Cache-Control"] = "public, max-age=86400"
+    return resp
+
+
+@video_station_bp.route("/hls/<session_id>/stop", methods=["POST"])
+def hls_stop_session(session_id):
+    """Stop an HLS transcoding session and clean up."""
+    _cleanup_hls(session_id)
+    return jsonify(ok=True)
+
+
 @video_station_bp.route("/watched/<int:vid>", methods=["POST"])
-@require_auth
+
 def update_watched(vid):
     d = request.json or {}
     conn = _get_db()
@@ -818,10 +1414,129 @@ def update_watched(vid):
     return jsonify({"ok": True})
 
 
-# --- TMDb config & matching routes ---
+@video_station_bp.route("/rescan-metadata", methods=["POST"])
+@admin_required
+def rescan_metadata():
+    """Re-probe all videos with empty codec metadata (fixes broken scans)."""
+    if not _all_deps_ok():
+        return jsonify({"error": "Brak ffmpeg/ffprobe."}), 400
+    force_all = request.json and request.json.get("all", False)
+    conn = _get_db()
+    if force_all:
+        rows = conn.execute("SELECT id, path FROM videos").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, path FROM videos WHERE codec IS NULL OR codec = ''").fetchall()
+    updated = 0
+    for r in rows:
+        path = r["path"]
+        if not os.path.isfile(path):
+            continue
+        meta = _probe_video(path)
+        if meta.get("codec"):
+            conn.execute(
+                "UPDATE videos SET codec=?, audio_codec=?, duration=?, width=?, "
+                "height=?, bitrate=?, metadata_json=? WHERE id=?",
+                (meta.get("codec", ""), meta.get("audio_codec", ""),
+                 meta.get("duration", 0), meta.get("width", 0),
+                 meta.get("height", 0), meta.get("bitrate", 0),
+                 json.dumps(meta), r["id"]))
+            updated += 1
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "updated": updated, "total": len(rows)})
+
+
+@video_station_bp.route("/remove/<int:vid>", methods=["POST"])
+
+def remove_from_library(vid):
+    """Remove video from library without deleting the file."""
+    conn = _get_db()
+    r = conn.execute("SELECT id FROM videos WHERE id=?", (vid,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify({"error": "Nie znaleziono."}), 404
+    conn.execute("DELETE FROM watch_state WHERE video_id=?", (vid,))
+    conn.execute("DELETE FROM videos WHERE id=?", (vid,))
+    conn.commit()
+    conn.close()
+    # Remove thumbnail and poster
+    for d in (_THUMB_DIR, _POSTER_DIR):
+        p = os.path.join(d, str(vid) + '.jpg')
+        if os.path.isfile(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+    return jsonify({"ok": True})
+
+
+@video_station_bp.route("/subtitles/<int:vid>", methods=["GET"])
+
+def subtitles(vid):
+    """Find subtitle files (.srt, .ass, .ssa, .vtt) next to the video file."""
+    conn = _get_db()
+    r = conn.execute("SELECT path FROM videos WHERE id=?", (vid,)).fetchone()
+    conn.close()
+    if not r:
+        return jsonify({"error": "Nie znaleziono."}), 404
+    video_path = r["path"]
+    base = os.path.splitext(video_path)[0]
+    video_dir = os.path.dirname(video_path)
+    video_stem = os.path.splitext(os.path.basename(video_path))[0]
+    sub_exts = {'.srt', '.ass', '.ssa', '.vtt'}
+    subs = []
+    if os.path.isdir(video_dir):
+        for fn in os.listdir(video_dir):
+            fext = os.path.splitext(fn)[1].lower()
+            if fext in sub_exts and fn.lower().startswith(video_stem.lower()):
+                # Extract language tag from filename like "movie.en.srt"
+                parts = os.path.splitext(fn)[0].split('.')
+                lang = parts[-1] if len(parts) > 1 and len(parts[-1]) <= 3 else ''
+                subs.append({
+                    "filename": fn,
+                    "path": os.path.join(video_dir, fn),
+                    "language": lang,
+                    "format": fext[1:],
+                })
+    return jsonify({"ok": True, "subtitles": subs})
+
+
+@video_station_bp.route("/subtitle-file/<int:vid>/<path:filename>", methods=["GET"])
+
+def subtitle_file(vid, filename):
+    """Serve a subtitle file. Converts SRT to VTT for browser compatibility."""
+    conn = _get_db()
+    r = conn.execute("SELECT path FROM videos WHERE id=?", (vid,)).fetchone()
+    conn.close()
+    if not r:
+        return jsonify({"error": "Nie znaleziono."}), 404
+    video_dir = os.path.dirname(r["path"])
+    sub_path = os.path.realpath(os.path.join(video_dir, filename))
+    # Ensure path is within the video directory
+    if not sub_path.startswith(os.path.realpath(video_dir) + os.sep):
+        return jsonify({"error": "Niedozwolona ścieżka."}), 403
+    if not os.path.isfile(sub_path):
+        return jsonify({"error": "Plik napisów nie istnieje."}), 404
+
+    ext = os.path.splitext(sub_path)[1].lower()
+    if ext == '.vtt':
+        return send_file(sub_path, mimetype="text/vtt")
+
+    # Convert SRT → VTT on-the-fly
+    if ext == '.srt':
+        try:
+            with open(sub_path, 'r', encoding='utf-8', errors='replace') as f:
+                srt_content = f.read()
+            vtt = "WEBVTT\n\n" + srt_content.replace(',', '.')
+            return Response(vtt, mimetype="text/vtt")
+        except Exception:
+            return jsonify({"error": "Błąd odczytu napisów."}), 500
+
+    return send_file(sub_path, mimetype="text/plain")
 
 @video_station_bp.route("/tmdb-config", methods=["GET"])
-@require_auth
+
 def tmdb_config_get():
     key = _load_tmdb_key()
     return jsonify({
@@ -852,7 +1567,7 @@ def tmdb_config_save():
 
 
 @video_station_bp.route("/tmdb-match/<int:vid>", methods=["POST"])
-@require_auth
+
 def tmdb_match_one(vid):
     conn = _get_db()
     r = conn.execute("SELECT id, filename FROM videos WHERE id=?", (vid,)).fetchone()
@@ -871,7 +1586,7 @@ def tmdb_match_one(vid):
 
 
 @video_station_bp.route("/tmdb-match-all", methods=["POST"])
-@require_auth
+
 def tmdb_match_all():
     api_key = _load_tmdb_key()
     if not api_key:
