@@ -626,7 +626,7 @@
         {
             "id": "security-advisor",
             "name": "Security Advisor",
-            "version": "0.0.2",
+            "version": "0.0.3",
             "icon": "fa-user-shield",
             "color": "#059669",
             "category": "Security",
