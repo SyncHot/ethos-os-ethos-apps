@@ -1472,7 +1472,9 @@ manual_add_modules overlay
 manual_add_modules loop
 manual_add_modules dm_verity
 manual_add_modules dm_mod
+manual_add_modules btrfs
 copy_exec /sbin/losetup /sbin
+copy_exec /sbin/blkid /sbin
 # dm-verity support (optional — only if veritysetup is installed)
 if [ -x /sbin/veritysetup ]; then
     copy_exec /sbin/veritysetup /sbin
@@ -1482,8 +1484,10 @@ chmod +x "$ROOT/etc/initramfs-tools/hooks/ethos-overlay"
 
 cat > "$ROOT/etc/initramfs-tools/scripts/local-bottom/ethos-overlay" <<'OVERLAYEOF'
 #!/bin/sh
-# EthOS SquashFS + OverlayFS boot script with optional dm-verity integrity check
-# Converts ext4 root into: squashfs (read-only lower) + ext4 overlay (writable upper)
+# EthOS SquashFS + OverlayFS boot script
+# Lower layer: read-only squashfs on Root-A/B partition
+# Upper layer: writable overlay — prefers EthOS-Data btrfs partition (like Synology),
+#              falls back to Root-A/B ext4 partition if data disk unavailable.
 # Activated by kernel cmdline: ethos.rootfs=squashfs
 PREREQ=""
 prereqs() {{ echo "$PREREQ"; }}
@@ -1493,8 +1497,36 @@ grep -q "ethos.rootfs=squashfs" /proc/cmdline || exit 0
 modprobe -q squashfs 2>/dev/null || true
 modprobe -q overlay 2>/dev/null || true
 modprobe -q loop 2>/dev/null || true
+modprobe -q btrfs 2>/dev/null || true
 mkdir -p /run/ethos-rootfs
 mount --move "${{rootmnt}}" /run/ethos-rootfs
+
+# Determine boot slot (a or b) from cmdline
+SLOT="a"
+for arg in $(cat /proc/cmdline); do
+    case "$arg" in ethos.slot=*) SLOT="${{arg#ethos.slot=}}" ;; esac
+done
+
+# ── Try to use EthOS-Data btrfs partition for overlay (Synology-style) ──
+DATA_UPPER=""
+DATA_DEV=$(blkid -L EthOS-Data 2>/dev/null)
+if [ -n "$DATA_DEV" ]; then
+    DATA_MNT=/run/ethos-data
+    mkdir -p "$DATA_MNT"
+    if mount -t btrfs -o subvol=@data,noatime "$DATA_DEV" "$DATA_MNT" 2>/dev/null; then
+        UPPER="$DATA_MNT/ethos/overlay/$SLOT/upper"
+        WORK="$DATA_MNT/ethos/overlay/$SLOT/work"
+        mkdir -p "$UPPER" "$WORK"
+        DATA_UPPER=1
+    fi
+fi
+
+# ── Fallback: use overlay dirs on Root-A/B partition ──
+if [ -z "$DATA_UPPER" ]; then
+    UPPER=/run/ethos-rootfs/overlay/upper
+    WORK=/run/ethos-rootfs/overlay/work
+    mkdir -p "$UPPER" "$WORK"
+fi
 
 # dm-verity integrity check (optional — runs if roothash and verity data exist)
 VERITY_OK=0
@@ -1508,7 +1540,6 @@ if [ -f "$ROOTHASH_FILE" ] && [ -f "$VERITY_FILE" ] && command -v veritysetup >/
     LOOP_DEV=$(losetup --find --show "$SQSH_FILE")
     HASH_DEV=$(losetup --find --show "$VERITY_FILE")
     if veritysetup open --hash-offset=0 "$LOOP_DEV" ethos-verity "$HASH_DEV" "$ROOTHASH" 2>/dev/null; then
-        # Verified! Mount from dm-verity device
         mkdir -p /run/ethos-sqsh
         if mount -t squashfs -o ro /dev/mapper/ethos-verity /run/ethos-sqsh 2>/dev/null; then
             VERITY_OK=1
@@ -1532,18 +1563,23 @@ if [ "$VERITY_OK" = "0" ]; then
     fi
 fi
 
-mkdir -p /run/ethos-rootfs/overlay/upper /run/ethos-rootfs/overlay/work
 if ! mount -t overlay overlay \
-    -o "lowerdir=/run/ethos-sqsh,upperdir=/run/ethos-rootfs/overlay/upper,workdir=/run/ethos-rootfs/overlay/work" \
+    -o "lowerdir=/run/ethos-sqsh,upperdir=$UPPER,workdir=$WORK" \
     "${{rootmnt}}" 2>/dev/null; then
     umount /run/ethos-sqsh 2>/dev/null
     [ "$VERITY_OK" = "1" ] && veritysetup close ethos-verity 2>/dev/null
+    [ -n "$DATA_UPPER" ] && umount /run/ethos-data 2>/dev/null
     mount --move /run/ethos-rootfs "${{rootmnt}}"
     exit 0
 fi
 mkdir -p "${{rootmnt}}/.squashfs" "${{rootmnt}}/.rootfs"
 mount --move /run/ethos-rootfs "${{rootmnt}}/.rootfs"
 mount --move /run/ethos-sqsh "${{rootmnt}}/.squashfs"
+# Expose data partition mount inside the new root for runtime use
+if [ -n "$DATA_UPPER" ]; then
+    mkdir -p "${{rootmnt}}/run/ethos-data"
+    mount --move /run/ethos-data "${{rootmnt}}/run/ethos-data"
+fi
 OVERLAYEOF
 chmod +x "$ROOT/etc/initramfs-tools/scripts/local-bottom/ethos-overlay"
 
@@ -2243,9 +2279,26 @@ def _github_api(method, path, token, body=None, timeout=30):
     except urllib.error.HTTPError as e:
         try:
             body_text = e.read().decode()
-            return e.code, json.loads(body_text)
+            parsed = json.loads(body_text)
+            # Enrich with human-readable context for common errors
+            if e.code == 401:
+                parsed['_hint'] = 'Nieprawidłowy token GitHub. Sprawdź token w konfiguracji Publishera.'
+            elif e.code == 403:
+                rate_remaining = e.headers.get('X-RateLimit-Remaining', '?')
+                if rate_remaining == '0':
+                    reset_ts = e.headers.get('X-RateLimit-Reset', '')
+                    parsed['_hint'] = f'Przekroczono limit GitHub API. Poczekaj chwilę.'
+                else:
+                    parsed['_hint'] = 'Brak uprawnień. Token musi mieć scope: repo (lub contents:write).'
+            elif e.code == 404:
+                parsed['_hint'] = f'Nie znaleziono zasobu GitHub: {path}'
+            elif e.code == 422:
+                parsed['_hint'] = 'GitHub odrzucił żądanie (błąd walidacji). Sprawdź zawartość pliku.'
+            return e.code, parsed
         except Exception:
             return e.code, {'message': str(e)}
+    except Exception as e:
+        return 0, {'message': f'Błąd sieci: {e}'}
 
 
 def _bump_version(ver):
@@ -2414,7 +2467,9 @@ def publish_apps():
             # Get current main branch ref
             code, ref_data = _github_api('GET', f'/repos/{repo}/git/ref/heads/main', token)
             if code != 200:
-                yield _sse({'type': 'done', 'success': False, 'message': f'Nie można pobrać ref main: {ref_data.get("message", code)}'})
+                hint = ref_data.get('_hint', '')
+                msg = ref_data.get('message', str(code))
+                yield _sse({'type': 'done', 'success': False, 'message': f'Nie można pobrać ref main: {msg}' + (f' — {hint}' if hint else '')})
                 return
             current_sha = ref_data['object']['sha']
 
