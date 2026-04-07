@@ -984,6 +984,7 @@ services:
 
     // Initial render
     checkDockerAndRender();
+}
 
 
 // ═══════════════════════════════════════════════════════════
