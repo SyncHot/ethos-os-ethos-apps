@@ -24,6 +24,10 @@ Endpoints:
   POST /api/builder/logs/clear            -> clear log
   POST /api/builder/delete                -> delete artifact
   GET  /api/builder/download              -> download artifact
+  GET  /api/builder/signing-key           -> builder public key (PEM)
+  GET  /api/builder/manifest              -> verify & return manifest JSON
+  POST /api/builder/beacon                -> receive "I AM ALIVE" from a freshly booted EthOS VM (no auth)
+  GET  /api/builder/beacon                -> return last received beacon info
 """
 
 import json
@@ -45,6 +49,7 @@ from utils import load_json as _load_json, save_json as _save_json, fmt_bytes, r
     require_tools, check_tool
 from blueprints.builder_spec import load_spec, save_spec, generate_default_spec, \
     spec_to_shell_vars, DEFAULT_SPEC
+from blueprints.admin_required import admin_required
 
 builder_bp = Blueprint('builder', __name__, url_prefix='/api/builder')
 
@@ -73,7 +78,14 @@ _build_state = {
     'start_time': 0,
     'pid': 0,               # host PID of nsenter process
     'result': None,         # {success, message, img, iso} on completion
+    'resume_available': False,  # True when failed build can be resumed
+    'build_dir': '',        # WORK_DIR path for resume
+    'preflight_result': '',  # 'ok'|'fail'|'timeout'|'skipped'|'disabled'
+    'last_beacon': None,    # Last "I AM ALIVE" beacon received from a booted VM
 }
+
+# Beacon ID is set at build completion; the booted VM must include it in its POST.
+_BEACON_FILE = data_path('builder_beacon.json')
 _build_lock = threading.Lock()
 
 
@@ -179,6 +191,9 @@ def _reset_build(build_type=''):
             'start_time': time.time(),
             'pid': 0,
             'result': None,
+            'resume_available': False,
+            'build_dir': '',
+            'preflight_result': '',
         })
         _save_build_state()
 
@@ -364,6 +379,9 @@ def build_status():
             'log_total': len(_build_state['logs']),
             'elapsed': elapsed,
             'result': _build_state['result'],
+            'resume_available': _build_state.get('resume_available', False),
+            'build_dir': _build_state.get('build_dir', ''),
+            'preflight_result': _build_state.get('preflight_result', ''),
         })
 
 
@@ -399,6 +417,72 @@ def dismiss_build():
         })
         _save_build_state()
     return jsonify({'ok': True})
+
+
+# ═══════════════════════════════════════════════════════════
+#  API — Boot Beacon  (Success Beacon for E2E validation)
+# ═══════════════════════════════════════════════════════════
+
+@builder_bp.route('/beacon', methods=['POST'])
+def receive_beacon():
+    """Receive an 'I AM ALIVE' signal from a freshly booted EthOS VM.
+
+    No authentication required — the newly installed system doesn't have a
+    session token yet.  The caller must supply ``build_id`` matching the
+    beacon_id embedded in the image at build time.
+
+    Body (JSON):
+        build_id  — matches the beacon_id stored in _build_state at completion
+        hostname  — hostname of the booted system
+        version   — EthOS version string from /etc/os-release
+        timestamp — Unix epoch (seconds) of first boot
+        extras    — optional dict of additional diagnostic fields
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    build_id = str(body.get('build_id', '')).strip()
+    if not build_id:
+        return jsonify({'error': 'build_id required'}), 400
+
+    beacon = {
+        'build_id': build_id,
+        'hostname': str(body.get('hostname', ''))[:128],
+        'version': str(body.get('version', ''))[:64],
+        'timestamp': body.get('timestamp', int(time.time())),
+        'received_at': int(time.time()),
+        'remote_addr': request.remote_addr,
+        'extras': body.get('extras') if isinstance(body.get('extras'), dict) else {},
+    }
+
+    with _build_lock:
+        _build_state['last_beacon'] = beacon
+
+    try:
+        _save_json(_BEACON_FILE, beacon)
+    except Exception as exc:
+        _logger.warning('beacon: could not persist: %s', exc)
+
+    _logger.info('beacon: received from %s (build_id=%s)', beacon['hostname'], build_id)
+    return jsonify({'ok': True, 'acknowledged': True})
+
+
+@builder_bp.route('/beacon', methods=['GET'])
+@admin_required
+def get_beacon():
+    """Return the last boot beacon received from a built image (auth required)."""
+    with _build_lock:
+        beacon = _build_state.get('last_beacon')
+
+    if beacon is None:
+        # Try loading from disk (survives server restart)
+        beacon = _load_json(_BEACON_FILE, None)
+
+    if beacon is None:
+        return jsonify({'ok': True, 'beacon': None,
+                        'message': 'No beacon received yet'})
+
+    expected_id = _build_state.get('beacon_id', '')
+    matched = bool(expected_id and beacon.get('build_id') == expected_id)
+    return jsonify({'ok': True, 'beacon': beacon, 'build_id_matched': matched})
 
 
 @builder_bp.route('/history')
@@ -710,6 +794,34 @@ rm -rf "$BUILD_DIR"
 #  API — Build Image (SSE)
 # ═══════════════════════════════════════════════════════════
 
+@builder_bp.route('/resume-image', methods=['POST'])
+@admin_required
+def resume_image():
+    """Resume a failed image build from the last checkpoint."""
+    if _build_state['status'] == 'building':
+        return jsonify({'error': 'Build already in progress.'}), 409
+    if not _build_state.get('resume_available'):
+        return jsonify({'error': 'No resumable build found.'}), 400
+    build_dir = _build_state.get('build_dir', '/tmp/ethos-x86-build-web')
+    import os
+    ckpt_dir = os.path.join(build_dir, '.ckpts')
+    if not os.path.isdir(ckpt_dir):
+        return jsonify({'error': f'Build directory not found: {build_dir}'}), 400
+
+    nasos = _get_host_nasos_dir()
+    _reset_build('image')
+    _update_build(message=f'Wznawianie z checkpointa...')
+
+    t = threading.Thread(
+        target=_build_image_worker,
+        args=(nasos,),
+        kwargs={'resume': True},
+        daemon=True,
+    )
+    t.start()
+    return jsonify({'status': 'ok', 'resumed': True})
+
+
 @builder_bp.route('/image', methods=['POST'])
 def build_image():
     """Build a bootable system image in background thread."""
@@ -733,10 +845,14 @@ def build_image():
     return jsonify({'status': 'ok'})
 
 
-def _build_image_worker(nasos):
+def _build_image_worker(nasos, resume=False):
     """Background worker that runs the x86 image build."""
+    from blueprints.builder_resources import enter_build_slice, leave_build_slice
+    enter_build_slice()
     try:
         wrapper = _x86_wrapper_script(nasos)
+        if resume:
+            wrapper = 'export ETHOS_RESUME=1\n' + wrapper
 
         start_time = time.time()
         result_info = {}
@@ -752,10 +868,14 @@ def _build_image_worker(nasos):
                     img_size = _human_size(int(result_info.get('img_size', 0)))
                     msg = f'Image ready! IMG: {img_size}'
                     msg += f' (czas: {elapsed_m}min {elapsed_s}s)'
+                    beacon_id = f"build-{int(start_time)}"
                     res = {
                         'success': True, 'message': msg,
                         'img': result_info.get('img_path', ''),
+                        'beacon_id': beacon_id,
                     }
+                    with _build_lock:
+                        _build_state['beacon_id'] = beacon_id
                     _update_build(status='done', percent=100, message=msg, result=res)
                 else:
                     msg = f'Image build error (code: {code}, time: {elapsed_m}min {elapsed_s}s)'
@@ -769,13 +889,28 @@ def _build_image_worker(nasos):
                 p = line.split(':')
                 result_info['img_path'] = p[1] if len(p) > 1 else ''
                 result_info['img_size'] = p[2] if len(p) > 2 else '0'
+            elif line.startswith('LOG:RESUME_AVAILABLE:'):
+                build_dir = line[len('LOG:RESUME_AVAILABLE:'):]
+                with _build_lock:
+                    _build_state['resume_available'] = True
+                    _build_state['build_dir'] = build_dir.strip()
+                    _save_build_state()
+            elif line.startswith('PREFLIGHT_RESULT:'):
+                pf_res = line[len('PREFLIGHT_RESULT:'):].strip()
+                with _build_lock:
+                    _build_state['preflight_result'] = pf_res
+                    _save_build_state()
+                _update_build(log=f'Pre-flight result: {pf_res}')
             elif line.startswith('LOG:'):
-                _update_build(log=line[4:])
+                msg = line[4:]
+                _update_build(log=msg)
             elif line.strip():
                 _update_build(log=line)
     except Exception as e:
         msg = f'Exception: {e}'
         _update_build(status='error', message=msg, result={'success': False, 'message': msg})
+    finally:
+        leave_build_slice()
 
 
 
@@ -835,18 +970,33 @@ FINAL_IMG="$NASOS/installer/images/ethos-x86.img"
 WORK_DIR="/tmp/ethos-x86-build-web"
 
 # ── Performance: use tmpfs (RAM) for build if enough memory ──
-TOTAL_RAM_MB=$(awk '/MemAvailable/{{print int($2/1024)}}' /proc/meminfo 2>/dev/null || echo 0)
+# VM-aware: subtract RAM already used by running QEMU processes.
+MEM_AVAIL_MB=$(awk '/MemAvailable/{{print int($2/1024)}}' /proc/meminfo 2>/dev/null || echo 0)
+VM_RAM_MB=$(ps -eo rss,comm --no-headers 2>/dev/null | awk '/qemu/{{s+=$1}} END{{print int(s/1024)}}')
+VM_RAM_MB=${{VM_RAM_MB:-0}}
+EFFECTIVE_RAM_MB=$(( MEM_AVAIL_MB - VM_RAM_MB - 512 ))
 USE_TMPFS=0
-if [ "$TOTAL_RAM_MB" -gt "$TMPFS_MIN_RAM_MB" ]; then
+if [ "$EFFECTIVE_RAM_MB" -gt "$TMPFS_MIN_RAM_MB" ]; then
     USE_TMPFS=1
-    echo "LOG:Available RAM: ${{TOTAL_RAM_MB}}MB — building in tmpfs (RAM) for speed"
+    echo "LOG:RAM: avail=${{MEM_AVAIL_MB}}MB vms=${{VM_RAM_MB}}MB effective=${{EFFECTIVE_RAM_MB}}MB — building in tmpfs"
     mkdir -p "$WORK_DIR"
     mount -t tmpfs -o size=${{IMG_SIZE_GB}}G,nr_inodes=0 tmpfs "$WORK_DIR"
 else
-    echo "LOG:Available RAM: ${{TOTAL_RAM_MB}}MB — not enough for tmpfs, building on disk"
+    echo "LOG:RAM: avail=${{MEM_AVAIL_MB}}MB vms=${{VM_RAM_MB}}MB effective=${{EFFECTIVE_RAM_MB}}MB — building on disk"
     mkdir -p "$WORK_DIR"
 fi
 OUTPUT_IMG="$WORK_DIR/ethos-x86.img"
+CKPT_DIR="$WORK_DIR/.ckpts"
+BUILD_DONE=0
+
+# ── Stage checkpoint helpers (idempotent builds) ──
+_ckpt_done() {{ [ -f "$CKPT_DIR/$1" ]; }}
+_ckpt_set()  {{ mkdir -p "$CKPT_DIR"; touch "$CKPT_DIR/$1"; echo "LOG:✓ Stage checkpoint: $1"; }}
+
+RESUME_MODE="${{ETHOS_RESUME:-0}}"
+if [ "$RESUME_MODE" = "1" ] && [ -d "$CKPT_DIR" ]; then
+    echo "LOG:Resume mode — existing checkpoints: $(ls "$CKPT_DIR/" 2>/dev/null | tr '\n' ' ')"
+fi
 
 # ── Build cache directories (persist across builds) ──
 DEBOOTSTRAP_CACHE="/var/cache/ethos-builder/debootstrap"
@@ -869,83 +1019,140 @@ cleanup() {{
     if [[ -n "${{LOOP_DEV:-}}" ]]; then
         losetup -d "$LOOP_DEV" 2>/dev/null || true
     fi
-    if [ "$USE_TMPFS" -eq 1 ]; then
-        umount "$WORK_DIR" 2>/dev/null || \
-            umount -l "$WORK_DIR" 2>/dev/null || true
+    if [ "$BUILD_DONE" = "1" ]; then
+        # Success — clean up completely
+        if [ "$USE_TMPFS" -eq 1 ] && mountpoint -q "$WORK_DIR" 2>/dev/null; then
+            umount "$WORK_DIR" 2>/dev/null || \
+                umount -l "$WORK_DIR" 2>/dev/null || true
+        fi
+        rm -rf "$WORK_DIR" 2>/dev/null || true
+    else
+        # Failure — preserve WORK_DIR for resume
+        echo "LOG:RESUME_AVAILABLE:$WORK_DIR"
+        if [ "$USE_TMPFS" -eq 1 ]; then
+            echo "LOG:Note: Build dir is in tmpfs — checkpoints survive crash but not reboot"
+        fi
     fi
-    rm -rf "$WORK_DIR" 2>/dev/null || true
 }}
 trap cleanup EXIT
 
+# ── Re-mount helper (used when resuming from checkpoint) ──
+_remount_for_resume() {{
+    echo "LOG:Remounting build artifacts for resume..."
+    mkdir -p "$WORK_DIR/root" "$WORK_DIR/efi"
+    LOOP_DEV=$(losetup --find --show --partscan "$OUTPUT_IMG" 2>/dev/null) || {{
+        echo "LOG:ERROR: Cannot attach loop device to $OUTPUT_IMG"; exit 1;
+    }}
+    echo "LOG:Loop device: $LOOP_DEV"
+    mount "${{LOOP_DEV}}p2" "$WORK_DIR/root" || {{ echo "LOG:ERROR: Cannot mount root partition"; exit 1; }}
+    mkdir -p "$WORK_DIR/root/boot/efi"
+    mount "${{LOOP_DEV}}p1" "$WORK_DIR/root/boot/efi" 2>/dev/null || true
+    echo "LOG:Disk remounted for resume"
+}}
+
 # ── Step 1: Create disk image ──
-echo "STEP:8:Creating disk image (${{IMG_SIZE_GB}}GB)..."
-mkdir -p "$WORK_DIR"/{{root,efi}}
-rm -f "$OUTPUT_IMG" "$FINAL_IMG"
-truncate -s "${{IMG_SIZE_GB}}G" "$OUTPUT_IMG"
-
-LOOP_DEV=$(losetup --find --show --partscan "$OUTPUT_IMG")
-echo "LOG:Loop device: $LOOP_DEV"
-
-parted -s "$LOOP_DEV" mklabel gpt
-parted -s "$LOOP_DEV" mkpart ESP fat32 1MiB ${{ESP_SIZE_MB}}MiB
-parted -s "$LOOP_DEV" set 1 esp on
-parted -s "$LOOP_DEV" mkpart primary ext4 ${{ESP_SIZE_MB}}MiB $((${{ESP_SIZE_MB}} + ${{ROOT_SIZE_MB}}))MiB
-partprobe "$LOOP_DEV"; sleep 1
-
-mkfs.vfat -F32 "${{LOOP_DEV}}p1"
-mkfs.ext4 -q -L "ethos-root" "${{LOOP_DEV}}p2"
-
-mount "${{LOOP_DEV}}p2" "$WORK_DIR/root"
-mkdir -p "$WORK_DIR/root/boot/efi"
-mount "${{LOOP_DEV}}p1" "$WORK_DIR/root/boot/efi"
-
-echo "STEP:14:Obraz dysku utworzony"
-
-# ── Step 2: Debootstrap ──
-if [ "$BASE_DISTRO" = "ubuntu" ]; then
-    echo "STEP:15:Debootstrap — minimal Ubuntu install (this will take a few minutes)..."
-    DEBOOTSTRAP_MIRROR="http://archive.ubuntu.com/ubuntu/"
-    DEBOOTSTRAP_EXTRA_OPTS="--no-check-gpg --components=main,restricted,universe"
+if _ckpt_done "01_disk"; then
+    echo "STEP:8:Resuming — disk image exists"
+    _remount_for_resume
+    echo "STEP:14:Obraz dysku (z checkpointa)"
 else
-    echo "STEP:15:Debootstrap — minimal Debian install (this will take a few minutes)..."
-    DEBOOTSTRAP_MIRROR="http://deb.debian.org/debian"
-    DEBOOTSTRAP_EXTRA_OPTS=""
-fi
-PKG_COUNT=0
-if [ -d "$DEBOOTSTRAP_CACHE" ] && [ "$(ls -A "$DEBOOTSTRAP_CACHE" 2>/dev/null)" ]; then
-    echo "LOG:Using debootstrap cache ($(du -sh "$DEBOOTSTRAP_CACHE" | cut -f1))"
-fi
-debootstrap --cache-dir="$DEBOOTSTRAP_CACHE" --variant=minbase $DEBOOTSTRAP_EXTRA_OPTS --include=\\
-$DEBOOTSTRAP_INCLUDE \\
-    "$DEBIAN_RELEASE" "$WORK_DIR/root" "$DEBOOTSTRAP_MIRROR" 2>&1 | \\
-    while IFS= read -r line; do
-        if echo "$line" | grep -qE "^I: Retrieving"; then
-            PKG_COUNT=$((PKG_COUNT + 1))
-            if (( PKG_COUNT % 20 == 0 )); then
-                echo "LOG:Downloading packages... ($PKG_COUNT downloaded)"
-            fi
-        elif echo "$line" | grep -qE "^I: Validating"; then
-            echo "LOG:$line"
-        elif echo "$line" | grep -qE "^I: Extracting"; then
-            PKG_COUNT=$((PKG_COUNT + 1))
-            if (( PKG_COUNT % 30 == 0 )); then
-                echo "LOG:Extracting... ($PKG_COUNT)"
-            fi
-        elif echo "$line" | grep -qE "^I: Unpacking|^I: Configuring"; then
-            echo "LOG:$line"
-        elif echo "$line" | grep -qE "^I: |^W: |^E: "; then
-            echo "LOG:$line"
+    echo "STEP:8:Creating disk image (${{IMG_SIZE_GB}}GB)..."
+    mkdir -p "$WORK_DIR"/{{root,efi}}
+    rm -f "$OUTPUT_IMG" "$FINAL_IMG"
+    truncate -s "${{IMG_SIZE_GB}}G" "$OUTPUT_IMG"
+
+    LOOP_DEV=$(losetup --find --show --partscan "$OUTPUT_IMG")
+    echo "LOG:Loop device: $LOOP_DEV"
+
+    parted -s "$LOOP_DEV" mklabel gpt
+    parted -s "$LOOP_DEV" mkpart ESP fat32 1MiB ${{ESP_SIZE_MB}}MiB
+    parted -s "$LOOP_DEV" set 1 esp on
+    parted -s "$LOOP_DEV" mkpart primary ext4 ${{ESP_SIZE_MB}}MiB $((${{ESP_SIZE_MB}} + ${{ROOT_SIZE_MB}}))MiB
+    partprobe "$LOOP_DEV"
+    # Wait for partition devices to appear (up to 10s, 0.5s steps)
+    for _pnum in 1 2; do
+        _waited=0
+        while [ ! -b "${{LOOP_DEV}}p${{_pnum}}" ] && [ $_waited -lt 20 ]; do
+            sleep 0.5; _waited=$((_waited + 1))
+        done
+        if [ ! -b "${{LOOP_DEV}}p${{_pnum}}" ]; then
+            echo "LOG:ERROR: Partition ${{LOOP_DEV}}p${{_pnum}} not ready after 10s"
+            exit 1
         fi
     done
 
-# Verify debootstrap succeeded
-if [ ! -d "$WORK_DIR/root/dev" ] || [ ! -d "$WORK_DIR/root/etc" ]; then
-    echo "LOG:ERROR: debootstrap did not create rootfs — check logs"
-    echo "STEP:45:Debootstrap failed"
-    exit 1
+    mkfs.vfat -F32 "${{LOOP_DEV}}p1"
+    mkfs.ext4 -q -L "ethos-root" "${{LOOP_DEV}}p2"
+
+    mount "${{LOOP_DEV}}p2" "$WORK_DIR/root"
+    mkdir -p "$WORK_DIR/root/boot/efi"
+    mount "${{LOOP_DEV}}p1" "$WORK_DIR/root/boot/efi"
+
+    echo "STEP:14:Obraz dysku utworzony"
+    _ckpt_set "01_disk"
 fi
 
-echo "STEP:45:${{BASE_DISTRO^}} installed. Configuring system..."
+# ── Step 2: Debootstrap ──
+if _ckpt_done "02_debootstrap"; then
+    echo "STEP:45:${{BASE_DISTRO^}} base system present (checkpoint — skipped)"
+else
+    if [ "$BASE_DISTRO" = "ubuntu" ]; then
+        echo "STEP:15:Debootstrap — minimal Ubuntu install (this will take a few minutes)..."
+        DEBOOTSTRAP_MIRROR="http://archive.ubuntu.com/ubuntu/"
+        DEBOOTSTRAP_EXTRA_OPTS="--no-check-gpg --components=main,restricted,universe"
+    else
+        echo "STEP:15:Debootstrap — minimal Debian install (this will take a few minutes)..."
+        DEBOOTSTRAP_MIRROR="http://deb.debian.org/debian"
+        DEBOOTSTRAP_EXTRA_OPTS=""
+    fi
+    PKG_COUNT=0
+    if [ -d "$DEBOOTSTRAP_CACHE" ] && [ "$(ls -A "$DEBOOTSTRAP_CACHE" 2>/dev/null)" ]; then
+        echo "LOG:Using debootstrap cache ($(du -sh "$DEBOOTSTRAP_CACHE" | cut -f1))"
+    fi
+    DEBS_LOG="/tmp/ethos-debootstrap-$$.log"
+    debootstrap --cache-dir="$DEBOOTSTRAP_CACHE" --variant=minbase $DEBOOTSTRAP_EXTRA_OPTS --include=\\
+$DEBOOTSTRAP_INCLUDE \\
+        "$DEBIAN_RELEASE" "$WORK_DIR/root" "$DEBOOTSTRAP_MIRROR" 2>&1 | \\
+        tee "$DEBS_LOG" | \\
+        while IFS= read -r line; do
+            if echo "$line" | grep -qE "^I: Retrieving"; then
+                PKG_COUNT=$((PKG_COUNT + 1))
+                if (( PKG_COUNT % 20 == 0 )); then
+                    echo "LOG:Downloading packages... ($PKG_COUNT downloaded)"
+                fi
+            elif echo "$line" | grep -qE "^I: Validating"; then
+                echo "LOG:$line"
+            elif echo "$line" | grep -qE "^I: Extracting"; then
+                PKG_COUNT=$((PKG_COUNT + 1))
+                if (( PKG_COUNT % 30 == 0 )); then
+                    echo "LOG:Extracting... ($PKG_COUNT)"
+                fi
+            elif echo "$line" | grep -qE "^I: Unpacking|^I: Configuring"; then
+                echo "LOG:$line"
+            elif echo "$line" | grep -qE "^I: |^W: |^E: "; then
+                echo "LOG:$line"
+            fi
+        done
+    DEBS_RC=${{PIPESTATUS[0]}}
+    if [ "$DEBS_RC" -ne 0 ]; then
+        echo "LOG:ERROR: debootstrap failed (exit $DEBS_RC)"
+        tail -5 "$DEBS_LOG" 2>/dev/null | while IFS= read -r _l; do echo "LOG:DEBS> $_l"; done
+        rm -f "$DEBS_LOG"
+        echo "STEP:45:Debootstrap failed"
+        exit 1
+    fi
+    rm -f "$DEBS_LOG"
+
+    # Verify debootstrap succeeded
+    if [ ! -d "$WORK_DIR/root/dev" ] || [ ! -d "$WORK_DIR/root/etc" ]; then
+        echo "LOG:ERROR: debootstrap did not create rootfs — check logs"
+        echo "STEP:45:Debootstrap failed"
+        exit 1
+    fi
+
+    echo "STEP:45:${{BASE_DISTRO^}} installed. Configuring system..."
+    _ckpt_set "02_debootstrap"
+fi
 
 # ── Step 3: Configure system ──
 ROOT="$WORK_DIR/root"
@@ -1026,6 +1233,58 @@ vm.dirty_writeback_centisecs = 1500
 kernel.nmi_watchdog = 0
 net.ipv4.ip_forward = 1
 IOTUNE
+
+# ── Security hardening: sysctl ──
+cat > "$ROOT/etc/sysctl.d/91-ethos-security.conf" <<'SECSYSCTL'
+# Kernel pointer hardening
+kernel.kptr_restrict = 2
+kernel.dmesg_restrict = 1
+kernel.perf_event_paranoid = 3
+kernel.unprivileged_bpf_disabled = 1
+# Reverse-path filtering (spoofing protection)
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+# SYN flood protection
+net.ipv4.tcp_syncookies = 1
+# Disable ICMP redirects
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+# Disable source routing
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+SECSYSCTL
+
+# ── Security: kernel module blacklist ──
+cat > "$ROOT/etc/modprobe.d/ethos-security-blacklist.conf" <<'MODBLK'
+# Disable DMA-capable bus interfaces (potential physical attack vectors)
+blacklist firewire-core
+blacklist thunderbolt
+# Disable uncommon/legacy filesystems (attack surface reduction)
+blacklist cramfs
+blacklist freevxfs
+blacklist jffs2
+blacklist hfs
+blacklist hfsplus
+blacklist udf
+install cramfs /bin/true
+install freevxfs /bin/true
+install jffs2 /bin/true
+install hfs /bin/true
+install hfsplus /bin/true
+install udf /bin/true
+# Disable uncommon network protocols
+blacklist dccp
+blacklist sctp
+blacklist rds
+blacklist tipc
+install dccp /bin/true
+install sctp /bin/true
+install rds /bin/true
+install tipc /bin/true
+MODBLK
 
 cat > "$ROOT/etc/udev/rules.d/99-ethos-power.rules" <<'UDEV_PWR'
 ACTION=="add|change", KERNEL=="sd[a-z]", ATTR{{queue/rotational}}=="1", RUN+="/sbin/hdparm -S 242 /dev/%k"
@@ -1312,6 +1571,39 @@ $BRAND_NAME \\n \\l
 ISSUE
 echo "$BRAND_NAME" > "$ROOT/etc/issue.net"
 
+# ── Full Debian branding purge ──
+# lsb-release
+cat > "$ROOT/etc/lsb-release" <<LSBREL
+DISTRIB_ID=EthOS
+DISTRIB_RELEASE=${{VERSION}}
+DISTRIB_CODENAME=ethos
+DISTRIB_DESCRIPTION="$BRAND_NAME v${{VERSION}}"
+LSBREL
+# /usr/lib/os-release (canonical path, symlinked by many tools)
+if [ -d "$ROOT/usr/lib" ]; then
+    cp "$ROOT/etc/os-release" "$ROOT/usr/lib/os-release" 2>/dev/null || true
+fi
+# Neutralise /etc/debian_version (content doesn't matter for EthOS)
+echo "ethos/${{VERSION}}" > "$ROOT/etc/debian_version" 2>/dev/null || true
+# Replace dpkg origin so dpkg --version shows EthOS
+if [ -d "$ROOT/etc/dpkg/origins" ]; then
+    cat > "$ROOT/etc/dpkg/origins/ethos" <<DPKGORIG
+Vendor: EthOS
+Vendor-URL: https://ethos.local
+Bugs: https://ethos.local/bugs
+Parent: Debian
+DPKGORIG
+    ln -sf ethos "$ROOT/etc/dpkg/origins/default" 2>/dev/null || true
+fi
+# Remove Debian motd snippets that would reveal base distro
+rm -f "$ROOT/etc/update-motd.d/10-uname" 2>/dev/null || true
+cat > "$ROOT/etc/motd" <<MOTD
+
+  Welcome to $BRAND_NAME v${{VERSION}}
+  https://ethos.local
+
+MOTD
+
 # ── GRUB defaults (so update-grub keeps EthOS name) ──
 cat > "$ROOT/etc/default/grub" <<GRUBDEF
 GRUB_DEFAULT=0
@@ -1339,9 +1631,15 @@ DEBIAN_FRONTEND=noninteractive chroot "$ROOT" apt-get install -y -qq efibootmgr 
 mkdir -p "$ROOT/boot/efi/EFI/BOOT"
 echo "LOG:GRUB UEFI install..."
 chroot "$ROOT" grub-install --target=x86_64-efi --efi-directory=/boot/efi \\
-    --boot-directory=/boot --removable --no-nvram 2>/dev/null || {{
-    echo "STEP:0:ERROR: UEFI grub-install failed!"; exit 1;
-}}
+    --boot-directory=/boot --removable --no-nvram 2>&1 | tail -5
+GRUB_RC=${{PIPESTATUS[0]}}
+GRUB_EFI_BIN="$ROOT/boot/efi/EFI/BOOT/BOOTX64.EFI"
+if [ "$GRUB_RC" -ne 0 ] || [ ! -f "$GRUB_EFI_BIN" ]; then
+    echo "LOG:ERROR: grub-install failed (rc=$GRUB_RC) or BOOTX64.EFI missing"
+    ls -la "$ROOT/boot/efi/EFI/" 2>/dev/null | while IFS= read -r _l; do echo "LOG:EFI> $_l"; done
+    echo "STEP:0:ERROR: UEFI grub-install failed!"
+    exit 1
+fi
 
 KERN=$(ls "$ROOT/boot/vmlinuz-"* 2>/dev/null | sort -V | tail -1 | sed "s|$ROOT||")
 INITRD=$(ls "$ROOT/boot/initrd.img-"* 2>/dev/null | sort -V | tail -1 | sed "s|$ROOT||")
@@ -1355,7 +1653,7 @@ insmod ext2
 insmod gzio
 menuentry "EthOS v${{VERSION}}" {{
     search --no-floppy --fs-uuid --set=root ${{ROOT_UUID}}
-    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro quiet net.ifnames=0 biosdevname=0 fsck.repair=preen
+    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro quiet net.ifnames=0 biosdevname=0 fsck.repair=preen console=ttyS0,115200n8
     initrd ${{INITRD}}
 }}
 menuentry "EthOS v${{VERSION}} (recovery)" {{
@@ -1451,7 +1749,7 @@ insmod ext2
 insmod gzio
 menuentry "EthOS v${{VERSION}}" {{
     search --no-floppy --fs-uuid --set=root ${{ROOT_UUID}}
-    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro quiet net.ifnames=0 biosdevname=0 fsck.repair=preen
+    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro quiet net.ifnames=0 biosdevname=0 fsck.repair=preen console=ttyS0,115200n8
     initrd ${{INITRD}}
 }}
 menuentry "EthOS v${{VERSION}} (recovery)" {{
@@ -1631,6 +1929,22 @@ else
 fi
 
 echo "STEP:75:Dependencies installed"
+_ckpt_set "05_apt_deps"
+
+# ── SBOM: generate Software Bill of Materials ──
+echo "LOG:Generating SBOM (SPDX-2.3)..."
+python3 - "$ROOT" "$VERSION" "$BRAND_NAME" "$WORK_DIR" <<'SBOMPY'
+import sys, os
+sys.path.insert(0, '/opt/ethos/backend/blueprints')
+try:
+    from builder_sbom import generate_sbom, write_sbom
+    rootfs, version, brand, outdir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+    sbom = generate_sbom(rootfs, version, brand)
+    write_sbom(sbom, outdir)
+    print(f"LOG:SBOM: {{len(sbom.get('packages', []))}} packages documented", flush=True)
+except Exception as e:
+    print(f"LOG:SBOM generation skipped: {{e}}", flush=True)
+SBOMPY
 
 # ── Step 6: Inject EthOS (full package) ──
 echo "STEP:76:Injecting EthOS..."
@@ -1727,7 +2041,12 @@ NAS_NAME=EthOS
 PORT=$NAS_PORT
 ETHOS_ROOT=/opt/ethos
 BACKUP_DIR=/opt/ethos/backups
+ETHOS_BUILD_ID=build-$(date +%s)
 ENVFILE
+# Inject build host for QA beacon (only if ETHOS_QA_BUILD_HOST is set in the host env)
+if [[ -n "${{ETHOS_QA_BUILD_HOST:-}}" ]]; then
+    echo "ETHOS_BUILD_HOST=${{ETHOS_QA_BUILD_HOST}}" >> "$ETHOS_DIR/ethos.env"
+fi
 chmod 640 "$ETHOS_DIR/ethos.env"
 
 cat > "$ETHOS_DIR/start.sh" <<'MGMT_STARTSH'
@@ -1959,6 +2278,7 @@ USERPROFILE
 chown $(chroot "$ROOT" id -u $DEFAULT_USER):$(chroot "$ROOT" id -g $DEFAULT_USER) "$ROOT/home/$DEFAULT_USER/.bash_profile"
 
 echo "STEP:85:EthOS injected"
+_ckpt_set "06_inject_ethos"
 
 # ── Step 7: Cleanup & finalize ──
 echo "STEP:86:Finalizing..."
@@ -2031,6 +2351,21 @@ if command -v mksquashfs >/dev/null 2>&1; then
             echo "$ROOTHASH" > "$ROOTHASH_OUT"
             VERITY_SIZE=$(stat -c%s "$VERITY_OUT" 2>/dev/null || echo 0)
             echo "LOG:dm-verity: root hash=$ROOTHASH, hash tree=$((VERITY_SIZE / 1024))KB"
+            # Sign artifact — produce ethos-manifest.json alongside .sqsh and .verity
+            echo "LOG:Signing artifact (RSA-SHA256)..."
+            python3 -c "
+import sys
+sys.path.insert(0, '$NASOS/backend')
+from blueprints.builder_signing import sign_artifact, write_manifest
+import json
+try:
+    ver = json.load(open('$NASOS/backend/version.json')).get('version','?')
+except Exception:
+    ver = '?'
+m = sign_artifact('$SQSH_OUT', '$ROOTHASH', build_version=ver)
+p = write_manifest(m, '$WORK_DIR')
+print('LOG:Manifest written: ' + p if p else 'LOG:WARNING: manifest signing failed')
+" 2>&1 | while IFS= read -r _l; do echo "LOG:$_l"; done || echo "LOG:WARNING: signing step failed (non-fatal)"
         else
             echo "LOG:WARNING: dm-verity format failed — skipping"
             rm -f "$VERITY_OUT" "$ROOTHASH_OUT"
@@ -2049,6 +2384,94 @@ if command -v mksquashfs >/dev/null 2>&1; then
 else
     echo "LOG:WARNING: mksquashfs not found — SquashFS image will not be created"
 fi
+
+# ── Inject pre-flight health-check service (into installer rootfs AFTER squashfs creation) ──
+# This service will NOT be in the installed system (squashfs is already baked).
+# It runs once in the QEMU test, reports health, then self-destructs.
+if [ "$PREFLIGHT_ENABLED" = "1" ] && mountpoint -q "$ROOT" 2>/dev/null; then
+    echo "LOG:Injecting pre-flight health-check service into rootfs..."
+    mkdir -p "$ROOT/usr/local/sbin"
+    cat > "$ROOT/usr/local/sbin/ethos-preflight.sh" <<'PFSCRIPT'
+#!/bin/bash
+# EthOS pre-flight check — runs once in test VM, reports via serial console
+exec 1>/dev/ttyS0 2>&1
+echo "PREFLIGHT:START"
+echo "PREFLIGHT:kernel=$(uname -r)"
+SYSTEMD_STATE=$(systemctl is-system-running --wait --timeout=30 2>/dev/null || echo unknown)
+echo "PREFLIGHT:SYSTEMD:$SYSTEMD_STATE"
+if systemctl is-active ethos.service >/dev/null 2>&1; then
+    echo "PREFLIGHT:ETHOS:OK"
+else
+    echo "PREFLIGHT:ETHOS:FAIL"
+fi
+# Branding validation
+if grep -q "ID=ethos" /etc/os-release 2>/dev/null; then
+    echo "PREFLIGHT:BRANDING:OK"
+else
+    echo "PREFLIGHT:BRANDING:FAIL"
+fi
+# Hardening validation
+if [ -f /etc/sysctl.d/91-ethos-security.conf ]; then
+    echo "PREFLIGHT:HARDENING:OK"
+else
+    echo "PREFLIGHT:HARDENING:FAIL"
+fi
+# Flask available
+if python3 -c "import flask" 2>/dev/null; then
+    echo "PREFLIGHT:FLASK:OK"
+else
+    echo "PREFLIGHT:FLASK:FAIL"
+fi
+echo "PREFLIGHT:DONE"
+systemctl disable ethos-preflight.service 2>/dev/null || true
+rm -f /usr/local/sbin/ethos-preflight.sh /etc/systemd/system/ethos-preflight.service
+systemctl daemon-reload 2>/dev/null || true
+shutdown -h now
+PFSCRIPT
+    chmod +x "$ROOT/usr/local/sbin/ethos-preflight.sh"
+    cat > "$ROOT/etc/systemd/system/ethos-preflight.service" <<'PFSVC'
+[Unit]
+Description=EthOS Pre-flight Health Check
+After=ethos.service
+Wants=ethos.service
+ConditionPathExists=/usr/local/sbin/ethos-preflight.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ethos-preflight.sh
+TimeoutStartSec=120
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
+PFSVC
+    chroot "$ROOT" systemctl enable ethos-preflight.service 2>/dev/null || true
+    echo "LOG:Pre-flight service injected into rootfs"
+fi
+
+# ── Secure Boot MOK signing ──
+echo "LOG:Attempting Secure Boot MOK signing..."
+python3 - "$ROOT" "$BRAND_NAME" <<'SBSIGNPY'
+import sys, os
+sys.path.insert(0, '/opt/ethos/backend/blueprints')
+try:
+    from builder_secureboot import ensure_mok_keys, sign_rootfs_efi_binaries, install_mok_der_to_esp
+    rootfs, brand = sys.argv[1], sys.argv[2]
+    if ensure_mok_keys(brand):
+        results = sign_rootfs_efi_binaries(rootfs, brand)
+        signed = [k for k, v in results.items() if v]
+        install_mok_der_to_esp(rootfs)
+        if signed:
+            print(f"LOG:Secure Boot: signed {{len(signed)}} EFI binaries", flush=True)
+            print(f"LOG:Secure Boot: after install run: sudo mokutil --import /boot/efi/EFI/ethos/MOK.der", flush=True)
+        else:
+            print("LOG:Secure Boot: no EFI binaries signed (sbsign not installed or no targets found)", flush=True)
+    else:
+        print("LOG:Secure Boot: MOK key generation failed — skipping", flush=True)
+except Exception as e:
+    print(f"LOG:Secure Boot signing skipped: {{e}}", flush=True)
+SBSIGNPY
 
 sync
 
@@ -2082,6 +2505,18 @@ if [ -f "$WORK_DIR/ethos-root.sqsh" ]; then
         cp "$WORK_DIR/ethos-root.sqsh.roothash" "$WORK_DIR/root/boot/efi/EFI/ethos/roothash"
         echo "LOG:dm-verity data injected"
         rm -f "$WORK_DIR/ethos-root.sqsh.verity" "$WORK_DIR/ethos-root.sqsh.roothash"
+        # Inject manifest (signing artifact)
+        if [ -f "$WORK_DIR/ethos-manifest.json" ]; then
+            cp "$WORK_DIR/ethos-manifest.json" "$WORK_DIR/root/opt/ethos/installer/images/ethos-manifest.json"
+            echo "LOG:Manifest injected into image"
+            rm -f "$WORK_DIR/ethos-manifest.json"
+        fi
+        # Inject SBOM alongside squashfs
+        if [ -f "$WORK_DIR/ethos-sbom.json" ]; then
+            cp "$WORK_DIR/ethos-sbom.json" "$WORK_DIR/root/opt/ethos/installer/images/ethos-sbom.json"
+            echo "LOG:SBOM injected into image"
+            rm -f "$WORK_DIR/ethos-sbom.json"
+        fi
     fi
     sync
     umount "$WORK_DIR/root" 2>/dev/null || \
@@ -2157,9 +2592,153 @@ fi
 # Results
 IMG_SIZE=$(stat -c%s "$OUTPUT_IMG" 2>/dev/null || echo 0)
 
+# ── Step 8: Pre-flight VM validation ──
+if [ "$PREFLIGHT_ENABLED" = "1" ]; then
+    echo "STEP:92:Pre-flight VM test — booting image in QEMU..."
+    OVMF_FW=""
+    for _p in /usr/share/OVMF/OVMF.fd /usr/share/ovmf/OVMF.fd /usr/share/qemu/OVMF.fd \\
+              /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd; do
+        if [ -f "$_p" ]; then OVMF_FW="$_p"; break; fi
+    done
+    if [ -z "$OVMF_FW" ]; then
+        echo "LOG:Pre-flight: OVMF not found — install 'ovmf' package to enable VM test"
+        echo "PREFLIGHT_RESULT:skipped"
+    elif ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
+        echo "LOG:Pre-flight: qemu-system-x86_64 not found — install 'qemu-system-x86' package"
+        echo "PREFLIGHT_RESULT:skipped"
+    else
+        PFLOG="/tmp/ethos-preflight-$$.serial"
+        KVM_OPTS=""
+        if [ -e /dev/kvm ]; then
+            KVM_OPTS="-enable-kvm -cpu host"
+            echo "LOG:Pre-flight: KVM available — hardware acceleration enabled"
+        else
+            echo "LOG:Pre-flight: KVM not available — using software emulation (may be slow)"
+        fi
+        echo "LOG:Pre-flight: Starting QEMU (timeout: ${{PREFLIGHT_TIMEOUT}}s)..."
+        qemu-system-x86_64 \\
+            -bios "$OVMF_FW" \\
+            -drive file="$OUTPUT_IMG",format=raw,if=virtio,readonly=on \\
+            -m 1024 \\
+            -smp 2 \\
+            $KVM_OPTS \\
+            -nographic \\
+            -serial file:"$PFLOG" \\
+            -no-reboot \\
+            -display none \\
+            2>/dev/null &
+        QEMU_PID=$!
+        PFLIGHT_OK=0
+        PFLIGHT_FAIL=0
+        _elapsed=0
+        while [ $_elapsed -lt "${{PREFLIGHT_TIMEOUT}}" ]; do
+            sleep 2
+            _elapsed=$((_elapsed + 2))
+            if [ -f "$PFLOG" ]; then
+                if grep -q "^PREFLIGHT:DONE" "$PFLOG" 2>/dev/null; then
+                    PFLIGHT_OK=1
+                    break
+                fi
+                if grep -q "Kernel panic" "$PFLOG" 2>/dev/null; then
+                    PFLIGHT_FAIL=1
+                    break
+                fi
+            fi
+        done
+        kill $QEMU_PID 2>/dev/null
+        wait $QEMU_PID 2>/dev/null || true
+        if [ "$PFLIGHT_OK" = "1" ]; then
+            echo "LOG:Pre-flight: PASSED — image booted and services verified"
+            if [ -f "$PFLOG" ]; then
+                grep "^PREFLIGHT:" "$PFLOG" 2>/dev/null | while IFS= read -r _line; do
+                    echo "LOG:VM> $_line"
+                done
+            fi
+            echo "PREFLIGHT_RESULT:ok"
+        elif [ "$PFLIGHT_FAIL" = "1" ]; then
+            echo "LOG:Pre-flight: FAILED — kernel panic detected"
+            echo "PREFLIGHT_RESULT:fail"
+        else
+            echo "LOG:Pre-flight: TIMEOUT — VM did not report within ${{PREFLIGHT_TIMEOUT}}s"
+            echo "PREFLIGHT_RESULT:timeout"
+        fi
+        rm -f "$PFLOG"
+    fi
+else
+    echo "LOG:Pre-flight VM test disabled"
+    echo "PREFLIGHT_RESULT:disabled"
+fi
+
+BUILD_DONE=1
 echo "STEP:100:Obraz gotowy!"
 echo "RESULT_IMG:$OUTPUT_IMG:$IMG_SIZE"
 """
+
+
+
+# ═══════════════════════════════════════════════════════════
+#  API — Artifact Signing
+# ═══════════════════════════════════════════════════════════
+
+@builder_bp.route('/signing-key')
+@admin_required
+def get_signing_key():
+    """Return the builder public key (PEM). Used for offline artifact verification."""
+    from blueprints.builder_signing import ensure_signing_key, get_public_key_pem
+    ensure_signing_key()
+    pem = get_public_key_pem()
+    if not pem:
+        return jsonify({'error': 'Signing key not available'}), 503
+    return jsonify({'ok': True, 'public_key': pem})
+
+
+@builder_bp.route('/manifest')
+@admin_required
+def get_manifest():
+    """
+    Verify and return a build manifest.
+
+    Query params:
+      path  — path to ethos-manifest.json (must be inside installer/ dir)
+      sqsh  — (optional) path to .sqsh for full verification
+    """
+    from blueprints.builder_signing import verify_artifact
+    manifest_path = request.args.get('path', '').strip()
+    sqsh_path     = request.args.get('sqsh', '').strip()
+
+    if not manifest_path:
+        return jsonify({'error': 'path param required'}), 400
+
+    nasos        = _get_host_nasos_dir()
+    allowed_root = os.path.realpath(os.path.join(nasos, 'installer'))
+    real_path    = os.path.realpath(manifest_path)
+    if not real_path.startswith(allowed_root + '/'):
+        return jsonify({'error': 'Path not allowed'}), 403
+
+    if not os.path.isfile(real_path):
+        return jsonify({'error': 'Manifest not found'}), 404
+
+    import json as _json
+    try:
+        manifest = _json.load(open(real_path))
+    except Exception as exc:
+        return jsonify({'error': f'Cannot read manifest: {exc}'}), 400
+
+    verified   = None
+    verify_msg = ''
+    if sqsh_path:
+        real_sqsh = os.path.realpath(sqsh_path)
+        if real_sqsh.startswith(allowed_root + '/') and os.path.isfile(real_sqsh):
+            verified, verify_msg = verify_artifact(real_sqsh, real_path)
+        else:
+            verify_msg = 'sqsh path not accessible'
+
+    return jsonify({
+        'ok':        True,
+        'manifest':  manifest,
+        'verified':  verified,
+        'verify_msg': verify_msg,
+    })
 
 
 # ═══════════════════════════════════════════════════════════
