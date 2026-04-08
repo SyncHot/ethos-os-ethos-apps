@@ -23,7 +23,16 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     let _preloadAudio = null;  // preload next track for near-gapless playback
     let _radioRetryTimer = null;
     let _radioRetries = 0;
+    // Offline archive: keyed by YT URL → {key, status, progress, size_bytes}
+    let _archiveDb = {};
+    let _swReady = false;      // Service Worker available for offline caching
     let _nasSpinTimer = null;  // detect slow NAS wake (>3s)
+    let _queueContent = null;  // DOM node of the queue panel (null when not visible)
+    let _renderNpQueueFn = null; // ref to _renderNpQueue inside the overlay closure
+
+    // ── Local radio logo cache (UUID → /img/radio-logos/filename) ──
+    let _logoManifest = null;
+    fetch('/img/radio-logos/manifest.json').then(r => r.ok ? r.json() : {}).then(d => { _logoManifest = d; }).catch(() => { _logoManifest = {}; });
 
     // ── Chromecast state ──
     let _isCasting = false;
@@ -34,6 +43,9 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     let _castController = null;
     let _advanceLock = false;   // debounce double-advance from Cast + local onended
     let _castQueueActive = false; // true when Cast queue manages playlist advancement
+    let _isBuffering = false;   // true while track is loading — blocks rapid Next/Prev
+    // LAN origin for Chromecast URLs (fetched once from /cast-info; Chromecast cannot use localhost)
+    let _castLanOrigin = location.origin;
 
     // Web Audio API — shared across plays (createMediaElementSource can only be called once per element)
     let _audioCtx = null, _analyser = null, _audioSource = null, _visRafId = null;
@@ -43,6 +55,25 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
     const _LS_KEY = 'rm_playback_state';
     let _savePending = false;
+
+    // ── Shared playback state store (Observable pattern) ──────────────────────
+    // Single source of truth for currentTrack + queueIndex so PlaylistView and
+    // NowPlayingOverlay always stay in sync without rebuilding DOM.
+    const _rmStore = (() => {
+        let _state = { currentTrack: null, currentTrackIndex: -1 };
+        const _subs = [];
+        return {
+            get state() { return _state; },
+            set(patch) {
+                _state = Object.assign({}, _state, patch);
+                _subs.forEach(fn => { try { fn(_state); } catch(e) {} });
+            },
+            subscribe(fn) {
+                _subs.push(fn);
+                return () => { const i = _subs.indexOf(fn); if (i > -1) _subs.splice(i, 1); };
+            }
+        };
+    })();
 
     // Sidebar group definitions — order is user-customisable via DnD (saved in localStorage)
     const _SIDEBAR_GROUPS = [
@@ -113,6 +144,9 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     let _npMinimizing = false;  // debounce guard for _onPopState / _minimizeNowPlaying
     let _lockOverlay = null;
     let _wakeLock = null;
+    let _seekLocked = false;    // true during track switch → seekbar won't jump to 0
+    let _hlsInstance = null;    // hls.js instance for HLS live streams
+    let _prevNextTs = 0;        // debounce timestamp for Next/Prev buttons (500ms cooldown)
 
     // BroadcastChannel — coordinate multi-tab audio (E-07/E-12): only one tab plays at a time
     const _tabId = Math.random().toString(36).slice(2);
@@ -279,7 +313,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
     // Deterministic color from station name (for letter-avatar fallback)
     const _COLORS = ['#ef4444','#f97316','#f59e0b','#22c55e','#14b8a6','#3b82f6','#6366f1','#a855f7','#ec4899','#06b6d4'];
-    function _stationColor(name) { let h=0; for(let i=0;i<name.length;i++) h=((h<<5)-h)+name.charCodeAt(i); return _COLORS[Math.abs(h)%_COLORS.length]; }
+    function _stationColor(name) { if (!name) return _COLORS[0]; let h=0; for(let i=0;i<name.length;i++) h=((h<<5)-h)+name.charCodeAt(i); return _COLORS[Math.abs(h)%_COLORS.length]; }
     function _stationInitial(name) { return (name||'?').replace(/^(radio|polskie)\s*/i,'').charAt(0).toUpperCase(); }
 
     // Extract domain from a URL for logo services
@@ -324,10 +358,21 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
     // Multi-layer logo: Google favicon (128px, from homepage domain) → Radio Browser favicon → letter avatar
     // Google service returns high-quality logos; Radio Browser favicons are often tiny/broken
+    // Priority: local cached logo (from manifest) → Google favicon → RB favicon → letter avatar
     function _stationIconHtml(s) {
         const letter = _stationInitial(s.name);
         const bg = _stationColor(s.name);
         const letterFallback = '<span class="rm-letter-icon" style="display:none;background:' + bg + '">' + escH(letter) + '</span>';
+        const uuid = s.stationuuid || s.uuid || '';
+        const localFile = uuid && _logoManifest ? _logoManifest[uuid] : null;
+        const localSrc = localFile ? '/img/radio-logos/' + localFile : null;
+
+        // If we have a pre-downloaded local logo, use it first (fast, no external request)
+        if (localSrc) {
+            return '<img src="' + escH(localSrc) + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'">'
+                 + letterFallback;
+        }
+
         const domain = _domainOf(s.homepage || s.url);
         const googleSrc = _googleIcon(domain);
         const rbFavicon = s.favicon || '';
@@ -443,9 +488,11 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 '.rm-player-btn{background:none;border:none;color:rgba(255,255,255,.8);font-size:16px;cursor:pointer;padding:8px;border-radius:50%;transition:all .12s;line-height:1}',
 '.rm-player-btn:hover{color:#fff;transform:scale(1.08)}',
 '.rm-player-btn.rm-mode-active{color:#1DB954}',
-'.rm-player-btn.rm-btn-play{font-size:20px;width:40px;height:40px;display:flex;align-items:center;justify-content:center;background:#1DB954;color:#000;border-radius:50%;box-shadow:0 2px 8px rgba(29,185,84,.3)}',
+'.rm-player-btn.rm-btn-play{font-size:20px;width:40px;height:40px;display:flex;align-items:center;justify-content:center;background:#1DB954;color:#000;border-radius:50%;box-shadow:0 2px 8px rgba(29,185,84,.3);position:relative;overflow:visible}',
 '.rm-player-btn.rm-btn-play:hover{background:#1ed760;transform:scale(1.06)}',
-'.rm-cast-btn{font-size:15px;transition:color .2s}',
+/* Loading state: Spotify-style progress ring around play button — signals NAS is loading */
+'.rm-player-btn.rm-btn-play.rm-loading::after{content:"";position:absolute;inset:-4px;border-radius:50%;border:2px solid transparent;border-top-color:#1DB954;border-right-color:rgba(29,185,84,.4);animation:rm-spin .7s linear infinite;pointer-events:none}',
+'.rm-cast-btn{font-size:15px;transition:color .2s;display:none}',
 '.rm-cast-btn.rm-casting{color:#1DB954;animation:rm-cast-pulse 2s ease-in-out infinite}',
 '@keyframes rm-cast-pulse{0%,100%{opacity:1}50%{opacity:.5}}',
 '.rm-autoplay-prompt{display:flex;align-items:center;justify-content:center;gap:10px;padding:12px 20px;background:linear-gradient(135deg,#1DB954,#0f9240);color:#000;font-weight:700;font-size:14px;cursor:pointer;border:none;width:100%;border-top:none;animation:rm-autoplay-pulse 1.5s ease-in-out infinite}',
@@ -582,6 +629,26 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 '.rm-dl-toast{position:fixed;bottom:80px;right:16px;background:#282828;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:10px 16px;font-size:12px;color:#fff;box-shadow:0 4px 20px rgba(0,0,0,.5);z-index:9998;display:flex;align-items:center;gap:8px;max-width:300px}',
 '.rm-dl-toast i{color:#1DB954;font-size:14px}',
 
+/* ── Offline Archive button (rm-arch-btn) ──────────────────── */
+/* Wrapper: relative + fixed size so SVG ring is always aligned */
+'.rm-arch-btn{position:relative;background:none;border:none;cursor:pointer;padding:4px;border-radius:50%;transition:background .12s;flex-shrink:0;width:30px;height:30px;display:flex;align-items:center;justify-content:center}',
+'.rm-arch-btn:hover{background:rgba(255,255,255,.08)}',
+/* SVG progress ring — hidden by default */
+'.rm-arch-ring{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg);pointer-events:none;opacity:0;transition:opacity .2s}',
+'.rm-arch-btn.rm-arch-loading .rm-arch-ring{opacity:1}',
+'.rm-arch-ring circle{stroke-dasharray:87.96;stroke-dashoffset:87.96;transition:stroke-dashoffset .4s ease}',
+/* Icon colour per state */
+'.rm-arch-icon{font-size:13px;color:rgba(255,255,255,.4);transition:color .15s,transform .15s}',
+'.rm-arch-btn:hover .rm-arch-icon{color:rgba(255,255,255,.7)}',
+/* State: loading */
+'.rm-arch-btn.rm-arch-loading .rm-arch-icon{color:#1DB954;animation:rm-pulse 1.2s infinite}',
+/* State: archived on NAS */
+'.rm-arch-btn.rm-arch-nas .rm-arch-icon{color:#1DB954}',
+/* State: archived on NAS + cached on phone (brightest) */
+'.rm-arch-btn.rm-arch-phone .rm-arch-icon{color:#1DB954;filter:drop-shadow(0 0 4px rgba(29,185,84,.7))}',
+/* Error state */
+'.rm-arch-btn.rm-arch-error .rm-arch-icon{color:#ef4444}',
+
 /* local music folder chips */
 '.rm-folder-chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}',
 '.rm-folder-chip{display:inline-flex;align-items:center;gap:4px;padding:5px 10px;border-radius:16px;background:rgba(255,255,255,.06);border:none;font-size:11px;color:rgba(255,255,255,.8);cursor:default}',
@@ -593,17 +660,27 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 /* ── Now Playing overlay ───────────────────────── */
 '.rm-np-overlay{position:absolute;inset:0;z-index:100;display:flex;flex-direction:column;overflow:hidden;background:#0a0a0a;transform:translateY(0);transition:transform 0.4s cubic-bezier(0.32,0.72,0,1);will-change:transform;padding-bottom:max(0px,env(safe-area-inset-bottom))}',
 '.rm-np-minimized{transform:translateY(100%)!important;pointer-events:none}',
-'.rm-np-bg{position:absolute;inset:-40px;background-size:cover;background-position:center;filter:blur(40px) brightness(.25) saturate(1.4);z-index:0}',
+/* Background: smooth colour transition between tracks */
+'.rm-np-bg{position:absolute;inset:-40px;background-size:cover;background-position:center;filter:blur(40px) brightness(.25) saturate(1.4);z-index:0;transition:opacity 300ms ease}',
 '.rm-np-inner{position:relative;z-index:1;flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;gap:16px;overflow-y:auto}',
 '.rm-np-close{position:absolute;top:max(50px,calc(env(safe-area-inset-top,0px) + 12px));left:12px;background:rgba(255,255,255,.08);border:none;color:#fff;font-size:18px;cursor:pointer;padding:8px 12px;border-radius:50%;z-index:2;backdrop-filter:blur(8px);transition:background .15s}',
 '.rm-np-close:hover{background:rgba(255,255,255,.15)}',
-'.rm-np-art{width:260px;height:260px;border-radius:8px;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,.6);flex-shrink:0;background:#282828;display:flex;align-items:center;justify-content:center}',
-'.rm-np-art img{width:100%;height:100%;object-fit:cover}',
+/* Fixed aspect-ratio art box — never causes layout shift */
+'.rm-np-art{width:260px;height:260px;aspect-ratio:1/1;border-radius:8px;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,.6);flex-shrink:0;background:#282828;display:flex;align-items:center;justify-content:center;position:relative}',
+/* Art image cross-fade via opacity */
+'.rm-np-art img{width:100%;height:100%;object-fit:cover;transition:opacity 200ms ease;position:absolute;inset:0}',
+'.rm-np-art img.rm-art-loading{opacity:0}',
+'.rm-np-art img.rm-art-loaded{opacity:1}',
 '.rm-np-art .rm-letter-icon{font-size:64px;width:100%;height:100%}',
 '.rm-np-art i{font-size:64px;color:rgba(255,255,255,.3)}',
+/* Skeleton shimmer — shown while artwork fetches from NAS */
+'.rm-np-art.rm-skeleton::before{content:"";position:absolute;inset:0;background:linear-gradient(90deg,#282828 25%,#333 50%,#282828 75%);background-size:200% 100%;animation:rm-skeleton-sweep 1.2s infinite}',
+'@keyframes rm-skeleton-sweep{0%{background-position:200% 0}100%{background-position:-200% 0}}',
 '.rm-np-info{text-align:center;max-width:320px;width:100%}',
-'.rm-np-title{font-size:22px;font-weight:700;color:#fff;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-'.rm-np-meta{font-size:13px;color:rgba(255,255,255,.5);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+/* Title + meta fade on track swap */
+'.rm-np-title{font-size:22px;font-weight:700;color:#fff;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:opacity 150ms ease}',
+'.rm-np-meta{font-size:13px;color:rgba(255,255,255,.5);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:opacity 150ms ease}',
+'.rm-np-title.rm-fading,.rm-np-meta.rm-fading{opacity:0}',
 '.rm-np-seek{display:flex;align-items:center;gap:10px;width:100%;max-width:320px}',
 '.rm-np-seek .rm-seek-time{color:rgba(255,255,255,.4);font-size:11px;min-width:38px}',
 '.rm-np-seek .rm-seek-track{flex:1;height:4px;background:rgba(255,255,255,.12);border-radius:2px;position:relative;cursor:pointer}',
@@ -613,8 +690,10 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 '.rm-np-btn{background:none;border:none;color:rgba(255,255,255,.7);font-size:22px;cursor:pointer;padding:10px;border-radius:50%;transition:all .12s}',
 '.rm-np-btn.rm-mode-active{color:#1DB954}',
 '.rm-np-btn:hover{color:#fff;transform:scale(1.1)}',
-'.rm-np-btn.rm-np-play{width:64px;height:64px;font-size:26px;background:#1DB954;color:#000;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 20px rgba(29,185,84,.3)}',
+'.rm-np-btn.rm-np-play{width:64px;height:64px;font-size:26px;background:#1DB954;color:#000;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 20px rgba(29,185,84,.3);position:relative;overflow:visible}',
 '.rm-np-btn.rm-np-play:hover{background:#1ed760;transform:scale(1.06)}',
+'.rm-np-btn.rm-np-play.rm-loading::after{content:"";position:absolute;inset:-5px;border-radius:50%;border:3px solid transparent;border-top-color:#1DB954;border-right-color:rgba(29,185,84,.4);animation:rm-spin .7s linear infinite;pointer-events:none}',
+'.rm-btn-disabled{opacity:.35!important;pointer-events:none!important;cursor:default!important}',
 '.rm-np-actions{display:flex;gap:10px;margin-top:4px;flex-wrap:wrap;justify-content:center}',
 '.rm-np-action{background:rgba(255,255,255,.06);border:none;color:rgba(255,255,255,.5);font-size:13px;cursor:pointer;padding:8px 16px;border-radius:20px;transition:all .12s;display:flex;align-items:center;gap:6px}',
 '.rm-np-action:hover{background:rgba(255,255,255,.12);color:#fff}',
@@ -681,6 +760,34 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 '.rm-more-btn:active{background:rgba(29,185,84,.15);color:#1DB954;transform:scale(.95)}',
 '.rm-more-btn i{font-size:22px;color:rgba(255,255,255,.5);transition:color .15s}',
 '.rm-more-btn:active i{color:#1DB954}',
+
+/* per-track action bottom sheet */
+'.rm-tsheet-overlay{position:fixed;inset:0;z-index:9998;background:rgba(0,0,0,.5);backdrop-filter:blur(4px)}',
+'.rm-tsheet{position:fixed;bottom:0;left:0;right:0;z-index:9999;background:#1a1a1a;border-radius:20px 20px 0 0;padding:12px 0 env(safe-area-inset-bottom,0);box-shadow:0 -8px 40px rgba(0,0,0,.7);transform:translateY(100%);transition:transform .25s cubic-bezier(.25,1,.5,1)}',
+'.rm-tsheet.open{transform:translateY(0)}',
+'.rm-tsheet-handle{width:40px;height:4px;background:rgba(255,255,255,.2);border-radius:2px;margin:0 auto 8px}',
+'.rm-tsheet-title{padding:4px 16px 12px;font-size:13px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-bottom:1px solid rgba(255,255,255,.07);margin-bottom:4px}',
+'.rm-tsheet-row{display:flex;align-items:center;gap:14px;padding:14px 20px;cursor:pointer;transition:background .12s}',
+'.rm-tsheet-row:hover{background:rgba(255,255,255,.06)}',
+'.rm-tsheet-row:active{background:rgba(29,185,84,.12)}',
+'.rm-tsheet-row i{width:20px;text-align:center;font-size:16px;color:rgba(255,255,255,.55)}',
+'.rm-tsheet-row span{font-size:14px;color:rgba(255,255,255,.85)}',
+'.rm-tsheet-row.danger i,.rm-tsheet-row.danger span{color:#ef4444}',
+'.rm-tsheet-row.disabled{opacity:.4;pointer-events:none}',
+'.rm-tsheet-progress{font-size:11px;color:#1DB954;margin-left:auto;font-weight:600}',
+
+/* "..." button on tracks */
+'.rm-track-more{background:none;border:none;color:rgba(255,255,255,.3);font-size:16px;padding:8px;cursor:pointer;flex-shrink:0;border-radius:8px;transition:color .12s;line-height:1}',
+'.rm-track-more:hover{color:rgba(255,255,255,.7);background:rgba(255,255,255,.06)}',
+'.rm-track-more.rm-downloading{color:#1DB954;animation:rm-pulse 1s infinite}',
+
+/* playlist edit mode */
+'.rm-pl-edit-mode .rm-track{cursor:grab}',
+'.rm-pl-edit-mode .rm-track:active{cursor:grabbing}',
+'.rm-track.rm-dnd-over{box-shadow:inset 0 2px 0 #1DB954}',
+'.rm-track.rm-dnd-dragging{opacity:.4}',
+'.rm-pl-edit-btn{background:none;border:1px solid rgba(255,255,255,.2);color:rgba(255,255,255,.6);font-size:12px;padding:6px 14px;border-radius:20px;cursor:pointer;transition:all .15s}',
+'.rm-pl-edit-btn.active{background:#1DB954;color:#000;border-color:#1DB954}',
 
 /* exit fullscreen toggle (mobile only) */
 '.rm-exit-fs{display:none;position:absolute;top:8px;right:8px;z-index:200;width:40px;height:40px;border-radius:50%;background:rgba(0,0,0,.55);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.12);color:rgba(255,255,255,.7);font-size:15px;cursor:pointer;align-items:center;justify-content:center;transition:all .2s}',
@@ -830,12 +937,32 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 }
             }, { passive: true });
 
-            // Player controls
+            // Player controls — optimistic toggle: icon flips instantly, reverts if play() rejects
             const playPauseBtn = body.querySelector('#rm-play-pause');
             playPauseBtn.onclick = () => {
                 if (!_audio) return;
-                if (_audio.paused) { _audio.play(); playPauseBtn.innerHTML = '<i class="fas fa-pause"></i>'; _showEq(true); }
-                else { _audio.pause(); playPauseBtn.innerHTML = '<i class="fas fa-play"></i>'; _showEq(false); }
+                // Restored state: audio src not yet loaded — reinitialise from saved track
+                if (!_audio.src && _playing) { playAudio(_playing); return; }
+                // When casting, route to Chromecast — don't touch local (muted) audio
+                if (_castTogglePlayPause()) return;
+                const npBtn = _npOverlay?.querySelector('#rm-np-playpause');
+                if (_audio.paused) {
+                    playPauseBtn.innerHTML = '<i class="fas fa-pause"></i>';
+                    if (npBtn) npBtn.innerHTML = '<i class="fas fa-pause"></i>';
+                    _showEq(true);
+                    _audio.play().catch(err => {
+                        if (err.name !== 'AbortError') {
+                            playPauseBtn.innerHTML = '<i class="fas fa-play"></i>';
+                            if (npBtn) npBtn.innerHTML = '<i class="fas fa-play"></i>';
+                            _showEq(false);
+                        }
+                    });
+                } else {
+                    _audio.pause();
+                    playPauseBtn.innerHTML = '<i class="fas fa-play"></i>';
+                    if (npBtn) npBtn.innerHTML = '<i class="fas fa-play"></i>';
+                    _showEq(false);
+                }
             };
             body.querySelector('#rm-prev-btn').onclick = () => _skipStation(-1);
             body.querySelector('#rm-next-btn').onclick = () => _skipStation(1);
@@ -863,7 +990,16 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             body.querySelector('#rm-shuffle-btn').onclick = () => { _shuffle = !_shuffle; _syncShuffleBtn(); };
             _syncShuffleBtn();
 
-            body.querySelector('#rm-vol').oninput = (e) => { if (_audio) _audio.volume = e.target.value / 100; };
+            body.querySelector('#rm-vol').oninput = (e) => {
+                const vol = e.target.value / 100;
+                if (_isCasting && _castPlayer && _castController) {
+                    // Route volume to Chromecast receiver, not local audio
+                    _castPlayer.volumeLevel = vol;
+                    _castController.setVolumeLevel();
+                } else if (_audio) {
+                    _audio.volume = vol;
+                }
+            };
 
             // Click player bar to open Now Playing overlay
             body.querySelector('#rm-player-art').onclick = () => _showNowPlaying();
@@ -883,6 +1019,16 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
             // Initialize Google Cast SDK (wrapped so failures don't break the app)
             try { _initCast(); } catch(e) { _cl('error', 'Cast init failed', { error: e.message }); }
+
+            // Initialize offline archive manager (SocketIO listeners + SW readiness)
+            try { _initArchive(); } catch(e) { _cl('error', 'Archive init failed', { error: e.message }); }
+
+            // Subscribe store → auto-refresh queue highlights when track changes via Next/Prev/Cast
+            _rmStore.subscribe(() => {
+                _refreshQueueHighlight();
+                // Refresh NP overlay queue — always (even if minimized), so it's ready on expand
+                if (_renderNpQueueFn) _renderNpQueueFn();
+            });
 
             // Restore previous playback state (paused, showing last track)
             _restoreAndShowLastTrack(body);
@@ -1201,6 +1347,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             const card = document.createElement('div');
             card.className = 'rm-card' + (isPlaying ? ' rm-playing' : '');
             card._stationUuid = s.uuid;
+            if (s.url) card.dataset.url = s.url;
             card.innerHTML = `
                 <div class="rm-card-icon">${_stationIconHtml(s)}</div>
                 <div class="rm-card-info">
@@ -1640,10 +1787,16 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     function renderMusicResults(tracks, container, dlFolder) {
         container.innerHTML = '<div style="display:flex;flex-direction:column;gap:6px" id="rm-tracks-list"></div>';
         const list = container.querySelector('#rm-tracks-list');
+        // Pre-load archive status for all visible tracks
+        _loadArchiveBatch(tracks.map(tr => tr.url).filter(Boolean));
         tracks.forEach((tr, idx) => {
             const isPlaying = _playing && _playing.id === tr.id;
             const el = document.createElement('div');
             el.className = 'rm-track' + (isPlaying ? ' rm-playing' : '');
+            if (tr.url) el.dataset.url = tr.url;
+            // Store metadata for archive use
+            if (tr.url) _archiveDb[tr.url] = _archiveDb[tr.url] || {};
+            if (tr.url && tr.title) (_archiveDb[tr.url] || {}).title = tr.title;
             el.innerHTML = `
                 <img class="rm-track-thumb" src="${escH(tr.thumbnail)}" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 48 48%22><rect fill=%22%231a1a2e%22 width=%2248%22 height=%2248%22/><text x=%2224%22 y=%2230%22 fill=%22%23666%22 text-anchor=%22middle%22 font-size=%2220%22>♪</text></svg>'">
                 <div class="rm-track-info">
@@ -1652,31 +1805,32 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 </div>
                 <span class="rm-track-dur">${escH(tr.duration_fmt)}</span>
                 <div class="rm-track-actions">
-                    <button class="rm-dl-btn" title="${t('Pobierz')}"><i class="fas fa-download"></i></button>
-                    <button class="rm-track-btn" title="${t('Playlista')}"><i class="fas fa-list-ul"></i></button>
-                    <button class="rm-track-btn rm-add-queue-btn" title="${t('Dodaj do kolejki')}"><i class="fas fa-plus"></i></button>
+                    ${_archiveBtnHtml(tr.url)}
+                    <button class="rm-track-more" title="${t('Opcje')}"><i class="fas fa-ellipsis-v"></i></button>
                 </div>`;
             el.onclick = (e) => {
-                if (e.target.closest('.rm-add-queue-btn') || e.target.closest('.rm-dl-btn') || e.target.closest('.rm-track-btn')) return;
-                _musicQueue = tracks.slice(idx);
-                _musicQueueIdx = 0;
-                playMusicTrack(tr);
+                if (e.target.closest('.rm-arch-btn') || e.target.closest('.rm-track-more')) return;
+                // F-02 playContext: clicking any track loads full folder as queue context
+                playContext(tracks.map(t => t), idx);
             };
-            el.querySelector('.rm-add-queue-btn').onclick = (e) => {
+            el.querySelector('.rm-track-more').onclick = (e) => {
                 e.stopPropagation();
-                _musicQueue.push(tr);
-                toast(t('Dodano do kolejki: ') + tr.title, 'success');
-            };
-            el.querySelector('.rm-dl-btn').onclick = (e) => {
-                e.stopPropagation();
-                _downloadTrack(tr, e.currentTarget, dlFolder);
-            };
-            el.querySelector('.rm-track-btn[title="' + t('Playlista') + '"]').onclick = (e) => {
-                e.stopPropagation();
-                _showAddToPlaylistModal({
+                _showTrackSheet({
                     name: tr.title, url: tr.url, type: 'music',
-                    meta: tr.channel, image: tr.thumbnail,
+                    meta: tr.channel, image: tr.thumbnail, source: 'youtube',
                 });
+            };
+            const archBtn = el.querySelector('.rm-arch-btn');
+            if (archBtn) archBtn.onclick = (e) => {
+                e.stopPropagation();
+                // Store track metadata for archive start
+                if (tr.url) {
+                    _archiveDb[tr.url] = {
+                        ..._archiveDb[tr.url] || {},
+                        title: tr.title, artist: tr.channel, thumbnail: tr.thumbnail
+                    };
+                }
+                _onArchiveBtnClick(tr.url, archBtn);
             };
             list.appendChild(el);
         });
@@ -1827,11 +1981,13 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             return;
         }
 
-        // Group by folder
+        // Group by first subdirectory (artist/album level), same as audiobooks
         const byFolder = {};
         items.forEach(it => {
-            if (!byFolder[it.folder]) byFolder[it.folder] = [];
-            byFolder[it.folder].push(it);
+            const parts = (it.relative || it.filename).split('/');
+            const group = parts.length > 1 ? parts[0] : (it.folder.split('/').pop() || 'Muzyka');
+            if (!byFolder[group]) byFolder[group] = [];
+            byFolder[group].push(it);
         });
 
         // Precompute search string for each item
@@ -1874,6 +2030,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 + '<div class="rm-track-actions">'
                 + '<button class="rm-track-btn" title="' + t('Playlista') + '"><i class="fas fa-list-ul"></i></button>'
                 + '<button class="rm-track-btn rm-add-queue-btn" title="' + t('Kolejka') + '"><i class="fas fa-plus"></i></button>'
+                + '<button class="rm-track-btn rm-local-del-btn" title="' + t('Usuń plik') + '" style="color:rgba(239,68,68,.5)"><i class="fas fa-trash-alt"></i></button>'
                 + '</div>';
             const localItem = {
                 name: file.name, type: 'local', path: file.path,
@@ -1900,6 +2057,24 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             };
             const plBtn = el.querySelector('.rm-track-btn[title="' + t('Playlista') + '"]');
             if (plBtn) plBtn.onclick = (e) => { e.stopPropagation(); _showAddToPlaylistModal(localItem); };
+            const delBtn = el.querySelector('.rm-local-del-btn');
+            if (delBtn) delBtn.onclick = async (e) => {
+                e.stopPropagation();
+                if (!confirm(t('Usunąć plik?') + '\n' + file.filename)) return;
+                const res = await api('/radio-music/local/file', { method: 'DELETE', body: { path: file.path } });
+                if (res.error) { toast(res.error, 'error'); return; }
+                // Remove from in-memory lists and re-render
+                const idx = items.indexOf(file);
+                if (idx >= 0) items.splice(idx, 1);
+                const bfArr = byFolder[folder];
+                if (bfArr) {
+                    const bi = bfArr.indexOf(file);
+                    if (bi >= 0) bfArr.splice(bi, 1);
+                    if (!bfArr.length) delete byFolder[folder];
+                }
+                _applyLocalFilter(content.querySelector('#rm-local-search')?.value || '');
+                toast(t('Usunięto: ') + file.name, 'success');
+            };
             return el;
         }
 
@@ -1915,8 +2090,37 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             if (entry.isHeader) {
                 const h = document.createElement('div');
                 h.className = 'rm-section-title';
-                h.innerHTML = '<i class="fas fa-folder"></i> ' + escH(entry.name)
+                h.style.display = 'flex';
+                h.style.alignItems = 'center';
+                h.style.justifyContent = 'space-between';
+                const label = document.createElement('span');
+                label.innerHTML = '<i class="fas fa-folder"></i> ' + escH(entry.name)
                     + ' <span style="font-size:11px;color:var(--text-muted);font-weight:400">(' + entry.count + ')</span>';
+                h.appendChild(label);
+                if (entry.folderPath) {
+                    const delFolderBtn = document.createElement('button');
+                    delFolderBtn.className = 'rm-track-btn rm-local-del-btn';
+                    delFolderBtn.title = t('Usuń folder');
+                    delFolderBtn.style.cssText = 'color:rgba(239,68,68,.5);flex-shrink:0';
+                    delFolderBtn.innerHTML = '<i class="fas fa-folder-minus"></i>';
+                    delFolderBtn.onclick = async (e) => {
+                        e.stopPropagation();
+                        const groupKey = entry.groupKey;
+                        const folderFiles = byFolder[groupKey] || [];
+                        if (!confirm(t('Usunąć folder i') + ' ' + folderFiles.length + ' ' + t('plików?') + '\n' + entry.folderPath)) return;
+                        const res = await api('/radio-music/local/folder', { method: 'DELETE', body: { path: entry.folderPath } });
+                        if (res.error) { toast(res.error, 'error'); return; }
+                        // Remove all files in this group from in-memory lists
+                        folderFiles.forEach(f => {
+                            const idx = items.indexOf(f);
+                            if (idx >= 0) items.splice(idx, 1);
+                        });
+                        delete byFolder[groupKey];
+                        _applyLocalFilter(content.querySelector('#rm-local-search')?.value || '');
+                        toast(t('Usunięto folder: ') + entry.name, 'success');
+                    };
+                    h.appendChild(delFolderBtn);
+                }
                 return h;
             }
             return _buildLocalTrackEl(entry.file, entry.folder);
@@ -1985,10 +2189,13 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                     count++;
                 });
             } else {
-                for (const [folder, files] of Object.entries(byFolder)) {
-                    const folderName = folder.split('/').pop() || folder;
-                    entries.push({ isHeader: true, name: folderName, count: files.length });
-                    files.forEach(f => { entries.push({ file: f, folder }); count++; });
+                const sortedGroups = Object.entries(byFolder).sort(([a], [b]) => a.localeCompare(b));
+                for (const [group, files] of sortedGroups) {
+                    const sample = files[0];
+                    const parts = (sample.relative || sample.filename).split('/');
+                    const realFolderPath = parts.length > 1 ? (sample.folder + '/' + group) : sample.folder;
+                    entries.push({ isHeader: true, name: group, count: files.length, folderPath: realFolderPath, groupKey: group });
+                    files.forEach(f => { entries.push({ file: f, folder: group }); count++; });
                 }
             }
             const countEl = content.querySelector('#rm-local-count');
@@ -2043,7 +2250,8 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 if (file.album) metaParts.push(file.album);
                 if (!metaParts.length) metaParts.push(file.filename);
                 const durStr = file.duration ? _fmtSecs(file.duration) : '';
-                html += '<div class="rm-track rm-lab-track" data-group="' + escH(folder) + '" data-idx="' + i + '">'
+                const isLocalPlaying = _playing && _playing.path && _playing.path === file.path;
+                html += '<div class="rm-track rm-lab-track' + (isLocalPlaying ? ' rm-playing' : '') + '" data-group="' + escH(folder) + '" data-idx="' + i + '" data-url="' + escH(file.path) + '">'
                     + (artUrl
                         ? '<img class="rm-track-thumb" src="' + escH(artUrl) + '" loading="lazy" onerror="this.outerHTML=\'<div class=\\\'rm-track-thumb\\\' style=\\\'display:flex;align-items:center;justify-content:center;background:#1a1a2e\\\'><i class=\\\'fas fa-book\\\' style=\\\'color:var(--text-muted)\\\'></i></div>\'">'
                         : '<div class="rm-track-thumb" style="display:flex;align-items:center;justify-content:center;background:#1a1a2e"><i class="fas fa-book" style="color:var(--text-muted)"></i></div>')
@@ -2177,51 +2385,110 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         const data = await api('/radio-music/playlists/' + plId);
         if (data.error) { content.innerHTML = '<div class="rm-empty"><p>' + escH(data.error) + '</p></div>'; return; }
         const pl = data.playlist;
+        let editMode = false;
+        let currentTracks = pl.tracks.slice(); // mutable copy for DnD
+
+        function _renderTracks() {
+            const trackList = content.querySelector('#rm-pl-tracklist');
+            if (!trackList) return;
+            trackList.innerHTML = '';
+            currentTracks.forEach((tr, idx) => {
+                const icon = tr.type === 'radio' ? 'fa-broadcast-tower' : tr.type === 'podcast' ? 'fa-podcast' : 'fa-music';
+                const isPlaying = _playing && _playing.url && _playing.url === tr.url;
+                const el = document.createElement('div');
+                el.className = 'rm-track' + (isPlaying ? ' rm-playing' : '');
+                el.dataset.idx = idx;
+                el.dataset.url = tr.url || '';
+                if (editMode) el.setAttribute('draggable', 'true');
+                el.innerHTML = `${tr.image || tr.thumbnail ? '<img class="rm-track-thumb" src="' + escH(tr.image || tr.thumbnail) + '" loading="lazy">' : '<div class="rm-track-thumb" style="display:flex;align-items:center;justify-content:center"><i class="fas ' + icon + '" style="color:var(--text-muted)"></i></div>'}
+                    <div class="rm-track-info">
+                        <div class="rm-track-title">${escH(tr.name || tr.title)}</div>
+                        <div class="rm-track-meta">${escH(tr.meta || tr.channel || '')} ${tr.type ? '<span class="rm-card-codec">' + tr.type + '</span>' : ''}</div>
+                    </div>
+                    ${tr.duration_fmt ? '<span class="rm-track-dur">' + escH(tr.duration_fmt) + '</span>' : ''}
+                    <button class="rm-track-more" title="${t('Opcje')}"><i class="fas fa-ellipsis-v"></i></button>`;
+                el.onclick = (e) => {
+                    if (e.target.closest('.rm-track-more')) return;
+                    if (editMode) return;
+                    _musicQueue = currentTracks.slice(idx).map(t => ({...t, _plItem: true}));
+                    _musicQueueIdx = 0;
+                    _playTrackFromPlaylist(currentTracks[idx]);
+                };
+                el.querySelector('.rm-track-more').onclick = (e) => {
+                    e.stopPropagation();
+                    _showTrackSheet(tr, {
+                        inPlaylist: plId,
+                        trackIdx: idx,
+                        onRemoved: () => openPlaylist(plId, content),
+                    });
+                };
+                // DnD reorder
+                el.addEventListener('dragstart', (e) => {
+                    el.classList.add('rm-dnd-dragging');
+                    e.dataTransfer.effectAllowed = 'move';
+                    e.dataTransfer.setData('text/plain', idx);
+                });
+                el.addEventListener('dragend', () => el.classList.remove('rm-dnd-dragging'));
+                el.addEventListener('dragover', (e) => { e.preventDefault(); el.classList.add('rm-dnd-over'); });
+                el.addEventListener('dragleave', () => el.classList.remove('rm-dnd-over'));
+                el.addEventListener('drop', async (e) => {
+                    e.preventDefault();
+                    el.classList.remove('rm-dnd-over');
+                    const fromIdx = parseInt(e.dataTransfer.getData('text/plain'));
+                    const toIdx = parseInt(el.dataset.idx);
+                    if (isNaN(fromIdx) || fromIdx === toIdx) return;
+                    const moved = currentTracks.splice(fromIdx, 1)[0];
+                    currentTracks.splice(toIdx, 0, moved);
+                    _renderTracks();
+                    // Persist new order
+                    await api('/radio-music/playlists/' + plId, { method: 'PUT', body: { tracks: currentTracks } });
+                });
+                trackList.appendChild(el);
+            });
+        }
 
         let html = '<div class="rm-pl-header">'
             + '<button class="rm-pl-btn" id="rm-pl-back" style="font-size:16px;color:var(--text-primary)"><i class="fas fa-arrow-left"></i></button>'
             + '<h3>' + escH(pl.name) + '</h3>'
             + '<button class="rm-pl-btn rm-pl-play-all" title="' + t('Odtwórz wszystko') + '" style="color:var(--accent);font-size:16px"><i class="fas fa-play"></i></button>'
+            + '<button class="rm-pl-edit-btn" id="rm-pl-edit-toggle" title="' + t('Edytuj kolejność') + '"><i class="fas fa-sort"></i></button>'
             + '<button class="rm-dl-btn rm-pl-dl-all" title="' + t('Pobierz playlistę') + '" style="font-size:16px"><i class="fas fa-download"></i></button>'
             + '</div>';
 
         if (!pl.tracks.length) {
             html += '<div class="rm-empty"><i class="fas fa-music"></i><p>' + t('Playlista jest pusta') + '</p><p style="font-size:12px;margin-top:4px">' + t('Dodaj utwory z sekcji Muzyka, Radio lub Podcasty') + '</p></div>';
         } else {
-            html += '<div style="display:flex;flex-direction:column;gap:4px">';
-            pl.tracks.forEach((tr, idx) => {
-                const icon = tr.type === 'radio' ? 'fa-broadcast-tower' : tr.type === 'podcast' ? 'fa-podcast' : 'fa-music';
-                html += `<div class="rm-track" data-idx="${idx}">
-                    ${tr.image || tr.thumbnail ? '<img class="rm-track-thumb" src="' + escH(tr.image || tr.thumbnail) + '" loading="lazy">' : '<div class="rm-track-thumb" style="display:flex;align-items:center;justify-content:center"><i class="fas ' + icon + '" style="color:var(--text-muted)"></i></div>'}
-                    <div class="rm-track-info">
-                        <div class="rm-track-title">${escH(tr.name || tr.title)}</div>
-                        <div class="rm-track-meta">${escH(tr.meta || tr.channel || '')} ${tr.type ? '<span class="rm-card-codec">' + tr.type + '</span>' : ''}</div>
-                    </div>
-                    ${tr.duration_fmt ? '<span class="rm-track-dur">' + escH(tr.duration_fmt) + '</span>' : ''}
-                    <button class="rm-track-btn rm-pl-trk-rm" title="${t('Usuń')}"><i class="fas fa-times"></i></button>
-                </div>`;
-            });
-            html += '</div>';
+            html += '<div id="rm-pl-tracklist" style="display:flex;flex-direction:column;gap:4px"></div>';
         }
         content.innerHTML = html;
+        if (pl.tracks.length) _renderTracks();
 
         content.querySelector('#rm-pl-back').onclick = () => {
             const toolbar = bodyEl.querySelector('#rm-toolbar');
             loadPlaylists(toolbar, content);
         };
 
+        const editToggle = content.querySelector('#rm-pl-edit-toggle');
+        if (editToggle) editToggle.onclick = () => {
+            editMode = !editMode;
+            editToggle.classList.toggle('active', editMode);
+            editToggle.title = editMode ? t('Gotowe') : t('Edytuj kolejność');
+            content.querySelector('#rm-pl-tracklist')?.classList.toggle('rm-pl-edit-mode', editMode);
+            _renderTracks();
+        };
+
         const playAllBtn = content.querySelector('.rm-pl-play-all');
         if (playAllBtn) playAllBtn.onclick = () => {
-            if (pl.tracks.length) {
-                _musicQueue = pl.tracks.map(t => ({...t, _plItem: true}));
+            if (currentTracks.length) {
+                _musicQueue = currentTracks.map(t => ({...t, _plItem: true}));
                 _musicQueueIdx = 0;
-                _playTrackFromPlaylist(pl.tracks[0]);
+                _playTrackFromPlaylist(currentTracks[0]);
             }
         };
 
         const dlAllBtn = content.querySelector('.rm-pl-dl-all');
         if (dlAllBtn) dlAllBtn.onclick = () => {
-            const musicTracks = pl.tracks.filter(t => t.type === 'music' && t.url);
+            const musicTracks = currentTracks.filter(t => t.type === 'music' && t.url);
             if (!musicTracks.length) {
                 toast(t('Brak utworów do pobrania (tylko YouTube)'), 'warning');
                 return;
@@ -2230,21 +2497,6 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             dlAllBtn.classList.add('rm-downloading');
             dlAllBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
         };
-
-        content.querySelectorAll('.rm-track').forEach(el => {
-            const idx = parseInt(el.dataset.idx);
-            el.onclick = (e) => {
-                if (e.target.closest('.rm-pl-trk-rm')) return;
-                _musicQueue = pl.tracks.slice(idx).map(t => ({...t, _plItem: true}));
-                _musicQueueIdx = 0;
-                _playTrackFromPlaylist(pl.tracks[idx]);
-            };
-            el.querySelector('.rm-pl-trk-rm').onclick = async (e) => {
-                e.stopPropagation();
-                await api('/radio-music/playlists/' + plId + '/tracks/' + idx, { method: 'DELETE' });
-                openPlaylist(plId, content);
-            };
-        });
     }
 
     function _playTrackFromPlaylist(tr) {
@@ -2256,40 +2508,174 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         }
     }
 
+    function _showTrackSheet(track, opts = {}) {
+        /* opts: { inPlaylist: plId, trackIdx: number, onRemoved: fn } */
+        const archEntry = track.url ? (_archiveDb[track.url] || null) : null;
+        const archKey = archEntry?.key || null;
+        const isYT = track.type === 'music';
+        const isDone = archEntry?.status === 'done';
+        const isDling = archEntry?.status === 'downloading';
+
+        const overlay = document.createElement('div');
+        overlay.className = 'rm-tsheet-overlay';
+        const sheet = document.createElement('div');
+        sheet.className = 'rm-tsheet';
+
+        const rows = [
+            { icon: 'fa-play-circle', label: t('Odtwórz'), action: 'play' },
+            { icon: 'fa-list-ol', label: t('Dodaj do kolejki'), action: 'queue' },
+            { icon: 'fa-list', label: t('Dodaj do playlisty'), action: 'playlist' },
+        ];
+        if (isYT && !isDone && !isDling) {
+            rows.push({ icon: 'fa-cloud-download-alt', label: t('Pobierz do folderu Muzyka'), action: 'archive' });
+        }
+        if (isYT && isDling) {
+            rows.push({ icon: 'fa-cloud-download-alt', label: t('Pobieranie…'), action: 'archive', extra: (archEntry.progress || 0) + '%', disabled: true });
+        }
+        if (isDone && archKey) {
+            rows.push({ icon: 'fa-download', label: t('Zapisz plik na dysku'), action: 'download' });
+        }
+        if (opts.inPlaylist != null) {
+            rows.push({ icon: 'fa-trash', label: t('Usuń z playlisty'), action: 'remove', danger: true });
+        }
+
+        sheet.innerHTML = `<div class="rm-tsheet-handle"></div>
+            <div class="rm-tsheet-title">${escH(track.name || track.title || '?')}</div>
+            ${rows.map(r => `<div class="rm-tsheet-row${r.danger ? ' danger' : ''}${r.disabled ? ' disabled' : ''}" data-action="${r.action}">
+                <i class="fas ${r.icon}"></i><span>${escH(r.label)}</span>
+                ${r.extra ? `<span class="rm-tsheet-progress">${escH(r.extra)}</span>` : ''}
+            </div>`).join('')}`;
+
+        document.body.appendChild(overlay);
+        document.body.appendChild(sheet);
+        requestAnimationFrame(() => sheet.classList.add('open'));
+
+        const close = () => {
+            sheet.classList.remove('open');
+            setTimeout(() => { overlay.remove(); sheet.remove(); }, 260);
+        };
+        overlay.onclick = close;
+
+        sheet.querySelectorAll('.rm-tsheet-row[data-action]').forEach(row => {
+            row.onclick = async () => {
+                const action = row.dataset.action;
+                close();
+                if (action === 'play') {
+                    if (track.type === 'radio') playStation(track);
+                    else playAudio(track);
+                } else if (action === 'queue') {
+                    _musicQueue.push(track);
+                    toast(t('Dodano do kolejki'), 'success');
+                } else if (action === 'playlist') {
+                    _showAddToPlaylistModal(track);
+                } else if (action === 'archive') {
+                    _onArchiveBtnClick(track.url, null);
+                } else if (action === 'download' && archKey) {
+                    const a = document.createElement('a');
+                    a.href = `/api/radio-music/archive/download/${archKey}?token=${NAS.token || ''}`;
+                    a.download = (track.name || track.title || archKey) + '.mp3';
+                    document.body.appendChild(a); a.click(); a.remove();
+                } else if (action === 'remove' && opts.inPlaylist != null) {
+                    await api('/radio-music/playlists/' + opts.inPlaylist + '/tracks/' + opts.trackIdx, { method: 'DELETE' });
+                    if (opts.onRemoved) opts.onRemoved();
+                }
+            };
+        });
+    }
+
     function _showAddToPlaylistModal(track) {
-        // Show a simple modal to pick a playlist
         const overlay = document.createElement('div');
         overlay.className = 'rm-modal-overlay';
         overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
 
-        let html = '<div class="rm-modal"><h4>' + t('Dodaj do playlisty') + '</h4>';
-        if (!_playlists.length) {
-            html += '<p style="color:var(--text-muted);font-size:13px">' + t('Brak playlist. Utwórz playlistę w sekcji Playlisty.') + '</p>';
-        } else {
-            _playlists.forEach(pl => {
-                html += `<div class="rm-modal-item" data-plid="${escH(pl.id)}"><i class="fas fa-list"></i> ${escH(pl.name)} <span style="color:var(--text-muted);margin-left:auto;font-size:11px">${pl.tracks.length}</span></div>`;
-            });
-        }
-        html += '<button class="rm-modal-close">' + t('Anuluj') + '</button></div>';
-        overlay.innerHTML = html;
+        const modal = document.createElement('div');
+        modal.className = 'rm-modal';
 
-        overlay.querySelector('.rm-modal-close').onclick = () => overlay.remove();
-        overlay.querySelectorAll('.rm-modal-item').forEach(el => {
-            el.onclick = async () => {
-                const plId = el.dataset.plid;
-                await api('/radio-music/playlists/' + plId + '/tracks', { method: 'POST', body: { track } });
-                overlay.remove();
-                toast(t('Dodano do: ') + _playlists.find(p => p.id === plId)?.name, 'success');
-                await _loadPlaylists();
+        const render = () => {
+            let html = '<h4>' + t('Dodaj do playlisty') + '</h4>';
+            // "Create new" row
+            html += `<div class="rm-modal-item rm-modal-new-pl" data-action="new"><i class="fas fa-plus-circle" style="color:#1DB954"></i> <span>${t('Utwórz nową playlistę')}</span></div>`;
+            // Inline create form (hidden by default)
+            html += `<div class="rm-modal-create-form" style="display:none;padding:8px 0 4px">
+                <input class="rm-modal-new-input" placeholder="${t('Nazwa playlisty...')}" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);color:#fff;font-size:13px;outline:none">
+                <div style="display:flex;gap:8px;margin-top:8px">
+                    <button class="rm-modal-create-confirm" style="flex:1;padding:7px;border-radius:20px;background:#1DB954;color:#000;border:none;cursor:pointer;font-size:12px;font-weight:700">${t('Utwórz i dodaj')}</button>
+                    <button class="rm-modal-create-cancel" style="flex:1;padding:7px;border-radius:20px;background:none;border:1px solid rgba(255,255,255,.15);color:rgba(255,255,255,.7);cursor:pointer;font-size:12px">${t('Anuluj')}</button>
+                </div>
+            </div>`;
+            if (_playlists.length) {
+                html += '<div style="margin:10px 0 4px;font-size:11px;color:rgba(255,255,255,.3);text-transform:uppercase;letter-spacing:.05em">' + t('Istniejące playlisty') + '</div>';
+                _playlists.forEach(pl => {
+                    html += `<div class="rm-modal-item" data-plid="${escH(pl.id)}"><i class="fas fa-list"></i> ${escH(pl.name)} <span style="color:var(--text-muted);margin-left:auto;font-size:11px">${pl.tracks.length}</span></div>`;
+                });
+            }
+            html += '<button class="rm-modal-close">' + t('Anuluj') + '</button>';
+            modal.innerHTML = html;
+
+            // Toggle create form
+            modal.querySelector('.rm-modal-new-pl').onclick = () => {
+                const form = modal.querySelector('.rm-modal-create-form');
+                const isOpen = form.style.display !== 'none';
+                form.style.display = isOpen ? 'none' : 'block';
+                if (!isOpen) modal.querySelector('.rm-modal-new-input').focus();
             };
-        });
 
+            // Create & add
+            const doCreate = async () => {
+                const input = modal.querySelector('.rm-modal-new-input');
+                const name = input.value.trim();
+                if (!name) { input.focus(); return; }
+                const res = await api('/radio-music/playlists', { method: 'POST', body: { name } });
+                if (res.error) { toast(res.error, 'error'); return; }
+                await _loadPlaylists();
+                const newPl = _playlists.find(p => p.name === name);
+                if (newPl) {
+                    await api('/radio-music/playlists/' + newPl.id + '/tracks', { method: 'POST', body: { track } });
+                    overlay.remove();
+                    toast(t('Utwórzono i dodano do: ') + name, 'success');
+                }
+            };
+            modal.querySelector('.rm-modal-create-confirm').onclick = doCreate;
+            modal.querySelector('.rm-modal-new-input').onkeydown = (e) => { if (e.key === 'Enter') doCreate(); };
+            modal.querySelector('.rm-modal-create-cancel').onclick = () => {
+                modal.querySelector('.rm-modal-create-form').style.display = 'none';
+            };
+
+            modal.querySelector('.rm-modal-close').onclick = () => overlay.remove();
+            modal.querySelectorAll('.rm-modal-item[data-plid]').forEach(el => {
+                el.onclick = async () => {
+                    const plId = el.dataset.plid;
+                    await api('/radio-music/playlists/' + plId + '/tracks', { method: 'POST', body: { track } });
+                    overlay.remove();
+                    toast(t('Dodano do: ') + _playlists.find(p => p.id === plId)?.name, 'success');
+                    await _loadPlaylists();
+                };
+            });
+        };
+
+        render();
+        overlay.appendChild(modal);
         bodyEl.appendChild(overlay);
     }
 
     /* ── Queue ──────────────────────────────────────── */
 
+    // Update rm-playing highlight inside the queue panel without full re-render
+    function _refreshQueueHighlight() {
+        if (!_queueContent || !_queueContent.isConnected) { _queueContent = null; return; }
+        const items = _queueContent.querySelectorAll('.rm-queue-item');
+        items.forEach((el, idx) => {
+            const isCurrent = idx === _musicQueueIdx;
+            el.className = 'rm-queue-item' + (isCurrent ? ' rm-playing' : '');
+            const idxSpan = el.querySelector('.rm-queue-item-idx');
+            if (idxSpan) idxSpan.innerHTML = isCurrent ? '<i class="fas fa-volume-up"></i>' : String(idx + 1);
+        });
+        const cur = _queueContent.querySelector('.rm-queue-item.rm-playing');
+        if (cur) cur.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+
     function loadQueue(content) {
+        _queueContent = content;
         if (!_musicQueue.length) {
             content.innerHTML = '<div class="rm-empty"><i class="fas fa-list-ol"></i><p>' + t('Kolejka jest pusta') + '</p><p style="font-size:12px;margin-top:8px">' + t('Kliknij + przy utworze aby dodać do kolejki') + '</p></div>';
             return;
@@ -2339,14 +2725,17 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             html += '<div class="rm-section-title"><i class="fas fa-fire"></i> ' + t('Najczęściej grane') + '</div>';
             html += '<div class="rm-hscroll">';
             items.slice(0, 30).forEach((item, i) => {
-                const artHtml = (item.image || item.favicon)
-                    ? '<img src="' + escH(item.image || item.favicon) + '" onerror="this.outerHTML=\'<i class=\\\'fas fa-music\\\'></i>\'">'
+                const art = item.image || item.thumbnail || item.favicon || '';
+                const title = item.name || item.title || '';
+                if (!title) return;
+                const artHtml = art
+                    ? '<img src="' + escH(art) + '" onerror="this.outerHTML=\'<i class=\\\'fas fa-music\\\'></i>\'">'
                     : '<i class="fas fa-music"></i>';
                 const badge = item.play_count > 1 ? '<span class="rm-hcard-badge">' + item.play_count + '×</span>' : '';
                 html += '<div class="rm-hcard" data-idx="' + i + '">'
                     + '<div class="rm-hcard-art">' + artHtml + badge + '</div>'
-                    + '<div class="rm-hcard-title">' + escH(item.name) + '</div>'
-                    + '<div class="rm-hcard-meta">' + escH(item.meta || item.country || '') + '</div>'
+                    + '<div class="rm-hcard-title">' + escH(title) + '</div>'
+                    + '<div class="rm-hcard-meta">' + escH(item.meta || item.channel || item.country || '') + '</div>'
                     + '</div>';
             });
             html += '</div>';
@@ -2354,18 +2743,19 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
         // "Ostatnio grane" — music/local only
         const allRecent = (await api('/radio-music/history')).items || [];
-        const recent = allRecent.filter(it => it.type === 'music' || it.type === 'local');
+        const recent = allRecent.filter(it => (it.type === 'music' || it.type === 'local') && (it.name || it.title));
         if (recent.length) {
             html += '<div class="rm-section-title" style="margin-top:20px"><i class="fas fa-history"></i> ' + t('Ostatnio grane') + '</div>';
             html += '<div class="rm-hscroll">';
             recent.slice(0, 20).forEach((item, i) => {
-                const artHtml = (item.image || item.favicon)
-                    ? '<img src="' + escH(item.image || item.favicon) + '" onerror="this.outerHTML=\'<i class=\\\'fas fa-music\\\'></i>\'">'
+                const art = item.image || item.thumbnail || item.favicon || '';
+                const artHtml = art
+                    ? '<img src="' + escH(art) + '" onerror="this.outerHTML=\'<i class=\\\'fas fa-music\\\'></i>\'">'
                     : '<i class="fas fa-music"></i>';
                 html += '<div class="rm-hcard rm-hcard-recent" data-ridx="' + i + '">'
                     + '<div class="rm-hcard-art">' + artHtml + '</div>'
-                    + '<div class="rm-hcard-title">' + escH(item.name) + '</div>'
-                    + '<div class="rm-hcard-meta">' + escH(item.meta || item.country || '') + '</div>'
+                    + '<div class="rm-hcard-title">' + escH(item.name || item.title) + '</div>'
+                    + '<div class="rm-hcard-meta">' + escH(item.meta || item.channel || item.country || '') + '</div>'
                     + '</div>';
             });
             html += '</div>';
@@ -2377,9 +2767,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             html += '<div class="rm-section-title" style="margin-top:20px"><i class="fas fa-broadcast-tower"></i> ' + t('Ostatnio słuchane radia') + '</div>';
             html += '<div class="rm-hscroll">';
             recentRadios.slice(0, 20).forEach((item, i) => {
-                const artHtml = (item.image || item.favicon)
-                    ? '<img src="' + escH(item.image || item.favicon) + '" onerror="this.outerHTML=\'<i class=\\\'fas fa-broadcast-tower\\\'></i>\'">'
-                    : '<i class="fas fa-broadcast-tower"></i>';
+                const artHtml = _stationIconHtml(item);
                 html += '<div class="rm-hcard rm-hcard-radio" data-radidx="' + i + '">'
                     + '<div class="rm-hcard-art">' + artHtml + '</div>'
                     + '<div class="rm-hcard-title">' + escH(item.name) + '</div>'
@@ -2498,7 +2886,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             card.className = 'rm-card';
             const icon = item.type === 'podcast' ? 'fa-podcast' : 'fa-broadcast-tower';
             card.innerHTML = `
-                <div class="rm-card-icon">${item.image || item.favicon ? '<img src="' + escH(item.image || item.favicon) + '">' : '<i class="fas ' + icon + '"></i>'}</div>
+                <div class="rm-card-icon">${(item.type === 'radio' || (!item.type && item.uuid)) ? _stationIconHtml(item) : (item.image || item.favicon ? '<img src="' + escH(item.image || item.favicon) + '">' : '<i class="fas ' + icon + '"></i>')}</div>
                 <div class="rm-card-info">
                     <div class="rm-card-name">${escH(item.name)}</div>
                     <div class="rm-card-meta">${escH(item.meta || item.country || '')}</div>
@@ -2562,9 +2950,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             stations.forEach(s => {
                 const card = document.createElement('div');
                 card.className = 'rm-disc-card';
-                const artHtml = s.favicon
-                    ? `<img src="${escH(s.favicon)}" loading="lazy" onerror="this.outerHTML='<i class=\\'fas fa-broadcast-tower\\'></i>'">`
-                    : '<i class="fas fa-broadcast-tower"></i>';
+                const artHtml = _stationIconHtml(s);
                 card.innerHTML = `<div class="rm-disc-card-art">${artHtml}<span class="rm-disc-badge rm-disc-badge-radio">LIVE</span></div>`
                     + `<div class="rm-disc-card-body"><div class="rm-disc-card-title">${escH(s.name)}</div>`
                     + `<div class="rm-disc-card-meta">${escH((s.tags||'').split(',')[0]||'')||'Radio'}</div></div>`;
@@ -2841,6 +3227,18 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     }
 
     function playAudio(item) {
+        // F-01 OPTIMISTIC STATE: update UI within <50ms before any audio events
+        // User sees pause icon + loading ring immediately — no perceived lag
+        const _optPlayBtn = bodyEl?.querySelector('#rm-play-pause');
+        if (_optPlayBtn) {
+            _optPlayBtn.innerHTML = '<i class="fas fa-pause"></i>';
+            _optPlayBtn.classList.add('rm-loading');
+        }
+        const _optPlayer = bodyEl?.querySelector('#rm-player');
+        if (_optPlayer) _optPlayer.style.display = 'flex';
+        const _optName = bodyEl?.querySelector('#rm-player-name');
+        if (_optName) _optName.textContent = item.name || '';
+
         // Safety: reset stuck _isCasting if no real Cast session exists
         if (_isCasting) {
             let realSession = null;
@@ -2859,10 +3257,19 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             _audio.onwaiting = null; _audio.onplaying = null; _audio.onstalled = null;
             _audio.pause(); _audio.src = ''; _audio.load(); // release media resource
         }
+        if (_hlsInstance) { try { _hlsInstance.destroy(); } catch (_) {} _hlsInstance = null; }
+        // F-04 RAM cleanup: immediately release preload buffer on every new play
+        if (_preloadAudio) {
+            _preloadAudio.oncanplaythrough = null;
+            _preloadAudio.src = '';
+            _preloadAudio.load();
+            _preloadAudio = null;
+        }
         _clearSeek();
         _audio = new Audio();
         _audio.volume = _isCasting ? 0 : (bodyEl.querySelector('#rm-vol')?.value || 80) / 100;
         _playing = item;
+        _seekLocked = true; // unlock on onplay/oncanplay — prevents seekbar jumping to 0
 
         // Reset reconnect state and preload on each new playback
         clearTimeout(_radioRetryTimer); _radioRetryTimer = null; _radioRetries = 0;
@@ -2904,8 +3311,22 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
         // ── Buffering state helpers ──
         function _setBuffering(on) {
+            _isBuffering = on;
             const player = bodyEl.querySelector('#rm-player');
             if (player) player.classList.toggle('rm-buffering', on);
+            // F-01: progress ring on play button signals NAS loading to user
+            const playBtn = bodyEl.querySelector('#rm-play-pause');
+            if (playBtn) playBtn.classList.toggle('rm-loading', on);
+            // Sync loading ring to NP overlay play button too
+            const npPlayBtn = _npOverlay?.querySelector('#rm-np-playpause');
+            if (npPlayBtn) npPlayBtn.classList.toggle('rm-loading', on);
+            // Disable skip buttons while buffering so rapid taps don't skip past the loading track
+            [
+                bodyEl.querySelector('#rm-prev-btn'),
+                bodyEl.querySelector('#rm-next-btn'),
+                _npOverlay?.querySelector('#rm-np-prev'),
+                _npOverlay?.querySelector('#rm-np-next'),
+            ].forEach(btn => { if (btn) btn.classList.toggle('rm-btn-disabled', on); });
             bodyEl.querySelectorAll('.rm-card, .rm-track').forEach(c => c.classList.remove('rm-buffering'));
             if (on && item.uuid) {
                 bodyEl.querySelectorAll('.rm-card').forEach(c => {
@@ -2918,6 +3339,17 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
         function tryUrl(idx) {
             if (idx >= urls.length) {
+                // All network URLs failed — try NAS archive as last resort (Fallback Logic)
+                const archEntry = isMusic && item.url ? _archiveDb[item.url] : null;
+                if (archEntry && archEntry.status === 'done' && archEntry.key) {
+                    const archSrc = `/api/radio-music/archive/file/${archEntry.key}?token=${NAS.token || ''}`;
+                    _cl('info', 'YouTube failed — falling back to NAS archive', { key: archEntry.key });
+                    _audio.src = archSrc;
+                    _audio.play().catch(() => {});
+                    // Subtle icon change to indicate using archived version
+                    _refreshArchiveBtn(item.url);
+                    return;
+                }
                 _cl('error', 'All URLs failed', { name: item?.name, type: item?.type, urlCount: urls.length });
                 toast(t('Nie udało się odtworzyć żadnego źródła'), 'error');
                 _showEq(false);
@@ -2926,7 +3358,13 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 return;
             }
             let src;
-            if (isLocal) {
+            // Source priority: NAS archive (if done) > YouTube proxy > fallback URLs
+            const archEntry = isMusic && item.url ? _archiveDb[item.url] : null;
+            if (idx === 0 && archEntry && archEntry.status === 'done' && archEntry.key) {
+                // Silently play from NAS — faster and doesn't consume YouTube quota
+                src = `/api/radio-music/archive/file/${archEntry.key}?token=${NAS.token || ''}`;
+                _cl('debug', 'Playing from NAS archive', { key: archEntry.key });
+            } else if (isLocal) {
                 src = item.url;
             } else if (isMusic) {
                 src = '/api/radio-music/music/stream?url=' + encodeURIComponent(urls[idx])
@@ -2950,6 +3388,8 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                     } else {
                         _showAutoplayPrompt();
                     }
+                } else if (err.name === 'AbortError') {
+                    // Normal: src changed while play() was pending (e.g. fast track switch) — ignore silently
                 } else {
                     _cl('warning', 'play() rejected', { idx, error: err?.message, src: src?.substring(0, 80) });
                     tryUrl(idx + 1);
@@ -2979,12 +3419,14 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             hasPlayed = true;
             localStorage.setItem('rm_autoplay_ok', '1');
             _acquireWakeLock();
+            _seekLocked = false; // unlock seekbar — audio has started
             // Notify other tabs to pause (master-tab coordination)
             if (_bc) _bc.postMessage({ type: 'playing', tabId: _tabId });
             _setBuffering(false);
             clearTimeout(_radioRetryTimer); _radioRetryTimer = null;
             bodyEl.querySelector('#rm-autoplay-prompt')?.remove(); // clear tap-to-play if shown
             bodyEl.querySelector('#rm-play-pause').innerHTML = '<i class="fas fa-pause"></i>';
+            _npOverlay?.querySelector('#rm-np-playpause')?.innerHTML && (_npOverlay.querySelector('#rm-np-playpause').innerHTML = '<i class="fas fa-pause"></i>');
             _showEq(!isMusic && !isLocal);
             _updateSeekbar();
             _savePlaybackState();
@@ -2997,6 +3439,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         _audio.onpause = () => {
             _releaseWakeLock();
             bodyEl.querySelector('#rm-play-pause').innerHTML = '<i class="fas fa-play"></i>';
+            _npOverlay?.querySelector('#rm-np-playpause')?.innerHTML && (_npOverlay.querySelector('#rm-np-playpause').innerHTML = '<i class="fas fa-play"></i>');
             _showEq(false);
             _savePlaybackState();
             if ('mediaSession' in navigator) navigator.mediaSession.playbackState = 'paused';
@@ -3024,6 +3467,32 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             const msg = _audio?.error?.message || '';
             _cl('error', 'Audio error', { code, msg, hasPlayed, urlIdx, name: item?.name, isRadio });
             clearTimeout(_radioRetryTimer); _radioRetryTimer = null;
+
+            // MEDIA_ERR_SRC_NOT_SUPPORTED (4) — try hls.js for live streams / m3u8 redirects
+            if (code === 4 && typeof Hls !== 'undefined' && Hls.isSupported() && !_audio._hlsAttempted) {
+                const currentSrc = _audio.src;
+                _audio._hlsAttempted = true;
+                _cl('info', 'Trying HLS.js fallback', { src: currentSrc?.substring(0, 80) });
+                if (_hlsInstance) { try { _hlsInstance.destroy(); } catch (_) {} _hlsInstance = null; }
+                const hls = new Hls({ enableWorker: false });
+                _hlsInstance = hls;
+                hls.loadSource(currentSrc);
+                hls.attachMedia(_audio);
+                hls.on(Hls.Events.MANIFEST_PARSED, () => {
+                    _audio.play().catch(err => {
+                        if (err.name !== 'AbortError') tryUrl(urlIdx + 1);
+                    });
+                });
+                hls.on(Hls.Events.ERROR, (ev, data) => {
+                    if (data.fatal) {
+                        _cl('warning', 'HLS.js fatal error', { type: data.type, details: data.details });
+                        hls.destroy(); _hlsInstance = null;
+                        tryUrl(urlIdx + 1);
+                    }
+                });
+                return;
+            }
+
             if (!hasPlayed) {
                 urlIdx++;
                 tryUrl(urlIdx);
@@ -3084,19 +3553,39 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                     catch(e) {}
                 }
             }
-            // Preload next track ~30s before end for near-gapless playback (music queue only)
+            // F-03 GAPLESS: preload at 90% of track (or 30s remaining, whichever first)
+            // On NAS this gives ~8-12s for HDD spin-up before the track ends
             if ((isMusic || isLocal) && !_preloadAudio && _audio && isFinite(_audio.duration) && _audio.duration > 0) {
                 const remaining = _audio.duration - _audio.currentTime;
-                if (remaining < 30 && remaining > 0) {
+                const pct = _audio.currentTime / _audio.duration;
+                const shouldPreload = remaining < 30 || pct >= 0.9;
+                if (shouldPreload && remaining > 0) {
                     const nextIdx = _musicQueueIdx + 1;
                     const nextItem = _musicQueue[nextIdx];
-                    if (nextItem && nextItem.url) {
-                        _preloadAudio = new Audio();
-                        _preloadAudio.preload = 'auto';
-                        const src = isLocal ? nextItem.url
-                            : '/api/radio-music/music/stream?url=' + encodeURIComponent(nextItem.url) + '&token=' + (NAS.token || '');
-                        _preloadAudio.src = src;
-                        _cl('debug', 'Preloading next track', { name: nextItem.name });
+                    if (nextItem) {
+                        const nextSrc = nextItem.type === 'local'
+                            ? (nextItem.url || ('/api/radio-music/local/stream?path=' + encodeURIComponent(nextItem.path || '') + '&token=' + (NAS.token || '')))
+                            : (nextItem.url ? '/api/radio-music/music/stream?url=' + encodeURIComponent(nextItem.url) + '&token=' + (NAS.token || '') : null);
+                        if (nextSrc) {
+                            _preloadAudio = new Audio();
+                            _preloadAudio.preload = 'auto';
+                            _preloadAudio.volume = 0; // silent until crossfade starts
+                            _preloadAudio.src = nextSrc;
+                            const targetVol = _audio.volume;
+                            // When preload is buffered enough AND we're in final 5%, crossfade immediately
+                            _preloadAudio.oncanplaythrough = () => {
+                                if (!_preloadAudio || _playing !== item) return;
+                                const pctNow = _audio.currentTime / _audio.duration;
+                                if (pctNow >= 0.95) {
+                                    _cl('info', 'Gapless crossfade triggered at ' + Math.round(pctNow * 100) + '%', { next: nextItem.name });
+                                    _crossfade(_audio, _preloadAudio, targetVol, 1500, () => {
+                                        // After crossfade, officially switch to next track
+                                        _audio.onended?.(); // trigger queue advance
+                                    });
+                                }
+                            };
+                            _cl('debug', 'Preloading next track at ' + Math.round(pct * 100) + '%', { name: nextItem.name });
+                        }
                     }
                 }
             }
@@ -3134,26 +3623,30 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
         // Player art — use thumbnail for music, logo cascade for radio
         const art = bodyEl.querySelector('#rm-player-art');
-        if (isMusic && item.image) {
-            art.innerHTML = '<img src="' + escH(item.image) + '" onerror="this.outerHTML=\'<i class=\\\'fas fa-music\\\'></i>\'">';
+        if (isMusic || item.type === 'local') {
+            const artSrc = item.image || item.thumbnail || '';
+            art.innerHTML = artSrc
+                ? '<img src="' + escH(artSrc) + '" onerror="this.outerHTML=\'<i class=\\\'fas fa-music\\\'></i>\'">'
+                : '<i class="fas fa-music"></i>';
         } else {
-            const _fItem = { name: item.name, favicon: item.image, homepage: item.homepage || '', url: item.url };
+            // Radio / podcast — use station icon with logo manifest lookup
+            const _fItem = { name: item.name, favicon: item.image || item.favicon, homepage: item.homepage || '', url: item.url, stationuuid: item.uuid || item.stationuuid || '' };
             art.innerHTML = _stationIconHtml(_fItem);
         }
 
         // Save to history
         api('/radio-music/history', { method: 'POST', body: { item } });
 
-        // Sync Now Playing overlay if open
-        if (_npOverlay && !_npOverlay.classList.contains('rm-np-minimized')) {
-            _hideNowPlaying();
-            _showNowPlaying();
-        } else if (_npOverlay) {
-            _hideNowPlaying(); // was minimized — destroy silently, will reopen when user taps
+        // Sync Now Playing overlay — in-place update regardless of minimized state.
+        // The overlay is ONLY destroyed when the user explicitly closes it (swipe/button).
+        if (_npOverlay) {
+            _updateNowPlayingContent(item); // smooth crossfade, works whether open or minimized
         }
 
-        // Highlight playing card/track
-        bodyEl.querySelectorAll('.rm-card, .rm-ep-item, .rm-track').forEach(c => c.classList.remove('rm-playing'));
+        // Highlight the matching row in the list and scroll it into view
+        _highlightPlayingTrack(item);
+        // Update shared state store (subscribers like queue view react instantly)
+        _rmStore.set({ currentTrack: item, currentTrackIndex: _musicQueueIdx });
 
         // Start playback with fallback chain
         tryUrl(0);
@@ -3181,7 +3674,40 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         _savePlaybackState();
     }
 
+    // Highlight the currently playing element in the list and scroll it into view.
+    // Uses data-url attributes (set during render) to find the matching element.
+    function _highlightPlayingTrack(item) {
+        if (!bodyEl) return;
+        bodyEl.querySelectorAll('.rm-card, .rm-ep-item, .rm-track').forEach(c => c.classList.remove('rm-playing'));
+        if (!item) return;
+
+        let el = null;
+        // 1. Match by URL (music YT, playlist track, podcast)
+        if (item.url) {
+            el = bodyEl.querySelector(`[data-url="${CSS.escape(item.url)}"]`);
+        }
+        // 2. Local files: item.url is the full stream URL but data-url stores the file path
+        if (!el && item.path) {
+            el = bodyEl.querySelector(`[data-url="${CSS.escape(item.path)}"]`);
+        }
+        // 3. Radio card: match by station UUID (JS property, not a DOM attribute)
+        if (!el && item.uuid) {
+            el = Array.from(bodyEl.querySelectorAll('.rm-card')).find(c => c._stationUuid === item.uuid);
+        }
+        if (el) {
+            el.classList.add('rm-playing');
+            el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+    }
+
     function _skipStation(dir) {
+        // Block while buffering — prevents skipping past a track that's still loading
+        if (_isBuffering) return;
+        // Debounce rapid taps (1500ms cooldown) — prevents queued animations on fast Next/Next
+        const now = Date.now();
+        if (now - _prevNextTs < 1500) return;
+        _prevNextTs = now;
+
         // Queue has priority (music tracks, local files, or history list items)
         if (_musicQueue.length > 0 && _musicQueueIdx >= 0) {
             let nextIdx;
@@ -3356,6 +3882,8 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 }
                 window._rmCastSessionCb = _onCastSessionChanged;
                 ctx.addEventListener(cast.framework.CastContextEventType.SESSION_STATE_CHANGED, _onCastSessionChanged);
+                // Show/hide cast button based on device availability (C-01)
+                ctx.addEventListener(cast.framework.CastContextEventType.CAST_STATE_CHANGED, _onCastStateChanged);
 
                 _castPlayer = new cast.framework.RemotePlayer();
                 _castController = new cast.framework.RemotePlayerController(_castPlayer);
@@ -3364,6 +3892,14 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 }
                 window._rmCastPlayerCb = _onCastPlayerStateChanged;
                 _castController.addEventListener(cast.framework.RemotePlayerEventType.PLAYER_STATE_CHANGED, _onCastPlayerStateChanged);
+
+                // Seek bar sync — update PWA seekbar from Cast position (remote control feel)
+                _castController.addEventListener(cast.framework.RemotePlayerEventType.CURRENT_TIME_CHANGED, _onCastTimeChanged);
+                // Volume sync — physical TV remote / receiver volume reflected in PWA slider
+                _castController.addEventListener(cast.framework.RemotePlayerEventType.VOLUME_LEVEL_CHANGED, _onCastVolumeChanged);
+                // Pause/play sync — if paused from Cast receiver UI, update PWA button
+                _castController.addEventListener(cast.framework.RemotePlayerEventType.IS_PAUSED_CHANGED, _onCastPausedChanged);
+
                 _cl('info', 'Cast SDK initialized, _castAvail=true');
             } catch (e) {
                 _cl('error', 'Cast framework init error', { error: e.message || String(e) });
@@ -3376,6 +3912,13 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             if (!isAvailable) { _castAvail = false; return; }
             _setupCastFramework();
         };
+        // Fetch NAS LAN IP — Chromecast needs the real IP, not localhost/hostname
+        api('/radio-music/cast-info').then(d => {
+            if (d?.lan_origin) {
+                _castLanOrigin = d.lan_origin;
+                _cl('info', 'Cast LAN origin: ' + _castLanOrigin);
+            }
+        }).catch(() => {});
         if (!document.querySelector('script[src*="cast_sender"]')) {
             const s = document.createElement('script');
             s.src = 'https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1';
@@ -3405,6 +3948,69 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         }
     }
 
+    // C-01: Show/hide cast button based on whether Cast devices are present on the network
+    function _onCastStateChanged(event) {
+        const state = event.castState;
+        const hasDevices = state !== cast.framework.CastState.NO_DEVICES_AVAILABLE;
+        const btn = bodyEl?.querySelector('#rm-cast-btn');
+        if (btn) btn.style.display = hasDevices ? '' : 'none';
+        _cl('debug', 'Cast state changed: ' + state + ', hasDevices=' + hasDevices);
+    }
+
+    // Seekbar sync: Cast position → PWA seekbar (fires ~1Hz from Cast SDK)
+    function _onCastTimeChanged() {
+        if (!_isCasting || !_castPlayer) return;
+        const cur = _castPlayer.currentTime;
+        const dur = _castPlayer.duration;
+        if (!isFinite(dur) || dur <= 0) return;
+        const pct = (cur / dur) * 100;
+        const seekbar = bodyEl?.querySelector('#rm-seekbar');
+        if (!seekbar) return;
+        seekbar.classList.add('visible');
+        const fill = seekbar.querySelector('#rm-seek-fill');
+        const thumb = seekbar.querySelector('#rm-seek-thumb');
+        if (fill) fill.style.width = pct + '%';
+        if (thumb) thumb.style.left = pct + '%';
+        const curEl = seekbar.querySelector('#rm-seek-cur');
+        const durEl = seekbar.querySelector('#rm-seek-dur');
+        if (curEl) curEl.textContent = _fmtTime(cur);
+        if (durEl) durEl.textContent = _fmtTime(dur);
+        // Sync NP overlay seekbar too
+        const npBar = _npOverlay?.querySelector('#rm-np-seek-fill');
+        if (npBar) npBar.style.width = pct + '%';
+        const npCur = _npOverlay?.querySelector('#rm-np-cur');
+        if (npCur) npCur.textContent = _fmtTime(cur);
+    }
+
+    // Volume sync: Cast receiver volume → PWA volume slider
+    function _onCastVolumeChanged() {
+        if (!_isCasting || !_castPlayer) return;
+        const vol = _castPlayer.volumeLevel;
+        const slider = bodyEl?.querySelector('#rm-vol');
+        if (slider) {
+            slider.value = Math.round(vol * 100);
+            slider.dispatchEvent(new Event('input', { bubbles: false })); // update icon only
+        }
+        _cl('debug', 'Cast volume: ' + Math.round(vol * 100));
+    }
+
+    // Pause sync: Cast receiver pause state → PWA play/pause button
+    function _onCastPausedChanged() {
+        if (!_isCasting || !_castPlayer) return;
+        const paused = _castPlayer.isPaused;
+        const btn = bodyEl?.querySelector('#rm-play-pause');
+        if (btn) btn.innerHTML = paused
+            ? '<i class="fas fa-play"></i>'
+            : '<i class="fas fa-pause"></i>';
+        const npBtn = _npOverlay?.querySelector('#rm-np-playpause');
+        if (npBtn) npBtn.innerHTML = paused
+            ? '<i class="fas fa-play"></i>'
+            : '<i class="fas fa-pause"></i>';
+        if ('mediaSession' in navigator) {
+            navigator.mediaSession.playbackState = paused ? 'paused' : 'playing';
+        }
+    }
+
     function _onCastSessionChanged(event) {
         const state = event.sessionState;
         _cl('info', 'Cast session: ' + state);
@@ -3416,14 +4022,32 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             toast(t('Połączono z Chromecast'), 'success');
             const deviceName = _castSession?.getCastDevice?.()?.friendlyName || '?';
             _cl('info', 'Cast connected to: ' + deviceName);
+            // Suppress browser MediaSession so Android shows only ONE Cast volume slider (not two)
+            if ('mediaSession' in navigator) {
+                navigator.mediaSession.playbackState = 'none';
+            }
             _castLoadCurrentTrack();
         } else if (state === cast.framework.SessionState.SESSION_ENDED) {
+            // C-05: capture Cast position so we can resume locally from same spot
+            const resumeAt = _castPlayer?.currentTime || 0;
+            const wasPlaying = _castPlayer && !_castPlayer.isPaused;
             _castSession = null;
             _isCasting = false;
             _castQueueActive = false;
             _syncCastBtnUi(false);
-            if (_audio) _audio.volume = _preCastVolume;
-            _cl('info', 'Cast disconnected, restored local playback');
+            // Restore browser MediaSession — user is back to local playback
+            _updateMediaSession();
+            if (_audio) {
+                _audio.volume = _preCastVolume;
+                if (_playing?.type !== 'radio' && resumeAt > 1) {
+                    _audio.currentTime = resumeAt;
+                }
+                if (wasPlaying) {
+                    _audio.play().catch(() => {});
+                    toast(t('Odtwarzanie wróciło na urządzenie'), 'info');
+                }
+            }
+            _cl('info', 'Cast disconnected, resumed locally at ' + Math.round(resumeAt) + 's');
         }
     }
 
@@ -3455,7 +4079,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         }
 
         if (!mediaUrl && _playing.type === 'local' && _playing.path) {
-            mediaUrl = location.origin + '/api/radio-music/local/stream?path='
+            mediaUrl = _castLanOrigin + '/api/radio-music/local/stream?path='
                 + encodeURIComponent(_playing.path) + '&token=' + (NAS.token || '');
             ct = 'audio/mpeg';
         }
@@ -3476,12 +4100,14 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
         _cl('info', 'Cast loadMedia', { url: mediaUrl.substring(0, 100), type: ct, track: _playing.name });
         const mediaInfo = new chrome.cast.media.MediaInfo(mediaUrl, ct);
+        // BUFFERED stream type: Android recognises it as music (not phone call), shows single Cast volume slider
+        mediaInfo.streamType = chrome.cast.media.StreamType.BUFFERED;
         mediaInfo.metadata = new chrome.cast.media.MusicTrackMediaMetadata();
         if (_playing) {
             mediaInfo.metadata.title = _playing.name || '';
             mediaInfo.metadata.artist = _playing.meta || '';
             if (_playing.image) {
-                const imgUrl = _playing.image.startsWith('http') ? _playing.image : (location.origin + _playing.image);
+                const imgUrl = _playing.image.startsWith('http') ? _playing.image : (_castLanOrigin + _playing.image);
                 mediaInfo.metadata.images = [new chrome.cast.Image(imgUrl)];
             }
         }
@@ -3507,9 +4133,9 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 const data = await api('/radio-music/music/direct-url?url=' + encodeURIComponent(tr.url));
                 if (data.audio_url) return { url: data.audio_url, ct: data.content_type || 'audio/mp4' };
             } catch (e) {}
-            // Fallback: proxy URL (Chromecast → NAS → yt-dlp)
+            // Fallback: proxy URL via NAS LAN IP (Chromecast must reach real IP, not localhost)
             return {
-                url: location.origin + '/api/radio-music/music/stream?url=' + encodeURIComponent(tr.url) + '&token=' + (NAS.token || ''),
+                url: _castLanOrigin + '/api/radio-music/music/stream?url=' + encodeURIComponent(tr.url) + '&token=' + (NAS.token || ''),
                 ct: 'audio/mp4'
             };
         }
@@ -3517,7 +4143,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             const path = tr.path || (tr.url?.match(/[?&]path=([^&]+)/)?.[1]);
             if (path) {
                 return {
-                    url: location.origin + '/api/radio-music/local/stream?path=' + path + '&token=' + (NAS.token || ''),
+                    url: _castLanOrigin + '/api/radio-music/local/stream?path=' + path + '&token=' + (NAS.token || ''),
                     ct: 'audio/mpeg'
                 };
             }
@@ -3549,7 +4175,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             mediaInfo.metadata.artist = tr.meta || tr.channel || '';
             const img = tr.image || tr.thumbnail;
             if (img) {
-                const imgUrl = img.startsWith('http') ? img : (location.origin + img);
+                const imgUrl = img.startsWith('http') ? img : (_castLanOrigin + img);
                 mediaInfo.metadata.images = [new chrome.cast.Image(imgUrl)];
             }
             items.push(new chrome.cast.media.QueueItem(mediaInfo));
@@ -3573,6 +4199,27 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             _castQueueActive = false;
             return _castLoadCurrentTrack();
         }
+    }
+
+    // Unified Cast play/pause toggle — use explicit play()/pause() via RemoteMediaClient
+    // instead of controlling local _audio when Chromecast is active.
+    // Returns true if Cast handled the action (caller should skip local audio control).
+    function _castTogglePlayPause() {
+        if (!_isCasting || !_castPlayer || !_castController) return false;
+        const paused = _castPlayer.isPaused;
+        // Optimistic UI update — don't wait for Cast ACK
+        const icon = paused ? '<i class="fas fa-pause"></i>' : '<i class="fas fa-play"></i>';
+        const mainBtn = bodyEl?.querySelector('#rm-play-pause');
+        const npBtn = _npOverlay?.querySelector('#rm-np-playpause');
+        if (mainBtn) mainBtn.innerHTML = icon;
+        if (npBtn) npBtn.innerHTML = icon;
+        _showEq(paused);
+        if ('mediaSession' in navigator) {
+            navigator.mediaSession.playbackState = paused ? 'playing' : 'paused';
+        }
+        // Send command to Chromecast receiver
+        _castController.playOrPause();
+        return true;
     }
 
     function _toggleCast() {
@@ -3622,6 +4269,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
     function _updateSeekbar() {
         if (!_audio) return;
+        if (_seekLocked) return; // don't jump to 0 during track switch
         const seekbar = bodyEl?.querySelector('#rm-seekbar');
         if (!seekbar) return;
         const dur = _audio.duration;
@@ -3668,8 +4316,20 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             album: item.type === 'radio' ? t('Radio Live') : (item.album || ''),
             artwork,
         });
-        navigator.mediaSession.setActionHandler('play', () => { _audio?.play(); });
-        navigator.mediaSession.setActionHandler('pause', () => { _audio?.pause(); });
+        navigator.mediaSession.setActionHandler('play', () => {
+            if (_isCasting) {
+                if (_castPlayer?.isPaused) _castController?.playOrPause();
+                return;
+            }
+            _audio?.play();
+        });
+        navigator.mediaSession.setActionHandler('pause', () => {
+            if (_isCasting) {
+                if (!_castPlayer?.isPaused) _castController?.playOrPause();
+                return;
+            }
+            _audio?.pause();
+        });
         navigator.mediaSession.setActionHandler('stop', () => stopPlayback());
         // Podcast queue uses _advancePodQueue, music uses _advanceQueue
         const isPod = _playing?.type === 'podcast';
@@ -3698,6 +4358,65 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         if (_podQueueIdx > 0) { _podQueueIdx--; playAudio(_podQueue[_podQueueIdx]); }
     }
 
+    /**
+     * F-02 playContext — Spotify-like: click any track and the whole list becomes
+     * the queue. The clicked track plays first, rest queues up silently.
+     * @param {Array}  items    Full array of track objects (music/local type)
+     * @param {number} startIdx Index of the track the user clicked
+     */
+    function playContext(items, startIdx = 0) {
+        if (!items || !items.length) return;
+        const idx = Math.max(0, Math.min(startIdx, items.length - 1));
+        // Ensure every item has type set — items from music search may lack it
+        const normalised = items.map(it => {
+            if (!it.type) {
+                // Infer type: YouTube/archive → music, local path → local
+                const isYt = it.source === 'youtube' || (it.url && (it.url.includes('youtube.com') || it.url.includes('youtu.be')));
+                return { ...it, type: isYt ? 'music' : (it.path ? 'local' : 'music') };
+            }
+            return it;
+        });
+        _musicQueue = normalised.slice();
+        _musicQueueIdx = idx;
+        _cl('info', 'playContext', { total: normalised.length, startIdx: idx, name: normalised[idx]?.name });
+        playAudio(normalised[idx]);
+    }
+
+    /**
+     * F-03 _crossfade — Double-buffer crossfade between two HTMLAudioElement instances.
+     * Uses rAF for smooth volume ramp on the main thread.
+     * @param {HTMLAudioElement} outAudio  Currently playing element (fades to 0)
+     * @param {HTMLAudioElement} inAudio   Preloaded next element (fades to targetVol)
+     * @param {number}           targetVol Final volume for inAudio (0–1)
+     * @param {number}           durationMs Crossfade duration in ms (default 1500)
+     * @param {Function}         onDone   Called after crossfade completes
+     */
+    function _crossfade(outAudio, inAudio, targetVol, durationMs = 1500, onDone) {
+        if (!outAudio || !inAudio) { onDone?.(); return; }
+        const startTime = performance.now();
+        const startVol = outAudio.volume;
+        inAudio.volume = 0;
+        inAudio.play().catch(e => {
+            _cl('warning', 'Crossfade inAudio.play failed', { error: e.message });
+            onDone?.();
+        });
+        function tick(now) {
+            const t = Math.min(1, (now - startTime) / durationMs);
+            // Ease in/out for smoother transition
+            const eased = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+            if (outAudio && !outAudio.paused) outAudio.volume = Math.max(0, startVol * (1 - eased));
+            if (inAudio) inAudio.volume = Math.min(targetVol, targetVol * eased);
+            if (t < 1) {
+                requestAnimationFrame(tick);
+            } else {
+                try { outAudio.pause(); outAudio.src = ''; outAudio.load(); } catch(e) {}
+                if (inAudio) inAudio.volume = targetVol;
+                onDone?.();
+            }
+        }
+        requestAnimationFrame(tick);
+    }
+
     function _fmtTime(s) {
         if (!isFinite(s)) return '0:00';
         s = Math.floor(s);
@@ -3705,7 +4424,330 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
     }
 
+    /* ── Offline Archive ──────────────────────────────────────────────────── */
+
+    /** Build archive button HTML for a YT music track. */
+    function _archiveBtnHtml(url) {
+        const entry = _archiveDb[url] || {};
+        const st = entry.status || 'none';
+        let iconClass = 'fa-cloud-arrow-down'; // default: not archived
+        let btnClass = '';
+        let title = t('Archiwizuj na NAS');
+        if (st === 'downloading') { iconClass = 'fa-cloud'; btnClass = 'rm-arch-loading'; title = t('Pobieranie...') + ' ' + (entry.progress || 0) + '%'; }
+        else if (st === 'done' && entry.phoneCache) { iconClass = 'fa-mobile-screen-button'; btnClass = 'rm-arch-phone'; title = t('Na NAS i na telefonie'); }
+        else if (st === 'done') { iconClass = 'fa-cloud-check'; btnClass = 'rm-arch-nas'; title = t('Zarchiwizowano na NAS'); }
+        else if (st === 'error') { iconClass = 'fa-cloud-exclamation'; btnClass = 'rm-arch-error'; title = entry.error || t('Błąd archiwizacji'); }
+
+        const circumference = 87.96;
+        const offset = st === 'downloading'
+            ? circumference - (circumference * (entry.progress || 0) / 100)
+            : circumference;
+
+        return `<button class="rm-arch-btn ${btnClass}" data-arch-url="${escH(url)}" title="${escH(title)}">
+            <i class="fas ${iconClass} rm-arch-icon"></i>
+            <svg class="rm-arch-ring" viewBox="0 0 36 36" xmlns="http://www.w3.org/2000/svg">
+                <circle cx="18" cy="18" r="14" fill="none" stroke="#1DB954" stroke-width="2.5"
+                    stroke-dasharray="${circumference}" stroke-dashoffset="${offset}" stroke-linecap="round"/>
+            </svg>
+        </button>`;
+    }
+
+    /** Update archive button DOM element to reflect current _archiveDb state. */
+    function _refreshArchiveBtn(url) {
+        bodyEl.querySelectorAll(`.rm-arch-btn[data-arch-url="${CSS.escape(url)}"]`).forEach(btn => {
+            const entry = _archiveDb[url] || {};
+            const st = entry.status || 'none';
+            btn.classList.remove('rm-arch-loading', 'rm-arch-nas', 'rm-arch-phone', 'rm-arch-error');
+            const icon = btn.querySelector('.rm-arch-icon');
+            if (!icon) return;
+            const ring = btn.querySelector('.rm-arch-ring circle');
+            if (st === 'downloading') {
+                btn.classList.add('rm-arch-loading');
+                btn.title = t('Pobieranie...') + ' ' + (entry.progress || 0) + '%';
+                icon.className = 'fas fa-cloud rm-arch-icon';
+                if (ring) {
+                    const c = 87.96;
+                    ring.style.strokeDashoffset = c - (c * (entry.progress || 0) / 100);
+                }
+            } else if (st === 'done' && entry.phoneCache) {
+                btn.classList.add('rm-arch-phone');
+                btn.title = t('Na NAS i na telefonie — dotknij aby usunąć');
+                icon.className = 'fas fa-mobile-screen-button rm-arch-icon';
+            } else if (st === 'done') {
+                btn.classList.add('rm-arch-nas');
+                btn.title = t('Zarchiwizowano na NAS — dotknij aby zapisać na telefon');
+                icon.className = 'fas fa-cloud-check rm-arch-icon';
+            } else if (st === 'error') {
+                btn.classList.add('rm-arch-error');
+                btn.title = entry.error || t('Błąd archiwizacji');
+                icon.className = 'fas fa-cloud-exclamation rm-arch-icon';
+            } else {
+                btn.title = t('Archiwizuj na NAS');
+                icon.className = 'fas fa-cloud-arrow-down rm-arch-icon';
+            }
+        });
+    }
+
+    /** Handle archive button click — cycles: none→NAS | NAS→phone | phone→delete menu */
+    async function _onArchiveBtnClick(url, btnEl) {
+        const entry = _archiveDb[url] || {};
+        const st = entry.status || 'none';
+
+        if (st === 'none' || st === 'error') {
+            // Start NAS archive
+            _archiveDb[url] = { ...(entry || {}), status: 'downloading', progress: 0 };
+            _refreshArchiveBtn(url);
+            const res = await api('/radio-music/archive/start', {
+                method: 'POST',
+                body: { url, title: entry.title || url, artist: entry.artist || '', thumbnail: entry.thumbnail || '' }
+            });
+            if (res.error) {
+                _archiveDb[url] = { ..._archiveDb[url], status: 'error', error: res.error };
+                _refreshArchiveBtn(url);
+                toast(res.error, 'error');
+            } else {
+                _archiveDb[url] = { ..._archiveDb[url], key: res.key, status: res.status };
+                _refreshArchiveBtn(url);
+                if (res.status === 'done') toast(t('Już zarchiwizowane!'), 'success');
+            }
+            return;
+        }
+
+        if (st === 'downloading') {
+            toast(t('Pobieranie w toku...') + ' ' + (entry.progress || 0) + '%', 'info');
+            return;
+        }
+
+        if (st === 'done' && !entry.phoneCache) {
+            // Cache to phone via SW
+            if (!navigator.serviceWorker?.controller) {
+                toast(t('Service Worker niedostępny'), 'error'); return;
+            }
+            toast(t('Zapisuję na telefon...'), 'info');
+            const archiveUrl = `/api/radio-music/archive/file/${entry.key}?token=${NAS.token || ''}`;
+            navigator.serviceWorker.controller.postMessage({
+                type: 'RM_CACHE_AUDIO', key: entry.key, url: archiveUrl
+            });
+            // Response comes via SW message event in _initArchive()
+            return;
+        }
+
+        if (st === 'done' && entry.phoneCache) {
+            // Show delete menu
+            _showArchiveDeleteMenu(url, entry, btnEl);
+        }
+    }
+
+    function _showArchiveDeleteMenu(url, entry, anchor) {
+        const existing = bodyEl.querySelector('.rm-arch-menu');
+        if (existing) existing.remove();
+        const menu = document.createElement('div');
+        menu.className = 'rm-arch-menu';
+        menu.style.cssText = 'position:fixed;background:#1e1e1e;border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:4px 0;z-index:9999;min-width:180px;box-shadow:0 4px 24px rgba(0,0,0,.5);font-size:13px;color:#fff';
+        menu.innerHTML = `
+            <button class="rm-arch-menu-item" data-action="del-phone"><i class="fas fa-mobile-screen-button" style="color:#f59e0b;width:18px"></i> ${t('Usuń z telefonu')}</button>
+            <button class="rm-arch-menu-item" data-action="del-nas"><i class="fas fa-trash" style="color:#ef4444;width:18px"></i> ${t('Usuń z NAS')}</button>
+            <button class="rm-arch-menu-item" data-action="cancel"><i class="fas fa-times" style="color:rgba(255,255,255,.4);width:18px"></i> ${t('Anuluj')}</button>`;
+        const rect = anchor.getBoundingClientRect();
+        menu.style.left = Math.min(rect.right, window.innerWidth - 190) + 'px';
+        menu.style.top = (rect.bottom + 6) + 'px';
+        menu.querySelectorAll('.rm-arch-menu-item').forEach(btn => {
+            btn.style.cssText = 'display:flex;align-items:center;gap:8px;padding:8px 14px;background:none;border:none;color:#fff;cursor:pointer;width:100%;text-align:left';
+            btn.onmouseenter = () => { btn.style.background = 'rgba(255,255,255,.06)'; };
+            btn.onmouseleave = () => { btn.style.background = ''; };
+        });
+        menu.querySelector('[data-action="del-phone"]').onclick = () => {
+            menu.remove();
+            navigator.serviceWorker?.controller?.postMessage({ type: 'RM_UNCACHE_AUDIO', key: entry.key });
+            _archiveDb[url] = { ..._archiveDb[url], phoneCache: false };
+            _refreshArchiveBtn(url);
+            toast(t('Usunięto z telefonu'), 'success');
+        };
+        menu.querySelector('[data-action="del-nas"]').onclick = async () => {
+            menu.remove();
+            if (!entry.key) return;
+            await api('/radio-music/archive/delete', { method: 'POST', body: { key: entry.key } });
+            navigator.serviceWorker?.controller?.postMessage({ type: 'RM_UNCACHE_AUDIO', key: entry.key });
+            delete _archiveDb[url];
+            _refreshArchiveBtn(url);
+            toast(t('Usunięto archiwum'), 'success');
+        };
+        menu.querySelector('[data-action="cancel"]').onclick = () => menu.remove();
+        document.body.appendChild(menu);
+        setTimeout(() => document.addEventListener('click', () => menu.remove(), { once: true }), 10);
+    }
+
+    /** Load archive status for an array of YT URLs (batch). */
+    async function _loadArchiveBatch(urls) {
+        if (!urls || !urls.length) return;
+        const toFetch = urls.filter(u => u && !_archiveDb[u]);
+        if (!toFetch.length) return;
+        try {
+            const res = await api('/radio-music/archive/batch', { method: 'POST', body: { urls: toFetch } });
+            if (res.results) {
+                for (const [url, info] of Object.entries(res.results)) {
+                    if (info.status !== 'none') {
+                        _archiveDb[url] = info;
+                    }
+                }
+            }
+        } catch (_) {}
+    }
+
+    /** Wire SocketIO listeners for archive progress/done/error events. */
+    function _initArchive() {
+        // Listen for SW messages (cache done/error)
+        if (navigator.serviceWorker) {
+            navigator.serviceWorker.ready.then(() => { _swReady = true; });
+            navigator.serviceWorker.addEventListener('message', (evt) => {
+                const { type, key } = evt.data || {};
+                if (type === 'RM_CACHE_DONE' && key) {
+                    // Find URL by key in _archiveDb
+                    for (const [url, entry] of Object.entries(_archiveDb)) {
+                        if (entry.key === key) {
+                            _archiveDb[url] = { ...entry, phoneCache: true };
+                            _refreshArchiveBtn(url);
+                            break;
+                        }
+                    }
+                    toast(t('Zapisano na telefon!'), 'success');
+                }
+                if (type === 'RM_CACHE_ERROR') {
+                    toast(t('Błąd zapisu na telefon'), 'error');
+                }
+            });
+        }
+
+        // SocketIO events from backend
+        if (NAS.socket) {
+            NAS.socket.on('rm_archive_progress', (d) => {
+                if (!d.url) return;
+                _archiveDb[d.url] = { ..._archiveDb[d.url] || {}, key: d.key, status: 'downloading', progress: d.progress };
+                _refreshArchiveBtn(d.url);
+            });
+            NAS.socket.on('rm_archive_done', (d) => {
+                if (!d.url) return;
+                _archiveDb[d.url] = { ..._archiveDb[d.url] || {}, key: d.key, status: 'done', progress: 100 };
+                _refreshArchiveBtn(d.url);
+                toast('✅ ' + (d.title || t('Utwór')) + ' — ' + t('zarchiwizowano na NAS'), 'success');
+                // If this track is currently playing from YT, silently switch source to NAS
+                if (_playing && _playing.url === d.url && _audio) {
+                    const nasUrl = `/api/radio-music/archive/file/${d.key}?token=${NAS.token || ''}`;
+                    const pos = _audio.currentTime;
+                    const wasPlaying = !_audio.paused;
+                    _audio.src = nasUrl;
+                    _audio.currentTime = pos;
+                    if (wasPlaying) _audio.play().catch(() => {});
+                }
+            });
+            NAS.socket.on('rm_archive_error', (d) => {
+                if (!d.url) return;
+                _archiveDb[d.url] = { ..._archiveDb[d.url] || {}, status: 'error', error: d.error };
+                _refreshArchiveBtn(d.url);
+                toast(t('Błąd archiwizacji: ') + (d.error || ''), 'error');
+            });
+        }
+    }
+
     /* ── Now Playing Overlay ──────────────────────── */
+
+    /**
+     * In-place NP overlay content update — no DOM rebuild, no layout shift.
+     * Crossfades art (200ms) and fades title/meta (150ms) simultaneously.
+     * Called when a new track starts while overlay is already open.
+     */
+    function _updateNowPlayingContent(item) {
+        if (!_npOverlay || !item) return;
+
+        const titleEl = _npOverlay.querySelector('.rm-np-title');
+        const metaEl  = _npOverlay.querySelector('.rm-np-meta');
+        const artEl   = _npOverlay.querySelector('#rm-np-art');
+        const bgEl    = _npOverlay.querySelector('.rm-np-bg');
+
+        // Step 1: fade out title + meta
+        if (titleEl) titleEl.classList.add('rm-fading');
+        if (metaEl)  metaEl.classList.add('rm-fading');
+
+        // Step 2: skeleton art while new image loads (if >100ms)
+        if (artEl) artEl.classList.add('rm-skeleton');
+
+        // Fade out background
+        if (bgEl) bgEl.style.opacity = '0';
+
+        setTimeout(() => {
+            // Step 3: swap text content while invisible
+            if (titleEl) { titleEl.textContent = item.name || ''; titleEl.classList.remove('rm-fading'); }
+            if (metaEl)  { metaEl.textContent  = item.meta || ''; metaEl.classList.remove('rm-fading'); }
+
+            // Step 4: swap background
+            if (bgEl) {
+                const bgUrl = item.image || item.favicon || '';
+                bgEl.style.backgroundImage = bgUrl ? `url('${escH(bgUrl)}')` : '';
+                bgEl.style.opacity = '1';
+            }
+
+            // Step 5: crossfade art image
+            if (artEl) {
+                const isMusic = item.type === 'music' || item.type === 'local';
+                const newSrc = item.image || item.thumbnail || null;
+
+                if (isMusic && newSrc) {
+                    // Pre-load new image; show skeleton until ready
+                    const newImg = document.createElement('img');
+                    newImg.className = 'rm-art-loading';
+                    newImg.style.cssText = 'width:100%;height:100%;object-fit:cover;position:absolute;inset:0;opacity:0;transition:opacity 200ms ease';
+                    let skeletonTimer = setTimeout(() => {
+                        artEl.classList.add('rm-skeleton'); // show shimmer if slow
+                    }, 100);
+                    newImg.onload = () => {
+                        clearTimeout(skeletonTimer);
+                        artEl.classList.remove('rm-skeleton');
+                        // Fade out old content, fade in new image
+                        const oldChildren = [...artEl.children];
+                        artEl.appendChild(newImg);
+                        requestAnimationFrame(() => {
+                            newImg.style.opacity = '1';
+                            setTimeout(() => {
+                                oldChildren.forEach(c => c.remove());
+                                newImg.style.position = '';
+                                newImg.style.inset = '';
+                                newImg.className = 'rm-art-loaded';
+                            }, 220);
+                        });
+                    };
+                    newImg.onerror = () => {
+                        clearTimeout(skeletonTimer);
+                        artEl.classList.remove('rm-skeleton');
+                        artEl.innerHTML = '<i class="fas fa-music"></i>';
+                    };
+                    newImg.src = newSrc;
+                } else {
+                    artEl.classList.remove('rm-skeleton');
+                    if (newSrc) {
+                        artEl.innerHTML = `<img src="${escH(newSrc)}" style="width:100%;height:100%;object-fit:cover" onerror="this.outerHTML='<i class=\\'fas fa-music\\'></i>'">`;
+                    } else if (isMusic) {
+                        artEl.innerHTML = '<i class="fas fa-music"></i>';
+                    } else {
+                        // Radio / podcast — station icon with logo manifest
+                        const _fItem = { name: item.name, favicon: item.image || item.favicon, homepage: item.homepage || '', url: item.url, stationuuid: item.uuid || item.stationuuid || '' };
+                        artEl.innerHTML = _stationIconHtml(_fItem);
+                    }
+                }
+            }
+
+            // Step 6: reset seekbar to 0 state cleanly (no jump — _seekLocked handles the live bar)
+            const fill = _npOverlay.querySelector('#rm-np-fill');
+            const cur  = _npOverlay.querySelector('#rm-np-cur');
+            const dur  = _npOverlay.querySelector('#rm-np-dur');
+            if (fill) fill.style.width = '0%';
+            if (cur)  cur.textContent = '0:00';
+            if (dur)  dur.textContent = '0:00';
+
+            // Step 7: update MediaSession with new track
+            _updateMediaSession();
+
+        }, 160); // wait for fade-out transition to complete
+    }
 
     function _showNowPlaying() {
         if (!_playing) return;
@@ -3719,6 +4761,12 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             const visCvs = _npOverlay.querySelector('#rm-np-vis');
             if (visCvs && _audio) _startVisualizer(visCvs);
             _npUpdateLoop();
+            // Refresh queue panel if it's visible — content may be stale from a playlist switch
+            // that happened while the overlay was minimized
+            if (_renderNpQueueFn) {
+                const qp = _npOverlay.querySelector('#rm-np-queue-panel');
+                if (qp?.classList.contains('rm-np-queue-visible')) _renderNpQueueFn();
+            }
             return;
         }
 
@@ -3812,15 +4860,29 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             }
         }, { passive: true });
 
-        // Controls
+        // Controls — optimistic: icon flips instantly, reverts only if play() rejects
         ov.querySelector('#rm-np-playpause').onclick = () => {
             if (!_audio) return;
+            // Restored state: audio src not yet loaded — reinitialise from saved track
+            if (!_audio.src && _playing) { playAudio(_playing); return; }
+            // When casting, route to Chromecast — don't touch local (muted) audio
+            if (_castTogglePlayPause()) return;
+            const btn = ov.querySelector('#rm-np-playpause');
+            const miniBtn = bodyEl?.querySelector('#rm-play-pause');
             if (_audio.paused) {
-                _audio.play();
-                ov.querySelector('#rm-np-playpause').innerHTML = '<i class="fas fa-pause"></i>';
+                // Optimistic: show Pause immediately
+                btn.innerHTML = '<i class="fas fa-pause"></i>';
+                if (miniBtn) miniBtn.innerHTML = '<i class="fas fa-pause"></i>';
+                _audio.play().catch(err => {
+                    if (err.name !== 'AbortError') { // AbortError = another src change interrupted, not a real failure
+                        btn.innerHTML = '<i class="fas fa-play"></i>';
+                        if (miniBtn) miniBtn.innerHTML = '<i class="fas fa-play"></i>';
+                    }
+                });
             } else {
+                btn.innerHTML = '<i class="fas fa-play"></i>';
+                if (miniBtn) miniBtn.innerHTML = '<i class="fas fa-play"></i>';
                 _audio.pause();
-                ov.querySelector('#rm-np-playpause').innerHTML = '<i class="fas fa-play"></i>';
             }
         };
         ov.querySelector('#rm-np-prev').onclick = () => _skipStation(-1);
@@ -3933,19 +4995,21 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             // Scroll current into view
             const cur = queuePanel.querySelector('.rm-q-current');
             if (cur) cur.scrollIntoView({ block: 'center', behavior: 'smooth' });
-            // Click to jump
+            // Click to jump — Action Proxy: same as clicking the track in the list
             queuePanel.querySelectorAll('.rm-np-q-item').forEach(el => {
                 el.onclick = () => {
                     const idx = parseInt(el.dataset.idx, 10);
                     if (isNaN(idx) || idx === _musicQueueIdx) return;
                     _musicQueueIdx = idx;
                     const tr = _musicQueue[idx];
+                    // Overlay stays open — only content changes (R-02: no _hideNowPlaying here)
                     if (tr._plItem) {
                         _playTrackFromPlaylist(tr);
                     } else {
                         playMusicTrack(tr);
                     }
-                    _hideNowPlaying();
+                    // Refresh NP queue panel highlight in-place
+                    _renderNpQueue();
                 };
             });
         }
@@ -4031,6 +5095,9 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             }));
         }
 
+        // Expose _renderNpQueue so the store subscriber can refresh it on Next/Prev
+        _renderNpQueueFn = _renderNpQueue;
+
         // Push history state so Android back minimizes overlay instead of navigating away
         if (!history.state?.rmNpOpen) history.pushState({ rmNpOpen: true }, '');
         localStorage.setItem('rm_np_open', '1');
@@ -4054,6 +5121,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             _npOverlay.remove();
             _npOverlay = null;
         }
+        _renderNpQueueFn = null;
         localStorage.removeItem('rm_np_open');
     }
 

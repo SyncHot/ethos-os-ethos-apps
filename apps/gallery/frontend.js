@@ -254,7 +254,8 @@ async function renderGallery(body, launchOpts) {
   _galLoadCustomAlbums();
   await _galReload();
   _galInitDragDrop();
-  
+  _galInitPWASync();   // PWA: share target handler + background sync listener
+
   if (initFile) {
       const idx = GAL.items.findIndex(i => i.path === initFile);
       if (idx !== -1) _galOpenLightbox(idx);
@@ -1968,27 +1969,354 @@ async function _galBatchShare() {
 }
 
 /* ━━━━  UPLOAD  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* ━━━━  UPLOAD MODAL (folder picker + per-file progress)  ━━━━━━━━━━━━━━━━━ */
+
+let _galUploadQueue = [];    // { file, status:'pending'|'uploading'|'done'|'error', progress:0-100, el }
+let _galUploading = false;
+
 function _galUploadClick() {
   const input = document.createElement('input');
   input.type = 'file';
   input.multiple = true;
   input.accept = 'image/*,video/*';
-  input.addEventListener('change', async () => {
-    const files = input.files;
-    if (!files.length) return;
-    const targetFolder = GAL.folder || (GAL.gallerySources.length ? GAL.gallerySources[0].path : '');
-    if (!targetFolder) { toast(t('Wybierz folder docelowy'), 'error'); return; }
-    const fd = new FormData();
-    for (const f of files) fd.append('files', f);
-    fd.append('folder', targetFolder);
-    toast(t('Przesyłanie') + ` ${files.length} ` + t('plików') + '...', 'info');
-    try {
-      const r = await api('/gallery/upload', { method: 'POST', body: fd });
-      toast(t('Przesłano') + ` ${r.uploaded} ` + t('plików'), 'success');
-      _galReload();
-    } catch(e) { toast(t('Błąd przesyłania: ') + e.message, 'error'); }
+  input.addEventListener('change', () => {
+    if (input.files.length) _galShowUploadModal([...input.files]);
   });
   input.click();
+}
+
+function _galShowUploadModal(files) {
+  const sources = GAL.gallerySources.filter(s => s.exists);
+  if (!sources.length) { toast(t('Najpierw dodaj folder źródłowy galerii'), 'error'); return; }
+
+  const defaultFolder = GAL.folder || sources[0].path;
+  let selectedFolder = defaultFolder;
+  let useDateSubfolders = false;
+
+  const overlay = document.createElement('div');
+  overlay.className = 'gal-upload-overlay';
+
+  const renderQueue = () => _galUploadQueue.map((item, i) => `
+    <div class="gal-uq-item" data-idx="${i}">
+      <div class="gal-uq-icon"><i class="fa-solid fa-${item.file.type.startsWith('video/') ? 'film' : 'image'}"></i></div>
+      <div class="gal-uq-info">
+        <div class="gal-uq-name">${_esc(item.file.name)}</div>
+        <div class="gal-uq-size">${_galFmtSize(item.file.size)}</div>
+        <div class="gal-uq-bar-wrap" style="display:${item.status === 'pending' ? 'none' : 'block'}">
+          <div class="gal-uq-bar" style="width:${item.progress}%"></div>
+        </div>
+      </div>
+      <div class="gal-uq-status">
+        ${item.status === 'pending' ? '<i class="fa-solid fa-clock" style="color:var(--text-muted)"></i>'
+          : item.status === 'uploading' ? `<span class="gal-uq-pct">${item.progress}%</span>`
+          : item.status === 'done' ? '<i class="fa-solid fa-check-circle" style="color:#1DB954"></i>'
+          : '<i class="fa-solid fa-circle-xmark" style="color:#ef4444"></i>'}
+      </div>
+    </div>
+  `).join('');
+
+  const render = () => {
+    const done = _galUploadQueue.filter(i => i.status === 'done').length;
+    const total = _galUploadQueue.length;
+    const allDone = done === total && total > 0;
+    const uploading = _galUploadQueue.some(i => i.status === 'uploading');
+
+    overlay.innerHTML = `
+      <div class="gal-upload-modal">
+        <div class="gal-upload-modal-header">
+          <span class="gal-upload-modal-title"><i class="fa-solid fa-cloud-arrow-up"></i> ${t('Prześlij pliki')}</span>
+          <button class="gal-upload-modal-close" ${uploading ? 'disabled' : ''}><i class="fa-solid fa-xmark"></i></button>
+        </div>
+
+        <div class="gal-upload-dest">
+          <label class="gal-upload-dest-label"><i class="fa-solid fa-folder-open"></i> ${t('Folder docelowy')}</label>
+          <select class="gal-upload-folder-sel">
+            ${sources.map(s => `<option value="${_esc(s.path)}" ${s.path === selectedFolder ? 'selected' : ''}>${_esc(s.label)}</option>`).join('')}
+          </select>
+          <label class="gal-upload-date-label">
+            <input type="checkbox" class="gal-upload-date-cb" ${useDateSubfolders ? 'checked' : ''}>
+            ${t('Organizuj w podfolderach RRRR/MM')}
+          </label>
+        </div>
+
+        <div class="gal-uq-list">${renderQueue()}</div>
+
+        <div class="gal-upload-modal-footer">
+          <span class="gal-upload-summary">${allDone ? t('Przesłano') + ' ' + done + '/' + total : done + '/' + total + ' ' + t('plików')}</span>
+          <div style="display:flex;gap:8px">
+            <button class="gal-btn gal-upload-add-btn" ${uploading || allDone ? 'disabled' : ''}><i class="fa-solid fa-plus"></i> ${t('Dodaj więcej')}</button>
+            <button class="gal-btn gal-upload-start-btn" style="background:var(--gal-accent);color:#fff;border-color:var(--gal-accent)" ${uploading || allDone ? 'disabled' : ''}>${uploading ? '<i class="fa-solid fa-spinner fa-spin"></i> ' + t('Wysyłanie…') : '<i class="fa-solid fa-paper-plane"></i> ' + t('Wyślij')}</button>
+          </div>
+        </div>
+      </div>`;
+
+    // Wire events
+    overlay.querySelector('.gal-upload-modal-close').onclick = () => { overlay.remove(); if (done > 0) _galReload(); };
+    overlay.querySelector('.gal-upload-folder-sel').onchange = e => { selectedFolder = e.target.value; };
+    overlay.querySelector('.gal-upload-date-cb').onchange = e => { useDateSubfolders = e.target.checked; };
+
+    const addMoreBtn = overlay.querySelector('.gal-upload-add-btn');
+    if (addMoreBtn && !addMoreBtn.disabled) addMoreBtn.onclick = () => {
+      const inp = document.createElement('input');
+      inp.type = 'file'; inp.multiple = true; inp.accept = 'image/*,video/*';
+      inp.onchange = () => {
+        [...inp.files].forEach(f => _galUploadQueue.push({ file: f, status: 'pending', progress: 0 }));
+        render();
+      };
+      inp.click();
+    };
+
+    const startBtn = overlay.querySelector('.gal-upload-start-btn');
+    if (startBtn && !startBtn.disabled) startBtn.onclick = () => _galRunUploadQueue(selectedFolder, useDateSubfolders, render);
+  };
+
+  // init queue from files
+  _galUploadQueue = files.map(f => ({ file: f, status: 'pending', progress: 0 }));
+  render();
+  document.body.appendChild(overlay);
+}
+
+async function _galRunUploadQueue(folder, useDateSubfolders, rerenderFn) {
+  if (_galUploading) return;
+  _galUploading = true;
+  _galSetSyncIndicator(true);
+  rerenderFn();
+
+  const pending = _galUploadQueue.filter(i => i.status === 'pending');
+  // Upload one at a time with XHR for progress tracking
+  for (const item of pending) {
+    item.status = 'uploading';
+    rerenderFn();
+    try {
+      await new Promise((resolve, reject) => {
+        const fd = new FormData();
+        fd.append('files', item.file);
+        fd.append('folder', folder);
+        fd.append('date_subfolders', useDateSubfolders ? '1' : '0');
+
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', '/api/gallery/upload');
+        xhr.setRequestHeader('Authorization', 'Bearer ' + (NAS.token || ''));
+        xhr.setRequestHeader('X-CSRF-Token', NAS.csrfToken || '');
+
+        xhr.upload.onprogress = e => {
+          if (e.lengthComputable) {
+            item.progress = Math.round((e.loaded / e.total) * 100);
+            rerenderFn();
+          }
+        };
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            item.progress = 100;
+            item.status = 'done';
+            resolve();
+          } else {
+            item.status = 'error';
+            reject(new Error(xhr.statusText));
+          }
+          rerenderFn();
+        };
+        xhr.onerror = () => { item.status = 'error'; rerenderFn(); reject(new Error('Network error')); };
+        xhr.send(fd);
+      });
+    } catch (e) {
+      item.status = 'error';
+      rerenderFn();
+    }
+  }
+
+  _galUploading = false;
+  _galSetSyncIndicator(false);
+  rerenderFn();
+
+  const doneCount = _galUploadQueue.filter(i => i.status === 'done').length;
+  if (doneCount > 0) {
+    toast(t('Przesłano') + ' ' + doneCount + ' ' + t('plików'), 'success');
+    // Browser notification if supported and permission granted
+    if ('Notification' in window && Notification.permission === 'granted') {
+      new Notification(t('Galeria — upload zakończony'), {
+        body: t('Przesłano') + ' ' + doneCount + ' ' + t('plików do') + ' ' + folder.split('/').pop(),
+        icon: '/img/icon-192.png',
+      });
+    }
+    _galReload();
+  }
+}
+
+function _galSetSyncIndicator(active) {
+  if (!GAL.root) return;
+  let ind = GAL.root.querySelector('.gal-sync-indicator');
+  if (active && !ind) {
+    ind = document.createElement('div');
+    ind.className = 'gal-sync-indicator';
+    ind.innerHTML = '<i class="fa-solid fa-cloud-arrow-up fa-spin"></i> ' + t('Wysyłanie…');
+    GAL.root.querySelector('.gal-toolbar-right').prepend(ind);
+  } else if (!active && ind) {
+    ind.remove();
+  }
+}
+
+function _galFmtSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+/* ━━━━  PWA SYNC — Share Target & Background Sync  ━━━━━━━━━━━━━━━━━━━━━━━ */
+const GAL_IDB_DB = 'ethos-gallery-queue';
+const GAL_IDB_STORE = 'pending-photos';
+
+function _galOpenQueue() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(GAL_IDB_DB, 1);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(GAL_IDB_STORE)) {
+        db.createObjectStore(GAL_IDB_STORE, { keyPath: 'id', autoIncrement: true });
+      }
+    };
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = e => reject(e.target.error);
+  });
+}
+
+async function _galGetPendingCount() {
+  try {
+    const db = await _galOpenQueue();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(GAL_IDB_STORE, 'readonly');
+      const req = tx.objectStore(GAL_IDB_STORE).count();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = e => reject(e.target.error);
+    });
+  } catch (_) { return 0; }
+}
+
+async function _galGetAllPending() {
+  const db = await _galOpenQueue();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(GAL_IDB_STORE, 'readonly');
+    const req = tx.objectStore(GAL_IDB_STORE).getAll();
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror = e => reject(e.target.error);
+  });
+}
+
+async function _galDeletePending(id) {
+  const db = await _galOpenQueue();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(GAL_IDB_STORE, 'readwrite');
+    tx.objectStore(GAL_IDB_STORE).delete(id).onsuccess = () => resolve();
+    tx.onerror = e => reject(e.target.error);
+  });
+}
+
+async function _galInitPWASync() {
+  // 1. Send auth token + default folder to SW so it can upload on our behalf
+  if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+    const defaultFolder = GAL.gallerySources.find(s => s.exists)?.path || '';
+    navigator.serviceWorker.controller.postMessage({
+      type: 'GAL_STORE_TOKEN',
+      token: NAS.token || '',
+      folder: defaultFolder,
+    });
+  }
+
+  // 2. Listen for upload-done messages from SW
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.addEventListener('message', e => {
+      if (e.data?.type === 'GAL_SYNC_DONE') {
+        const { uploaded, failed } = e.data;
+        if (uploaded > 0) {
+          toast(t('Zsynchronizowano') + ' ' + uploaded + ' ' + t('zdjęć z telefonu'), 'success');
+          _galReload();
+        }
+        if (failed > 0) toast(t('Błąd synchronizacji') + ': ' + failed + ' ' + t('plików'), 'error');
+        _galUpdateSyncBanner();
+      }
+    });
+  }
+
+  // 3. Check if launched from Share Target (?pending=1) or has pending items in IDB
+  const urlParams = new URLSearchParams(window.location.search);
+  const fromShare = urlParams.get('pending') === '1';
+  const pendingCount = await _galGetPendingCount();
+
+  if (fromShare || pendingCount > 0) {
+    _galShowSyncBanner(pendingCount);
+    // Remove ?pending=1 from URL without reload
+    if (fromShare) {
+      const clean = window.location.pathname + (window.location.search.replace(/[?&]pending=1/, '') || '');
+      history.replaceState(null, '', clean);
+    }
+    // Trigger background sync if SW supports it
+    if ('serviceWorker' in navigator && 'SyncManager' in window) {
+      const reg = await navigator.serviceWorker.ready;
+      reg.sync.register('gallery-photo-sync').catch(() => {
+        // SyncManager not available — upload directly from foreground
+        _galFlushQueueForeground();
+      });
+    } else {
+      _galFlushQueueForeground();
+    }
+  }
+}
+
+function _galShowSyncBanner(count) {
+  const existing = GAL.root?.querySelector('.gal-sync-banner');
+  if (existing) { existing.remove(); }
+  if (!count || !GAL.root) return;
+
+  const banner = document.createElement('div');
+  banner.className = 'gal-sync-banner';
+  banner.innerHTML = `
+    <i class="fa-solid fa-cloud-arrow-up fa-spin"></i>
+    <span>${t('Synchronizowanie')} <strong>${count}</strong> ${t('zdjęć z telefonu')}…</span>
+    <button class="gal-sync-banner-close"><i class="fa-solid fa-xmark"></i></button>`;
+  banner.querySelector('.gal-sync-banner-close').onclick = () => banner.remove();
+  GAL.root.querySelector('.gal-main').prepend(banner);
+}
+
+async function _galUpdateSyncBanner() {
+  const count = await _galGetPendingCount();
+  if (count === 0) {
+    GAL.root?.querySelector('.gal-sync-banner')?.remove();
+  } else {
+    _galShowSyncBanner(count);
+  }
+}
+
+async function _galFlushQueueForeground() {
+  // Fallback: upload from main thread when SW Background Sync isn't available
+  let items;
+  try { items = await _galGetAllPending(); } catch (_) { return; }
+  if (!items.length) return;
+
+  const folder = GAL.gallerySources.find(s => s.exists)?.path || '';
+  if (!folder) {
+    toast(t('Brak folderu docelowego — dodaj folder w Galerii'), 'error');
+    return;
+  }
+
+  _galSetSyncIndicator(true);
+  let uploaded = 0;
+  for (const item of items) {
+    try {
+      const blob = new Blob([item.data], { type: item.type || 'image/jpeg' });
+      const fd = new FormData();
+      fd.append('files', blob, item.filename);
+      fd.append('folder', item.folder || folder);
+      fd.append('date_subfolders', '1');
+      const r = await api('/gallery/upload', { method: 'POST', body: fd });
+      if (!r.error) { await _galDeletePending(item.id); uploaded++; }
+    } catch (_) {}
+  }
+  _galSetSyncIndicator(false);
+  if (uploaded > 0) {
+    toast(t('Zsynchronizowano') + ' ' + uploaded + ' ' + t('zdjęć z telefonu'), 'success');
+    _galReload();
+  }
+  _galUpdateSyncBanner();
 }
 
 function _galInitDragDrop() {
@@ -2003,23 +2331,14 @@ function _galInitDragDrop() {
   main.addEventListener('dragenter', e => { e.preventDefault(); dragCounter++; dropOverlay.style.display = 'flex'; });
   main.addEventListener('dragleave', e => { e.preventDefault(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; dropOverlay.style.display = 'none'; } });
   main.addEventListener('dragover', e => e.preventDefault());
-  main.addEventListener('drop', async e => {
+  main.addEventListener('drop', e => {
     e.preventDefault(); dragCounter = 0; dropOverlay.style.display = 'none';
-    const files = e.dataTransfer.files;
-    if (!files.length) return;
-    const targetFolder = GAL.folder || (GAL.gallerySources.length ? GAL.gallerySources[0].path : '');
-    if (!targetFolder) { toast(t('Wybierz folder docelowy'), 'error'); return; }
-    const fd = new FormData();
-    for (const f of files) fd.append('files', f);
-    fd.append('folder', targetFolder);
-    toast(t('Przesyłanie') + ` ${files.length} ` + t('plików') + '...', 'info');
-    try {
-      const r = await api('/gallery/upload', { method: 'POST', body: fd });
-      toast(t('Przesłano') + ` ${r.uploaded} ` + t('plików'), 'success');
-      _galReload();
-    } catch(e) { toast(t('Błąd przesyłania: ') + e.message, 'error'); }
+    const files = [...e.dataTransfer.files].filter(f => f.type.startsWith('image/') || f.type.startsWith('video/'));
+    if (files.length) _galShowUploadModal(files);
   });
 }
+
+
 
 /* ━━━━  MAP VIEW  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 async function _galLoadLeaflet() {

@@ -39,16 +39,24 @@ Routes:
   GET  /api/video-station/tmdb-config     - get TMDb API key status
   POST /api/video-station/tmdb-config     - save TMDb API key
   POST /api/video-station/tmdb-match/<int:vid> - manually trigger TMDb match for a video
-  POST /api/video-station/tmdb-match-all  - match all unmatched videos
+  POST /api/video-station/tmdb-match-all  - match all unmatched NON-HIDDEN videos
+  GET  /api/video-station/tmdb-search-list - search TMDb, return list (?q=query)
+  POST /api/video-station/tmdb-apply/<int:vid> - apply a specific TMDb result (by tmdb_id)
+  POST /api/video-station/rename/<int:vid> - rename video file on disk and update DB
+  GET  /api/video-station/hw-health       - detailed HW acceleration health report
+  GET  /api/video-station/vainfo-test     - run vainfo against /dev/dri/renderD128, return profiles
+  POST /api/video-station/gpu-retest      - reset encoder cache, re-probe all VAAPI codecs (H264/HEVC/VP9/AV1)
 
 SocketIO events emitted:
   vs_scan_progress  - {running, total, processed, current_file}
   vs_scan_done      - {total_processed, duration}
 """
 
+import grp
 import json
 import logging
 import os
+import pwd
 import re
 import shutil
 import sqlite3
@@ -62,7 +70,7 @@ import urllib.error
 
 from flask import Blueprint, jsonify, request, Response, send_file
 
-from host import host_run, q, data_path, app_path
+from host import host_run, host_run_stream, q, data_path, app_path
 from crypto_utils import hash_folder_password as _hash_pw, verify_folder_password as _verify_pw
 
 from blueprints.admin_required import admin_required
@@ -102,12 +110,372 @@ _scan_state = {
 }
 
 # ── HLS transcoding sessions ──────────────────────────────────
-_hls_sessions = {}   # session_id → {proc, tmpdir, vid, created}
+_hls_sessions = {}   # session_id → {proc, tmpdir, vid, created, last_heartbeat, client_pos, paused}
 _HLS_MAX_AGE = 2 * 3600   # auto-cleanup after 2 hours
 _HLS_ORPHAN_PREFIX = "vs_hls_"
+_HLS_HEARTBEAT_TIMEOUT = 20   # seconds — kill session if no heartbeat
+_HLS_THROTTLE_AHEAD = 90      # seconds — pause ffmpeg when this far ahead of playback
+_HLS_THROTTLE_RESUME = 30     # seconds — resume ffmpeg when buffer drops below this
+_HLS_MAX_SESSIONS = 3         # kill oldest session when this many are active
+
+# File-watcher state: folder_path → last-seen mtime
+_watcher_state = {}           # populated by _start_hls_cleanup_loop
+
+# Hardware encoder detection (run once at import)
+_HW_ENCODER = None  # 'h264_nvenc' | 'h264_vaapi' | 'h264_videotoolbox' | 'libx264'
+
+def _detect_hw_encoder():
+    """Probe available HW H.264 encoders. Returns best available encoder name."""
+    global _HW_ENCODER
+    if _HW_ENCODER is not None:
+        return _HW_ENCODER
+    if not shutil.which('ffmpeg'):
+        _HW_ENCODER = 'libx264'
+        return _HW_ENCODER
+    candidates = [
+        ('h264_nvenc',        '-f lavfi -i nullsrc=s=64x64:d=0.1 -c:v h264_nvenc -f null -'),
+        ('h264_vaapi',        '-vaapi_device /dev/dri/renderD128 -f lavfi -i nullsrc=s=64x64:d=0.1 '
+                              '-vf format=nv12,hwupload -c:v h264_vaapi -f null -'),
+        ('h264_videotoolbox', '-f lavfi -i nullsrc=s=64x64:d=0.1 -c:v h264_videotoolbox -f null -'),
+    ]
+    for name, args in candidates:
+        try:
+            r = subprocess.run(
+                ['ffmpeg', '-hide_banner', '-loglevel', 'error'] + args.split(),
+                capture_output=True, timeout=5)
+            if r.returncode == 0:
+                _HW_ENCODER = name
+                log.info("HLS HW encoder: %s", name)
+                return _HW_ENCODER
+        except Exception:
+            pass
+    _HW_ENCODER = 'libx264'
+    log.info("HLS HW encoder: libx264 (no HW accel)")
+    return _HW_ENCODER
 
 
-def _cleanup_hls(session_id):
+def _detect_docker():
+    """Return True if the current process is running inside a Docker container."""
+    if os.path.exists('/.dockerenv'):
+        return True
+    try:
+        with open('/proc/1/cgroup') as f:
+            content = f.read()
+        if 'docker' in content or 'kubepods' in content or 'containerd' in content:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _check_iHD_driver():
+    """Return (present: bool, path: str) for iHD_drv_video.so (Intel Media Driver)."""
+    search_paths = [
+        '/usr/lib/x86_64-linux-gnu/dri/iHD_drv_video.so',
+        '/usr/lib/dri/iHD_drv_video.so',
+        '/usr/lib64/dri/iHD_drv_video.so',
+        '/usr/local/lib/dri/iHD_drv_video.so',
+    ]
+    for p in search_paths:
+        if os.path.exists(p):
+            return True, p
+    return False, ''
+
+
+def _render_node_group_info(render_node):
+    """Return (in_group: bool, group_name: str, process_user: str) for render node access.
+
+    Checks actual supplemental group membership of the running process, which
+    is more accurate than os.access() for setuid scenarios.
+    """
+    try:
+        st = os.stat(render_node)
+        gid = st.st_gid
+        try:
+            grp_name = grp.getgrgid(gid).gr_name
+        except KeyError:
+            grp_name = str(gid)
+
+        # Also get the video group gid for secondary check
+        try:
+            video_gid = grp.getgrnam('video').gr_gid
+        except KeyError:
+            video_gid = None
+
+        proc_gids = os.getgroups()
+        proc_egid = os.getegid()
+        in_group = (gid in proc_gids or gid == proc_egid
+                    or (video_gid is not None and video_gid in proc_gids))
+
+        try:
+            process_user = pwd.getpwuid(os.geteuid()).pw_name
+        except KeyError:
+            process_user = str(os.geteuid())
+
+        return in_group, grp_name, process_user
+    except Exception:
+        # Fallback: simple access check
+        return os.access(render_node, os.R_OK), 'render', ''
+
+
+def _hw_health_check():
+    """Return detailed HW acceleration health report for Intel/NVIDIA/AMD GPUs.
+
+    Returns a dict with:
+      status        : "ok" | "no_render_node" | "missing_driver" | "permission_denied" | "cpu_only"
+      hw_encoder    : detected encoder name
+      is_hw         : bool — True when real HW acceleration is active
+      render_node   : bool — /dev/dri/renderD128 exists
+      driver_ok     : bool — VAAPI driver responds
+      in_render_grp : bool — current process can access the render node
+      render_grp    : str  — OS group owning the render node (e.g. "render")
+      process_user  : str  — username of the running process
+      iHD_present   : bool — iHD_drv_video.so (Intel Media Driver) found on disk
+      iHD_path      : str  — full path to iHD_drv_video.so or ''
+      in_docker     : bool — process is running inside a Docker container
+      cpu_model     : str  — from /proc/cpuinfo
+      setup_steps   : list of {title, commands: [str]} — install instructions
+      message       : human-readable diagnosis
+    """
+    RENDER_NODE = '/dev/dri/renderD128'
+    encoder = _detect_hw_encoder()
+    is_hw = encoder != 'libx264'
+    in_docker = _detect_docker()
+    iHD_present, iHD_path = _check_iHD_driver()
+
+    # CPU model
+    cpu_model = ''
+    try:
+        for line in open('/proc/cpuinfo').readlines():
+            if 'model name' in line:
+                cpu_model = line.split(':', 1)[1].strip()
+                break
+    except Exception:
+        pass
+
+    # Is it Intel (N100/N95/etc.)?
+    is_intel = 'intel' in cpu_model.lower() or 'n100' in cpu_model.lower() or 'n95' in cpu_model.lower()
+    is_amd   = 'amd' in cpu_model.lower()
+    is_nvidia = encoder == 'h264_nvenc'
+
+    if is_hw:
+        return {
+            'status': 'ok',
+            'hw_encoder': encoder,
+            'is_hw': True,
+            'render_node': os.path.exists(RENDER_NODE),
+            'driver_ok': True,
+            'in_render_grp': True,
+            'render_grp': '',
+            'process_user': '',
+            'iHD_present': iHD_present,
+            'iHD_path': iHD_path,
+            'in_docker': in_docker,
+            'cpu_model': cpu_model,
+            'setup_steps': [],
+            'message': 'Akceleracja sprzętowa aktywna (%s).' % encoder,
+        }
+
+    # Not using HW — diagnose why
+    render_node_exists = os.path.exists(RENDER_NODE)
+    in_render_grp, render_grp, process_user = False, 'render', ''
+    if render_node_exists:
+        in_render_grp, render_grp, process_user = _render_node_group_info(RENDER_NODE)
+
+    driver_ok = False
+    if render_node_exists and in_render_grp:
+        r = subprocess.run(
+            ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+             '-vaapi_device', RENDER_NODE,
+             '-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.1',
+             '-vf', 'format=nv12,hwupload', '-c:v', 'h264_vaapi', '-f', 'null', '-'],
+            capture_output=True, timeout=8
+        )
+        driver_ok = r.returncode == 0
+
+    # Build setup steps for Intel N-series (N100/N95 = Alder Lake / Twin Lake / GMKtec G3 Plus)
+    pkg_main  = 'intel-media-va-driver-non-free'    # Xe iGPU (N100/N95/N200)
+    pkg_legacy = 'i965-va-driver'                   # older Intel (Haswell–Ice Lake)
+    run_user = process_user or os.environ.get('USER', '') or os.environ.get('SUDO_USER', '') or 'ethos'
+
+    # LIBVA_DRIVER_NAME env var check — important for iHD init
+    libva_driver_name = os.environ.get('LIBVA_DRIVER_NAME', '')
+    libva_correct = libva_driver_name.lower() == 'ihd'
+
+    # Docker-specific step (shown when any permission/driver issue + running in container)
+    docker_step = {
+        'title': '🐳 Docker: przekaż urządzenie GPU do kontenera',
+        'commands': [
+            'docker run --device /dev/dri:/dev/dri ...',
+            '# lub w docker-compose.yml:',
+            'devices:\n  - /dev/dri:/dev/dri',
+        ],
+    } if in_docker else None
+
+    if not render_node_exists:
+        status = 'no_render_node'
+        message = ('Brak węzła renderowania GPU (/dev/dri/renderD128). '
+                   'Sprawdź, czy GPU jest obsługiwane przez jądro systemu.')
+        steps = [
+            {'title': '1. Sprawdź dostępne urządzenia DRI',
+             'commands': ['ls -la /dev/dri/', 'lspci | grep -i vga']},
+            {'title': '2. Zainstaluj sterownik Intel (N100/N95 — GMKtec G3 Plus)',
+             'commands': [
+                 'sudo apt update',
+                 'sudo apt install -y %s %s vainfo intel-gpu-tools' % (pkg_main, pkg_legacy),
+             ]},
+            {'title': '3. Przeładuj moduł i915',
+             'commands': ['sudo modprobe i915', 'ls /dev/dri/']},
+            {'title': '4. Uruchom ponownie serwer EthOS',
+             'commands': ['sudo systemctl restart ethos']},
+        ]
+        if docker_step:
+            steps.append(docker_step)
+    elif not in_render_grp:
+        status = 'permission_denied'
+        message = ('Błąd akceleracji: Brak uprawnień do procesora graficznego Intel N100. '
+                   'Użytkownik "%s" musi być w grupie "%s" i "video".' % (run_user, render_grp))
+        steps = [
+            {'title': '1. Nadaj uprawnienia QuickSync — dodaj użytkownika do grup %s i video' % render_grp,
+             'commands': [
+                 'sudo usermod -aG video,%s %s' % (render_grp, run_user),
+                 'groups %s  # weryfikacja — na liście powinno być: video %s' % (run_user, render_grp),
+             ]},
+            {'title': '2. Uruchom ponownie usługę lub zaloguj się ponownie',
+             'commands': [
+                 'sudo systemctl restart ethos',
+                 '# Jeśli uruchamiasz lokalnie: wyloguj się i zaloguj ponownie',
+             ]},
+            {'title': '3. Weryfikacja dostępu do GPU (GMKtec G3 Plus — Intel N100)',
+             'commands': [
+                 'ls -la /dev/dri/renderD128',
+                 'vainfo --display drm --device /dev/dri/renderD128',
+             ]},
+        ]
+        if docker_step:
+            steps.insert(0, docker_step)
+    elif not driver_ok:
+        # Run vainfo to get precise iHD failure info
+        ihd_init_failed = False
+        if iHD_present and shutil.which('vainfo'):
+            try:
+                vr = subprocess.run(
+                    ['vainfo', '--display', 'drm', '--device', RENDER_NODE],
+                    capture_output=True, timeout=8, text=True
+                )
+                vc = (vr.stdout or '') + (vr.stderr or '')
+                if ('iHD_drv_video.so init failed' in vc
+                        or 'Failed to open the given device' in vc
+                        or 'init failed' in vc):
+                    ihd_init_failed = True
+            except Exception:
+                pass
+
+        if ihd_init_failed:
+            status = 'ihd_init_failed'
+            message = ('Wykryto procesor Intel N100, ale sterownik iHD nie może wystartować. '
+                       'iHD_drv_video.so init failed — brakujące zależności lub LIBVA_DRIVER_NAME.')
+            steps = [
+                {'title': '1. Zainstaluj brakujące zależności (Intel N100 — GMKtec G3 Plus)',
+                 'commands': [
+                     'sudo apt install -y intel-media-va-driver-non-free libmfx1 libmfx-gen1 libva-drm2',
+                 ]},
+                {'title': '2. Wymuś sterownik iHD (LIBVA_DRIVER_NAME=ihd)',
+                 'commands': [
+                     'export LIBVA_DRIVER_NAME=ihd  # tymczasowo w bieżącej sesji',
+                     '# Trwale — dodaj do /etc/environment:',
+                     'echo "LIBVA_DRIVER_NAME=ihd" | sudo tee -a /etc/environment',
+                     '# Dla usługi EthOS — edytuj /etc/default/ethos (lub /etc/systemd/system/ethos.service):',
+                     'sudo sed -i \'/^\\[Service\\]/a Environment=LIBVA_DRIVER_NAME=ihd\' /etc/systemd/system/ethos.service',
+                     'sudo systemctl daemon-reload',
+                 ]},
+                {'title': '3. Dodaj użytkownika do grup render i video',
+                 'commands': [
+                     'sudo usermod -aG render,video %s' % run_user,
+                     'sudo systemctl restart ethos',
+                 ]},
+            ]
+        elif not iHD_present:
+            status = 'missing_driver'
+            message = ('Węzeł GPU dostępny, ale brak sterownika Intel Media Driver (iHD_drv_video.so). '
+                       'Wymagany pakiet: intel-media-va-driver-non-free (Intel N100/N95).')
+            steps = [
+                {'title': '1. Zainstaluj sterownik VAAPI dla Intel N100/N95 (GMKtec G3 Plus)',
+                 'commands': [
+                     'sudo apt update',
+                     'sudo apt install -y %s %s vainfo' % (pkg_main, pkg_legacy),
+                 ]},
+                {'title': '2. Włącz repozytorium non-free (jeśli potrzebne)',
+                 'commands': [
+                     "sudo sed -i 's/main$/main contrib non-free non-free-firmware/g' /etc/apt/sources.list",
+                     'sudo apt update',
+                     'sudo apt install -y %s' % pkg_main,
+                 ]},
+                {'title': '3. Sprawdź działanie VAAPI',
+                 'commands': [
+                     'vainfo --display drm --device /dev/dri/renderD128',
+                     'ffmpeg -hide_banner -vaapi_device /dev/dri/renderD128 -f lavfi -i nullsrc=s=64x64:d=0.1 -vf format=nv12,hwupload -c:v h264_vaapi -f null -',
+                 ]},
+                {'title': '4. Uruchom ponownie EthOS i odśwież enkoder',
+                 'commands': ['sudo systemctl restart ethos']},
+            ]
+        else:
+            status = 'missing_driver'
+            message = ('Węzeł GPU istnieje i masz do niego dostęp, ale sterownik VAAPI nie odpowiada. '
+                       'Zainstaluj intel-media-va-driver-non-free (Intel N100/N95).')
+            steps = [
+                {'title': '1. Zainstaluj sterownik VAAPI dla Intel N100/N95 (GMKtec G3 Plus)',
+                 'commands': [
+                     'sudo apt update',
+                     'sudo apt install -y %s %s vainfo' % (pkg_main, pkg_legacy),
+                 ]},
+                {'title': '2. Włącz repozytorium non-free (jeśli potrzebne)',
+                 'commands': [
+                     "sudo sed -i 's/main$/main contrib non-free non-free-firmware/g' /etc/apt/sources.list",
+                     'sudo apt update',
+                     'sudo apt install -y %s' % pkg_main,
+                 ]},
+                {'title': '3. Sprawdź działanie VAAPI',
+                 'commands': [
+                     'vainfo --display drm --device /dev/dri/renderD128',
+                     'ffmpeg -hide_banner -vaapi_device /dev/dri/renderD128 -f lavfi -i nullsrc=s=64x64:d=0.1 -vf format=nv12,hwupload -c:v h264_vaapi -f null -',
+                 ]},
+                {'title': '4. Uruchom ponownie EthOS i odśwież enkoder',
+                 'commands': ['sudo systemctl restart ethos']},
+            ]
+        if docker_step:
+            steps.append(docker_step)
+    else:
+        # render node ok, driver ok, but encoder detection still returned libx264
+        status = 'cpu_only'
+        message = ('Sprzęt nie obsługuje akceleracji H.264 przez VAAPI lub NVENC. '
+                   'Używany jest enkoder programowy libx264 (CPU).')
+        steps = []
+
+    return {
+        'status': status,
+        'hw_encoder': encoder,
+        'is_hw': False,
+        'render_node': render_node_exists,
+        'driver_ok': driver_ok,
+        'in_render_grp': in_render_grp,
+        'render_grp': render_grp,
+        'process_user': run_user,
+        'iHD_present': iHD_present,
+        'iHD_path': iHD_path,
+        'in_docker': in_docker,
+        'libva_driver_name': libva_driver_name,
+        'libva_correct': libva_correct,
+        'cpu_model': cpu_model,
+        'is_intel': is_intel,
+        'is_amd': is_amd,
+        'is_nvidia': is_nvidia,
+        'setup_steps': steps,
+        'message': message,
+    }
+
+
+
     """Stop ffmpeg and remove temp dir for an HLS session."""
     sess = _hls_sessions.pop(session_id, None)
     if not sess:
@@ -160,12 +528,12 @@ _cleanup_orphaned_hls_dirs()
 
 
 def _start_hls_cleanup_loop(socketio_instance=None):
-    """Start a periodic background greenlet that cleans stale HLS sessions and /tmp."""
+    """Start background greenlets: stale session cleanup + heartbeat watchdog + throttle."""
     import gevent
 
-    def _loop():
+    def _cleanup_loop():
         while True:
-            gevent.sleep(30 * 60)  # every 30 minutes
+            gevent.sleep(30 * 60)
             try:
                 _cleanup_stale_hls()
             except Exception:
@@ -175,7 +543,91 @@ def _start_hls_cleanup_loop(socketio_instance=None):
             except Exception:
                 pass
 
-    gevent.spawn(_loop)
+    def _heartbeat_watchdog():
+        """Kill sessions whose client hasn't sent a heartbeat for _HLS_HEARTBEAT_TIMEOUT s."""
+        while True:
+            gevent.sleep(5)
+            now = time.time()
+            for sid in list(_hls_sessions):
+                sess = _hls_sessions.get(sid)
+                if not sess:
+                    continue
+                last = sess.get('last_heartbeat', sess.get('created', now))
+                if now - last > _HLS_HEARTBEAT_TIMEOUT:
+                    log.info("HLS heartbeat timeout sid=%s — killing ffmpeg", sid)
+                    _cleanup_hls(sid)
+
+    def _throttle_loop():
+        """Pause/resume ffmpeg based on how far ahead of client the buffer is."""
+        while True:
+            gevent.sleep(2)
+            for sid, sess in list(_hls_sessions.items()):
+                proc = sess.get('proc')
+                if not proc or proc.poll() is not None:
+                    continue
+                client_pos = sess.get('client_pos', 0)
+                start_offset = sess.get('start_offset', 0)
+                seg_dur = 4  # seconds per HLS segment
+                tmpdir = sess.get('tmpdir', '')
+                try:
+                    segs = sorted(f for f in os.listdir(tmpdir) if f.endswith('.ts'))
+                except OSError:
+                    continue
+                if not segs:
+                    continue
+                # Estimate how many seconds are buffered ahead of client
+                seg_count = len(segs)
+                buffered_end = start_offset + seg_count * seg_dur
+                ahead = buffered_end - client_pos
+                paused = sess.get('paused', False)
+                if ahead > _HLS_THROTTLE_AHEAD and not paused:
+                    try:
+                        os.kill(proc.pid, 19)  # SIGSTOP
+                        sess['paused'] = True
+                        log.debug("HLS throttle STOP sid=%s ahead=%.0fs", sid, ahead)
+                    except OSError:
+                        pass
+                elif ahead < _HLS_THROTTLE_RESUME and paused:
+                    try:
+                        os.kill(proc.pid, 18)  # SIGCONT
+                        sess['paused'] = False
+                        log.debug("HLS throttle CONT sid=%s ahead=%.0fs", sid, ahead)
+                    except OSError:
+                        pass
+
+    gevent.spawn(_cleanup_loop)
+    gevent.spawn(_heartbeat_watchdog)
+    gevent.spawn(_throttle_loop)
+    gevent.spawn(_file_watcher_loop)
+
+
+def _file_watcher_loop():
+    """Poll library folders every 60 s; auto-scan if any folder mtime changed."""
+    import gevent
+    gevent.sleep(30)  # initial delay — let server finish starting
+    while True:
+        try:
+            folders = _load_folders()
+            changed = []
+            for f in folders:
+                if not os.path.isdir(f):
+                    continue
+                try:
+                    mt = os.path.getmtime(f)
+                except OSError:
+                    continue
+                prev = _watcher_state.get(f)
+                _watcher_state[f] = mt
+                if prev is not None and mt != prev:
+                    changed.append(f)
+            if changed and not _scan_state.get('running'):
+                log.info("File watcher: changes in %s — triggering scan", changed)
+                _scan_state.update(running=True, stop_requested=False,
+                                   total=0, processed=0, current_file='')
+                gevent.spawn(_scan_worker, folders, False)
+        except Exception as e:
+            log.debug("File watcher error: %s", e)
+        gevent.sleep(60)
 
 
 def _evict_tmp_if_low():
@@ -277,6 +729,10 @@ def _migrate_db():
         for col_name, col_def in migrations:
             if col_name not in cols:
                 conn.execute('ALTER TABLE videos ADD COLUMN %s %s' % (col_name, col_def))
+        # watch_state migrations
+        ws_cols = {r[1] for r in conn.execute('PRAGMA table_info(watch_state)').fetchall()}
+        if 'last_watched_at' not in ws_cols:
+            conn.execute('ALTER TABLE watch_state ADD COLUMN last_watched_at REAL DEFAULT 0')
         conn.commit()
         conn.close()
     except Exception:
@@ -393,6 +849,7 @@ def _probe_video(path):
         fmt = data.get('format', {})
         vstream = next((s for s in data.get('streams', []) if s.get('codec_type') == 'video'), {})
         astreams = [s for s in data.get('streams', []) if s.get('codec_type') == 'audio']
+        sstreams = [s for s in data.get('streams', []) if s.get('codec_type') == 'subtitle']
         first_audio = astreams[0] if astreams else {}
         audio_tracks = []
         for i, a in enumerate(astreams):
@@ -401,6 +858,15 @@ def _probe_video(path):
                 'index': a.get('index', i),
                 'codec': a.get('codec_name', ''),
                 'channels': a.get('channels', 0),
+                'language': tags.get('language', ''),
+                'title': tags.get('title', ''),
+            })
+        sub_tracks = []
+        for s in sstreams:
+            tags = s.get('tags', {})
+            sub_tracks.append({
+                'index': s.get('index'),
+                'codec': s.get('codec_name', ''),
                 'language': tags.get('language', ''),
                 'title': tags.get('title', ''),
             })
@@ -413,6 +879,7 @@ def _probe_video(path):
             'bitrate': int(fmt.get('bit_rate', 0)),
             'title': fmt.get('tags', {}).get('title', ''),
             'audio_tracks': audio_tracks,
+            'sub_tracks': sub_tracks,
         }
     except Exception as e:
         log.debug('ffprobe failed for %s: %s', path, e)
@@ -451,33 +918,75 @@ _TMDB_BACKDROP_BASE = 'https://image.tmdb.org/t/p/w1280'
 # Common noise tokens stripped from filenames before TMDb search
 _NOISE_RE = re.compile(
     r'\b('
-    r'720p|1080p|1080i|2160p|4k|uhd|hdr|hdr10|dolby|atmos|dts|aac|ac3|'
-    r'bluray|blu-ray|bdrip|brrip|dvdrip|webrip|web-dl|webdl|hdtv|hdrip|'
-    r'x264|x265|h264|h265|hevc|avc|xvid|divx|'
-    r'remastered|extended|directors.cut|unrated|theatrical|'
-    r'proper|repack|internal|limited|'
+    # Resolution / quality
+    r'480p|576p|720p|1080p|1080i|2160p|4k|uhd|fhd|hd|'
+    r'hdr|hdr10|hdr10plus|dv|dolbyvision|sdr|'
+    # Audio codecs
+    r'dolby|atmos|dts|dts-hd|truehd|aac|ac3|eac3|ddp5?[\.\s]?1|'
+    r'flac|mp3|opus|vorbis|'
+    # Video codecs / containers
+    r'x264|x265|h264|h265|hevc|avc|xvid|divx|av1|vp9|'
+    r'mkv|mp4|avi|mov|wmv|ts|m2ts|'
+    # Source / rip type
+    r'bluray|blu-ray|bdrip|brrip|bdremux|remux|'
+    r'dvdrip|dvdscr|dvd|'
+    r'webrip|web-dl|webdl|web|'
+    r'hdtv|hdrip|pdtv|dsr|'
+    r'hc|hq|cam|ts|scr|'
+    # Streaming sources
+    r'nf|amzn|dsnp|hmax|hulu|atvp|pcok|sho|'
+    # Edition/cut tags
+    r'remastered|extended|extended-cut|directors?.cut|unrated|theatrical|'
+    r'open.matte|imax|proper|repack|internal|limited|retail|'
+    # Language tags
+    r'multi|dual|pl|eng|ger|fra|por|spa|ita|rus|cze|'
+    r'dubbed|lektor|napisy|subs|subbed|'
+    # Common release groups / site prefixes
     r'yts|yify|rarbg|eztv|ettv|sparks|geckos|fgt|'
-    r'mkv|mp4|avi|mov'
+    r'nodlabs|rzero-?x|poke|cmrg|ntg|fum|wbr|nhanc3|'
+    r'evo|galadriel|axxo|vxt|mzabi|tigole|qxr|flux|'
+    # Bracket/paren noise
+    r'sample|trailer|featurette|extra'
     r')\b', re.IGNORECASE
 )
+# Strip site-prefix patterns like "DDLValley.me_83_" or "SiteTag_NNN_"
+_SITE_PREFIX_RE = re.compile(r'^[A-Za-z0-9]+\.[a-z]{2,4}[_\-\s]\d*[_\-\s]', re.IGNORECASE)
+# TV episode pattern: S01E01, S01, E01, 1x01
+_EPISODE_RE = re.compile(r'\bS\d{1,2}E\d{1,2}\b|\bS\d{1,2}\b|\bE\d{1,2}\b|\b\d{1,2}x\d{2}\b', re.IGNORECASE)
 _YEAR_RE = re.compile(r'[\(\[\.]?((?:19|20)\d{2})[\)\]\.]?')
 _CLEAN_RE = re.compile(r'[\.\-_]+')
 _MULTI_SPACE = re.compile(r'\s{2,}')
 
 
 def _parse_filename(filename):
-    """Extract title and year from a video filename."""
+    """Extract clean title and year from a video filename.
+
+    Handles:
+      - Site prefixes: DDLValley.me_83_scream.7.2026 → Scream 7
+      - Quality/codec noise: 1080p, x265, BluRay, HEVC, AMZN, etc.
+      - Release groups: NodLabs, POKE, RZeroX, etc.
+      - TV episode tags: S01E01, 2x04, etc. (stripped for TMDb search)
+    """
     name = os.path.splitext(filename)[0]
+    # Strip leading site-prefix (e.g. "DDLValley.me_83_")
+    name = _SITE_PREFIX_RE.sub('', name)
     # Try to find year first — everything before it is likely the title
     year_match = _YEAR_RE.search(name)
     year = ''
     if year_match:
         year = year_match.group(1)
         name = name[:year_match.start()]
+    else:
+        # Cut off at first episode marker if no year
+        ep_match = _EPISODE_RE.search(name)
+        if ep_match:
+            name = name[:ep_match.start()]
     # Replace dots/dashes/underscores with spaces
     name = _CLEAN_RE.sub(' ', name)
     # Remove noise tokens
     name = _NOISE_RE.sub('', name)
+    # Remove leftover episode tags (e.g. "S01E01" after space normalisation)
+    name = _EPISODE_RE.sub('', name)
     name = _MULTI_SPACE.sub(' ', name).strip()
     return name, year
 
@@ -705,6 +1214,12 @@ def _scan_worker(folders, use_tmdb=False):
             if ok:
                 conn.execute("UPDATE videos SET thumb_ok=1 WHERE id=?", (vid_row["id"],))
                 conn.commit()
+            # Background thumbstrip generation (sprite for seek preview)
+            sprite_path = os.path.join(_THUMBSTRIP_DIR, str(vid_row["id"]) + ".jpg")
+            if not os.path.isfile(sprite_path) and meta.get("duration", 0) > 30:
+                vid_id = vid_row["id"]
+                dur = meta.get("duration", 0)
+                gevent.spawn(_generate_thumbstrip, vid_id, path, dur, sprite_path)
             # TMDb matching during scan
             if use_tmdb and _load_tmdb_key():
                 try:
@@ -879,6 +1394,38 @@ def continue_watching():
     return jsonify({"items": items})
 
 
+@video_station_bp.route("/history", methods=["GET"])
+
+def watch_history():
+    """Return recently watched videos (fully watched), sorted by last_watched_at desc."""
+    conn = _get_db()
+    limit = min(int(request.args.get("limit", 40)), 100)
+    rows = conn.execute(
+        "SELECT v.*, ws.watched, ws.position, ws.last_watched_at FROM videos v "
+        "JOIN watch_state ws ON ws.video_id=v.id "
+        "WHERE ws.watched=1 AND COALESCE(v.hidden,0)=0 "
+        "ORDER BY COALESCE(ws.last_watched_at, ws.updated_at) DESC LIMIT ?",
+        (limit,)).fetchall()
+    items = [{
+        "id": r["id"], "title": r["title"], "filename": r["filename"],
+        "path": r["path"], "duration": r["duration"],
+        "duration_fmt": _format_duration(r["duration"]),
+        "width": r["width"], "height": r["height"],
+        "thumb_ok": bool(r["thumb_ok"]),
+        "poster_ok": bool(r["poster_ok"]),
+        "tmdb_id": r["tmdb_id"] or 0,
+        "tmdb_title": r["tmdb_title"] or "",
+        "tmdb_year": r["tmdb_year"] or "",
+        "tmdb_rating": r["tmdb_rating"] or 0,
+        "tmdb_genres": r["tmdb_genres"] or "",
+        "watched": True,
+        "position": r["position"] or 0,
+        "last_watched_at": r["last_watched_at"] or r["updated_at"] or 0,
+    } for r in rows]
+    conn.close()
+    return jsonify({"items": items})
+
+
 @video_station_bp.route("/library", methods=["GET"])
 
 def library():
@@ -937,12 +1484,107 @@ def library():
             "tmdb_year": r["tmdb_year"] or "",
             "tmdb_rating": r["tmdb_rating"] or 0,
             "tmdb_overview": r["tmdb_overview"] or "",
+            "tmdb_genres": r["tmdb_genres"] or "",
             "watched": bool(r["watched"]), "position": r["position"] or 0,
             "added_at": r["added_at"],
             "hidden": bool(r["hidden"]),
         })
     conn.close()
     return jsonify({"items": items, "total": total, "offset": offset, "limit": limit})
+
+
+def _row_items(rows):
+    """Convert DB rows to lean dicts for Netflix home rows."""
+    items = []
+    for r in rows:
+        d = dict(r)
+        items.append({
+            "id": d["id"], "title": d["title"], "filename": d["filename"],
+            "duration": d["duration"], "duration_fmt": _format_duration(d["duration"]),
+            "thumb_ok": bool(d.get("thumb_ok")), "poster_ok": bool(d.get("poster_ok")),
+            "backdrop_ok": bool(d.get("backdrop_ok", 0)),
+            "tmdb_id": d.get("tmdb_id") or 0,
+            "tmdb_title": d.get("tmdb_title") or "",
+            "tmdb_year": d.get("tmdb_year") or "",
+            "tmdb_rating": d.get("tmdb_rating") or 0,
+            "tmdb_overview": d.get("tmdb_overview") or "",
+            "tmdb_genres": d.get("tmdb_genres") or "",
+            "tmdb_media_type": d.get("tmdb_media_type") or "movie",
+            "watched": bool(d.get("watched")), "position": d.get("position") or 0,
+            "added_at": d.get("added_at"),
+        })
+    return items
+
+
+@video_station_bp.route("/home", methods=["GET"])
+def home():
+    """Netflix-style home rows: hero, continue watching, recently added, per-genre rows."""
+    conn = _get_db()
+    hidden_clause = "COALESCE(v.hidden,0)=0"
+
+    # Hero: last watched with backdrop, else last added with backdrop
+    hero_row = conn.execute(
+        "SELECT v.*, ws.watched, ws.position, ws.last_watched_at FROM videos v "
+        "LEFT JOIN watch_state ws ON ws.video_id=v.id "
+        "WHERE " + hidden_clause + " AND v.backdrop_ok=1 "
+        "ORDER BY COALESCE(ws.last_watched_at, v.added_at) DESC LIMIT 1"
+    ).fetchone()
+    hero = None
+    if hero_row:
+        hero = _row_items([hero_row])[0]
+        hero["last_watched_at"] = dict(hero_row).get("last_watched_at")
+
+    # Continue watching — has position > 5% of duration
+    cw_rows = conn.execute(
+        "SELECT v.*, ws.watched, ws.position FROM videos v "
+        "JOIN watch_state ws ON ws.video_id=v.id "
+        "WHERE " + hidden_clause + " AND ws.watched=0 "
+        "AND v.duration > 0 AND ws.position > (v.duration * 0.05) "
+        "ORDER BY ws.updated_at DESC LIMIT 20"
+    ).fetchall()
+
+    # Recently added
+    recent_rows = conn.execute(
+        "SELECT v.*, ws.watched, ws.position FROM videos v "
+        "LEFT JOIN watch_state ws ON ws.video_id=v.id "
+        "WHERE " + hidden_clause + " ORDER BY v.added_at DESC LIMIT 20"
+    ).fetchall()
+
+    # Genre rows — collect top genres present in library
+    genre_rows = conn.execute(
+        "SELECT tmdb_genres FROM videos WHERE COALESCE(hidden,0)=0"
+        " AND tmdb_genres IS NOT NULL AND tmdb_genres != '' LIMIT 500"
+    ).fetchall()
+    # Count genre IDs
+    from collections import Counter
+    genre_counter = Counter()
+    for g in genre_rows:
+        for gid in (g["tmdb_genres"] or "").split(","):
+            gid = gid.strip()
+            if gid:
+                genre_counter[gid] += 1
+    # Top 6 genres
+    top_genres = [gid for gid, _ in genre_counter.most_common(6)]
+
+    genre_sections = []
+    for gid in top_genres:
+        g_rows = conn.execute(
+            "SELECT v.*, ws.watched, ws.position FROM videos v "
+            "LEFT JOIN watch_state ws ON ws.video_id=v.id "
+            "WHERE " + hidden_clause + " AND (',' || v.tmdb_genres || ',') LIKE ? "
+            "ORDER BY v.tmdb_rating DESC LIMIT 20",
+            ('%,' + gid + ',%',)
+        ).fetchall()
+        if g_rows:
+            genre_sections.append({"genre_id": int(gid), "items": _row_items(g_rows)})
+
+    conn.close()
+    return jsonify({
+        "hero": hero,
+        "continue_watching": _row_items(cw_rows),
+        "recently_added": _row_items(recent_rows),
+        "genres": genre_sections,
+    })
 
 
 @video_station_bp.route("/recent", methods=["GET"])
@@ -1352,9 +1994,25 @@ def hls_start(vid):
         if _hls_sessions[sid].get("vid") == vid:
             _cleanup_hls(sid)
 
+    # Enforce max concurrent sessions — kill the oldest non-matching session
+    while len(_hls_sessions) >= _HLS_MAX_SESSIONS:
+        oldest_sid = min(_hls_sessions, key=lambda s: _hls_sessions[s].get('created', 0))
+        log.info("HLS session limit reached — killing oldest session %s", oldest_sid)
+        _cleanup_hls(oldest_sid)
+
     vcodec = (r["codec"] or "").lower()
     vcopy = vcodec in ("h264", "vp8", "vp9")
-    v_arg = "copy" if vcopy else "libx264 -preset ultrafast -crf 23"
+    if vcopy:
+        v_arg = "copy"
+    else:
+        hw_enc = _detect_hw_encoder()
+        if hw_enc == 'h264_vaapi':
+            v_arg = "h264_vaapi -vf format=nv12,hwupload -qp 23"
+        elif hw_enc in ('h264_nvenc', 'h264_videotoolbox'):
+            v_arg = "%s -preset fast -cq 23" % hw_enc
+        else:
+            v_arg = "libx264 -preset ultrafast -crf 23"
+        log.info("HLS encode: %s → %s", vcodec, v_arg.split()[0])
 
     session_id = "%d_%s" % (vid, os.urandom(4).hex())
     tmpdir = tempfile.mkdtemp(prefix="vs_hls_")
@@ -1390,6 +2048,9 @@ def hls_start(vid):
         "start_offset": start_sec,
         "duration": r["duration"] or 0,
         "created": time.time(),
+        "last_heartbeat": time.time(),
+        "client_pos": start_sec,
+        "paused": False,
     }
 
     # Wait for first segment (up to 10s)
@@ -1405,7 +2066,8 @@ def hls_start(vid):
             return jsonify(error="Transkodowanie nie powiodło się: " + stderr), 500
         time.sleep(0.1)
 
-    return jsonify(ok=True, session_id=session_id, start_offset=start_sec)
+    return jsonify(ok=True, session_id=session_id, start_offset=start_sec,
+                   sub_tracks=json.loads(r["metadata_json"] or '{}').get('sub_tracks', []))
 
 
 @video_station_bp.route("/hls/<session_id>/playlist.m3u8")
@@ -1480,8 +2142,302 @@ def hls_stop_session(session_id):
     return jsonify(ok=True)
 
 
-@video_station_bp.route("/watched/<int:vid>", methods=["POST"])
+@video_station_bp.route("/hls/<session_id>/heartbeat", methods=["POST"])
+def hls_heartbeat(session_id):
+    """Client keepalive — update last_heartbeat and current playback position.
 
+    POST body: {pos: seconds}
+    Must be called every ~8s while the player is active.
+    If no heartbeat for _HLS_HEARTBEAT_TIMEOUT seconds, the watchdog kills ffmpeg.
+    """
+    sess = _hls_sessions.get(session_id)
+    if not sess:
+        return jsonify(ok=False, error="Session not found"), 404
+    data = request.get_json(silent=True) or {}
+    if isinstance(data, str):
+        # Defensive: body was double-serialized by client (JSON.stringify in api())
+        try:
+            data = json.loads(data)
+        except Exception:
+            data = {}
+    sess['last_heartbeat'] = time.time()
+    pos = float(data.get('pos', sess.get('client_pos', 0)))
+    sess['client_pos'] = pos
+    paused = sess.get('paused', False)
+    return jsonify(ok=True, paused=paused, client_pos=pos)
+
+
+@video_station_bp.route("/hls/encoder-info", methods=["GET"])
+def hls_encoder_info():
+    """Return current HW encoder in use (for player stats overlay)."""
+    enc = _detect_hw_encoder()
+    hw = enc != 'libx264'
+    libva_driver_name = os.environ.get('LIBVA_DRIVER_NAME', '')
+    return jsonify(
+        encoder=enc,
+        type='hw' if hw else 'sw',
+        label='GPU (%s)' % enc if hw else 'CPU (libx264)',
+        tooltip=('Intel QuickSync (iHD) — Aktywny' if 'vaapi' in enc else enc) if hw else 'libx264 (CPU) — akceleracja GPU niedostępna',
+        libva_driver_name=libva_driver_name,
+    )
+
+
+@video_station_bp.route("/hw-health", methods=["GET"])
+def hw_health():
+    """Detailed HW acceleration health report.
+
+    Returns status, diagnostic info, and step-by-step setup instructions
+    when HW acceleration is not working. The frontend uses this to show
+    a warning banner and setup wizard modal.
+    """
+    return jsonify(_hw_health_check())
+
+
+@video_station_bp.route("/vainfo-test", methods=["GET"])
+def vainfo_test():
+    """Run vainfo against /dev/dri/renderD128 and return parsed result.
+
+    Returns:
+      ok                : bool
+      output            : raw vainfo stdout+stderr
+      profiles          : list of detected VAProfile/VAEntrypoint strings
+      error_code        : "IHD_INIT_FAILED" | "PERMISSION_DENIED" | "MISSING_DRIVER" |
+                          "NO_RENDER_NODE" | "MISSING_VAINFO" | "TIMEOUT" | ""
+      error             : human-readable error string (only on failure)
+      libva_driver_name : value of LIBVA_DRIVER_NAME env var
+      libva_correct     : bool — LIBVA_DRIVER_NAME == 'ihd'
+    """
+    RENDER_NODE = '/dev/dri/renderD128'
+    libva_driver_name = os.environ.get('LIBVA_DRIVER_NAME', '')
+    libva_correct = libva_driver_name.lower() == 'ihd'
+
+    if not shutil.which('vainfo'):
+        return jsonify(ok=False, output='', profiles=[], error_code='MISSING_VAINFO',
+                       error='Polecenie vainfo nie jest zainstalowane. '
+                             'Uruchom: sudo apt install vainfo',
+                       libva_driver_name=libva_driver_name, libva_correct=libva_correct)
+    if not os.path.exists(RENDER_NODE):
+        return jsonify(ok=False, output='', profiles=[], error_code='NO_RENDER_NODE',
+                       error='Węzeł %s nie istnieje.' % RENDER_NODE,
+                       libva_driver_name=libva_driver_name, libva_correct=libva_correct)
+    try:
+        r = subprocess.run(
+            ['vainfo', '--display', 'drm', '--device', RENDER_NODE],
+            capture_output=True, timeout=10, text=True
+        )
+        combined = (r.stdout or '') + (r.stderr or '')
+        ok = r.returncode == 0 and 'VAEntrypoint' in combined
+
+        # Parse supported profiles
+        profiles = []
+        for line in combined.splitlines():
+            m = re.search(r'(VAProfile\w+)\s*/\s*(VAEntrypoint\w+)', line)
+            if m:
+                profiles.append('%s / %s' % (m.group(1), m.group(2)))
+
+        if ok:
+            return jsonify(ok=True, output=combined, profiles=profiles, error_code='', error='',
+                           libva_driver_name=libva_driver_name, libva_correct=libva_correct)
+
+        # Classify the failure
+        if ('iHD_drv_video.so init failed' in combined
+                or 'Failed to open the given device' in combined
+                or ('init failed' in combined and 'iHD' in combined)):
+            error_code = 'IHD_INIT_FAILED'
+            error_msg = ('iHD_drv_video.so init failed — brakujące zależności lub LIBVA_DRIVER_NAME. '
+                         'Uruchom: sudo apt install intel-media-va-driver-non-free libmfx1 libmfx-gen1 libva-drm2')
+        elif 'Permission denied' in combined or 'permission denied' in combined:
+            error_code = 'PERMISSION_DENIED'
+            error_msg = ('Brak dostępu do /dev/dri/renderD128. '
+                         'Uruchom: sudo usermod -aG render,video $USER')
+        elif 'va_openDriver() returns -1' in combined:
+            error_code = 'MISSING_DRIVER'
+            error_msg = 'Brak sterownika VAAPI. Uruchom: sudo apt install intel-media-va-driver-non-free'
+        else:
+            err_m = re.search(r'(error|failed)[^\n]*', combined, re.I)
+            error_code = 'UNKNOWN'
+            error_msg = err_m.group(0) if err_m else ('vainfo błąd (kod %d)' % r.returncode)
+
+        return jsonify(ok=False, output=combined, profiles=[], error_code=error_code, error=error_msg,
+                       libva_driver_name=libva_driver_name, libva_correct=libva_correct)
+    except subprocess.TimeoutExpired:
+        return jsonify(ok=False, output='', profiles=[], error_code='TIMEOUT',
+                       error='Timeout — vainfo nie odpowiedział w 10s.',
+                       libva_driver_name=libva_driver_name, libva_correct=libva_correct)
+    except Exception as exc:
+        return jsonify(ok=False, output='', profiles=[], error_code='EXCEPTION',
+                       error=str(exc), libva_driver_name=libva_driver_name, libva_correct=libva_correct)
+
+
+@video_station_bp.route("/gpu-retest", methods=["POST"])
+def gpu_retest():
+    """Reset HW encoder cache and re-probe GPU capabilities via vainfo + ffmpeg.
+
+    Returns:
+      ok                : bool — vainfo succeeded
+      hw_encoder        : str  — newly detected best encoder
+      is_hw             : bool
+      error_code        : str  — IHD_INIT_FAILED | PERMISSION_DENIED | etc.
+      profiles          : list — VAProfile/VAEntrypoint strings
+      codecs            : dict — {h264, hevc, vp9, av1}: bool
+      libva_driver_name : str
+      libva_correct     : bool
+    """
+    global _HW_ENCODER
+    _HW_ENCODER = None  # reset encoder cache to force re-detection
+
+    RENDER_NODE = '/dev/dri/renderD128'
+    libva_driver_name = os.environ.get('LIBVA_DRIVER_NAME', '')
+    libva_correct = libva_driver_name.lower() == 'ihd'
+
+    # ── vainfo probe ────────────────────────────────────────────────────
+    vainfo_ok = False
+    profiles = []
+    error_code = ''
+    vainfo_output = ''
+
+    if shutil.which('vainfo') and os.path.exists(RENDER_NODE):
+        try:
+            vr = subprocess.run(
+                ['vainfo', '--display', 'drm', '--device', RENDER_NODE],
+                capture_output=True, timeout=10, text=True
+            )
+            vainfo_output = (vr.stdout or '') + (vr.stderr or '')
+            vainfo_ok = vr.returncode == 0 and 'VAEntrypoint' in vainfo_output
+            for line in vainfo_output.splitlines():
+                m = re.search(r'(VAProfile\w+)\s*/\s*(VAEntrypoint\w+)', line)
+                if m:
+                    profiles.append('%s / %s' % (m.group(1), m.group(2)))
+            if not vainfo_ok:
+                if ('iHD_drv_video.so init failed' in vainfo_output
+                        or 'Failed to open the given device' in vainfo_output
+                        or ('init failed' in vainfo_output and 'iHD' in vainfo_output)):
+                    error_code = 'IHD_INIT_FAILED'
+                elif 'Permission denied' in vainfo_output or 'permission denied' in vainfo_output:
+                    error_code = 'PERMISSION_DENIED'
+                elif 'va_openDriver() returns -1' in vainfo_output:
+                    error_code = 'MISSING_DRIVER'
+                else:
+                    error_code = 'UNKNOWN'
+        except subprocess.TimeoutExpired:
+            error_code = 'TIMEOUT'
+        except Exception:
+            error_code = 'EXCEPTION'
+
+    # ── per-codec ffmpeg probe ───────────────────────────────────────────
+    codecs = {}
+    if shutil.which('ffmpeg') and os.path.exists(RENDER_NODE):
+        _base = '-vaapi_device %s -f lavfi -i nullsrc=s=64x64:d=0.1 -vf format=nv12,hwupload' % RENDER_NODE
+        codec_tests = [
+            ('h264',  '%s -c:v h264_vaapi -f null -'  % _base),
+            ('hevc',  '%s -c:v hevc_vaapi -f null -'  % _base),
+            ('vp9',   '%s -c:v vp9_vaapi  -f null -'  % _base),
+            ('av1',   '%s -c:v av1_vaapi  -f null -'  % _base),
+        ]
+        for codec_name, args in codec_tests:
+            try:
+                cr = subprocess.run(
+                    ['ffmpeg', '-hide_banner', '-loglevel', 'error'] + args.split(),
+                    capture_output=True, timeout=6
+                )
+                codecs[codec_name] = cr.returncode == 0
+            except Exception:
+                codecs[codec_name] = False
+
+    new_encoder = _detect_hw_encoder()
+    return jsonify(
+        ok=vainfo_ok,
+        hw_encoder=new_encoder,
+        is_hw=new_encoder != 'libx264',
+        error_code=error_code,
+        profiles=profiles,
+        codecs=codecs,
+        libva_driver_name=libva_driver_name,
+        libva_correct=libva_correct,
+        tooltip=('Intel QuickSync (iHD) — Aktywny' if vainfo_ok else
+                 'libx264 (CPU) — akceleracja GPU niedostępna'),
+    )
+
+
+
+@video_station_bp.route("/hw-install", methods=["GET", "POST"])
+@admin_required
+def hw_install():
+    """Auto-install VAAPI drivers for Intel GPUs, streamed as SSE.
+
+    Streams progress lines as:
+      data: {"line": "...", "done": false}
+    Final event:
+      data: {"done": true, "ok": true|false, "hw_encoder": "..."}
+    """
+    from flask import Response
+
+    def _generate():
+        global _HW_ENCODER
+
+        def _send(line, done=False, **kw):
+            import json
+            payload = {"line": line, "done": done}
+            payload.update(kw)
+            return "data: %s\n\n" % json.dumps(payload)
+
+        try:
+            yield _send("🔍 Wykrywanie systemu...")
+            # Check if we can use non-free
+            sources = ""
+            try:
+                sources = open("/etc/apt/sources.list").read()
+            except Exception:
+                pass
+
+            if "non-free" not in sources:
+                yield _send("📦 Włączanie repozytorium non-free...")
+                r = host_run(
+                    "sed -i 's/main$/main contrib non-free non-free-firmware/g' /etc/apt/sources.list",
+                    timeout=10
+                )
+                if r.returncode != 0:
+                    yield _send("⚠️  Nie udało się edytować sources.list (kontynuuję...)")
+
+            yield _send("🔄 Aktualizacja listy pakietów (apt update)...")
+            for line in host_run_stream("apt-get update -qq 2>&1"):
+                yield _send(line.rstrip())
+
+            yield _send("📥 Instalacja sterowników VAAPI...")
+            pkgs = "intel-media-va-driver-non-free i965-va-driver vainfo"
+            for line in host_run_stream(
+                "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends %s 2>&1" % pkgs
+            ):
+                yield _send(line.rstrip())
+
+            # Add current user to render+video groups
+            run_user = os.environ.get('SUDO_USER', '') or os.environ.get('USER', '') or 'ethos'
+            yield _send("👤 Dodawanie użytkownika '%s' do grup render i video..." % run_user)
+            host_run("usermod -aG render,video %s 2>&1 || true" % q(run_user), timeout=10)
+
+            yield _send("✅ Sterowniki zainstalowane. Testuję VAAPI...")
+
+            # Reset encoder cache and re-detect
+            _HW_ENCODER = None
+            new_encoder = _detect_hw_encoder()
+            if new_encoder != 'libx264':
+                yield _send(
+                    "🎉 Akceleracja sprzętowa aktywna! Enkoder: %s" % new_encoder,
+                    done=True, ok=True, hw_encoder=new_encoder
+                )
+            else:
+                yield _send(
+                    "ℹ️  VAAPI zainstalowane — restart serwisu wymagany do aktywacji.",
+                    done=True, ok=True, hw_encoder='libx264', restart_required=True
+                )
+        except Exception as exc:
+            yield _send("❌ Błąd: %s" % str(exc), done=True, ok=False, hw_encoder='libx264')
+
+    return Response(_generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@video_station_bp.route("/watched/<int:vid>", methods=["POST"])
 def update_watched(vid):
     d = request.json or {}
     conn = _get_db()
@@ -1491,11 +2447,15 @@ def update_watched(vid):
         return jsonify({"error": "Nie znaleziono."}), 404
     watched = 1 if d.get("watched", False) else 0
     position = float(d.get("position", 0))
+    now = time.time()
+    last_watched = now if watched else 0
     conn.execute(
-        "INSERT INTO watch_state (video_id,watched,position,updated_at) "
-        "VALUES (?,?,?,?) ON CONFLICT(video_id) DO UPDATE SET "
-        "watched=excluded.watched,position=excluded.position,updated_at=excluded.updated_at",
-        (vid, watched, position, time.time()))
+        "INSERT INTO watch_state (video_id,watched,position,updated_at,last_watched_at) "
+        "VALUES (?,?,?,?,?) ON CONFLICT(video_id) DO UPDATE SET "
+        "watched=excluded.watched,position=excluded.position,updated_at=excluded.updated_at,"
+        "last_watched_at=CASE WHEN excluded.watched=1 THEN excluded.last_watched_at "
+        "ELSE watch_state.last_watched_at END",
+        (vid, watched, position, now, last_watched))
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
@@ -1774,8 +2734,77 @@ def subtitle_file(vid, filename):
 
     return send_file(sub_path, mimetype="text/plain")
 
-@video_station_bp.route("/tmdb-config", methods=["GET"])
 
+@video_station_bp.route("/embedded-subs/<int:vid>/<int:track>", methods=["GET"])
+def embedded_subs(vid, track):
+    """Extract an embedded subtitle stream from a video file to WebVTT on demand.
+
+    Uses ffmpeg to extract the subtitle stream at the given stream index.
+    Result is cached in /tmp for the session.
+    """
+    conn = _get_db()
+    r = conn.execute("SELECT path FROM videos WHERE id=?", (vid,)).fetchone()
+    conn.close()
+    if not r:
+        return jsonify({"error": "Nie znaleziono."}), 404
+    fp = os.path.realpath(r["path"])
+    if not os.path.isfile(fp):
+        return jsonify({"error": "Plik nie istnieje."}), 404
+    if not shutil.which("ffmpeg"):
+        return jsonify({"error": "ffmpeg nie jest zainstalowany."}), 500
+
+    cache_path = os.path.join(tempfile.gettempdir(), "vs_sub_%d_%d.vtt" % (vid, track))
+    if not os.path.isfile(cache_path):
+        try:
+            cmd = "ffmpeg -hide_banner -loglevel error -i %s -map 0:%d -c:s webvtt -f webvtt %s -y" % (
+                q(fp), track, q(cache_path))
+            res = host_run(cmd, timeout=60)
+            if res.returncode != 0 or not os.path.isfile(cache_path):
+                return jsonify({"error": "Błąd ekstrakcji napisów."}), 500
+        except Exception as e:
+            return jsonify({"error": "Błąd: " + str(e)}), 500
+
+    return send_file(cache_path, mimetype="text/vtt")
+
+
+@video_station_bp.route("/watcher-status", methods=["GET"])
+def watcher_status():
+    """Return file-watcher state (watched folders and their last-seen mtimes)."""
+    return jsonify({
+        "ok": True,
+        "watched": [
+            {"folder": f, "last_mtime": mt}
+            for f, mt in _watcher_state.items()
+        ],
+        "scanning": _scan_state.get("running", False),
+    })
+
+
+@video_station_bp.route("/scan-folder", methods=["POST"])
+def scan_folder():
+    """Trigger an incremental scan of a specific folder path.
+
+    POST body: {folder: "/path/to/folder", use_tmdb: bool}
+    """
+    import gevent
+    data = request.get_json(silent=True) or {}
+    folder = data.get("folder", "").strip()
+    if not folder:
+        return jsonify({"error": "Brak parametru folder."}), 400
+    if not os.path.isdir(folder):
+        return jsonify({"error": "Folder nie istnieje."}), 404
+    if _scan_state.get("running"):
+        return jsonify({"error": "Skanowanie już w toku."}), 409
+    use_tmdb = bool(data.get("use_tmdb", False))
+    _scan_state.update(running=True, stop_requested=False,
+                       total=0, processed=0, current_file="")
+    gevent.spawn(_scan_worker, [folder], use_tmdb)
+    return jsonify({"ok": True, "message": "Skanowanie folderu w tle..."})
+
+
+
+
+@video_station_bp.route("/tmdb-config", methods=["GET"])
 def tmdb_config_get():
     key = _load_tmdb_key()
     return jsonify({
@@ -1839,7 +2868,8 @@ def tmdb_match_all():
                            total=0, processed=0, current_file='')
         conn = _get_db()
         unmatched = conn.execute(
-            "SELECT id, filename FROM videos WHERE tmdb_id=0 OR tmdb_id IS NULL"
+            "SELECT id, filename FROM videos "
+            "WHERE (tmdb_id=0 OR tmdb_id IS NULL) AND COALESCE(hidden,0)=0"
         ).fetchall()
         _scan_state['total'] = len(unmatched)
         _emit_progress()
@@ -1867,3 +2897,155 @@ def tmdb_match_all():
 
     gevent.spawn(_do_match)
     return jsonify({"ok": True})
+
+
+@video_station_bp.route("/tmdb-search-list", methods=["GET"])
+
+def tmdb_search_list():
+    """Search TMDb and return a list of results for manual selection."""
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({"results": []})
+    api_key = _load_tmdb_key()
+    if not api_key:
+        return jsonify({"error": "Brak klucza TMDb. Skonfiguruj w ustawieniach."}), 400
+    results = []
+    for endpoint, media_type in [('/search/movie', 'movie'), ('/search/tv', 'tv')]:
+        try:
+            params = urllib.parse.urlencode({
+                'api_key': api_key, 'query': query, 'language': 'pl-PL', 'page': 1,
+            })
+            url = _TMDB_BASE + endpoint + '?' + params
+            req = urllib.request.Request(url, headers={'User-Agent': 'EthOS/1.0'})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+            for r in (data.get('results') or [])[:5]:
+                title = r.get('title' if media_type == 'movie' else 'name', '')
+                date = r.get('release_date' if media_type == 'movie' else 'first_air_date', '') or ''
+                results.append({
+                    'tmdb_id': r.get('id', 0),
+                    'title': title,
+                    'year': date[:4],
+                    'overview': (r.get('overview', '') or '')[:200],
+                    'poster_path': r.get('poster_path', ''),
+                    'rating': round(r.get('vote_average', 0), 1),
+                    'media_type': media_type,
+                })
+        except Exception as e:
+            log.debug('tmdb_search_list %s failed: %s', endpoint, e)
+    results.sort(key=lambda x: x.get('rating', 0), reverse=True)
+    return jsonify({"results": results[:10]})
+
+
+@video_station_bp.route("/tmdb-apply/<int:vid>", methods=["POST"])
+
+def tmdb_apply(vid):
+    """Apply a specific TMDb result (chosen by user) to a video."""
+    d = request.json or {}
+    tmdb_id = d.get("tmdb_id")
+    media_type = d.get("type", "movie")
+    if not tmdb_id:
+        return jsonify({"error": "Brak tmdb_id."}), 400
+    if media_type not in ('movie', 'tv'):
+        return jsonify({"error": "Nieprawidłowy typ."}), 400
+    api_key = _load_tmdb_key()
+    if not api_key:
+        return jsonify({"error": "Brak klucza TMDb."}), 400
+    conn = _get_db()
+    r = conn.execute("SELECT id FROM videos WHERE id=?", (vid,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify({"error": "Nie znaleziono."}), 404
+    try:
+        url = '%s/%s/%d?api_key=%s&language=pl-PL' % (
+            _TMDB_BASE, media_type, int(tmdb_id), urllib.parse.quote(api_key))
+        req = urllib.request.Request(url, headers={'User-Agent': 'EthOS/1.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            details = json.loads(resp.read().decode('utf-8'))
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": "Błąd pobierania z TMDb: " + str(e)}), 500
+    title_key = 'title' if media_type == 'movie' else 'name'
+    date_key = 'release_date' if media_type == 'movie' else 'first_air_date'
+    tmdb_title = details.get(title_key, '')
+    tmdb_year = (details.get(date_key, '') or '')[:4]
+    tmdb_genres = ','.join(str(g['id']) for g in (details.get('genres') or []))
+    poster_path = details.get('poster_path', '')
+    backdrop_path = details.get('backdrop_path', '')
+    rating = details.get('vote_average', 0)
+    overview = details.get('overview', '')
+    cast, director = _fetch_tmdb_credits(tmdb_id, media_type, api_key)
+    conn.execute(
+        'UPDATE videos SET tmdb_id=?, tmdb_title=?, tmdb_overview=?, '
+        'tmdb_year=?, tmdb_rating=?, tmdb_genres=?, tmdb_poster_path=?, '
+        'tmdb_backdrop_path=?, tmdb_cast=?, tmdb_director=?, tmdb_media_type=? WHERE id=?',
+        (tmdb_id, tmdb_title, overview, tmdb_year, rating, tmdb_genres,
+         poster_path, backdrop_path, cast, director, media_type, vid))
+    conn.commit()
+    if tmdb_title:
+        display = tmdb_title + (' (' + tmdb_year + ')' if tmdb_year else '')
+        conn.execute('UPDATE videos SET title=? WHERE id=?', (display, vid))
+        conn.commit()
+    poster_ok = False
+    if poster_path:
+        poster_ok = _download_poster(poster_path, vid)
+        if poster_ok:
+            conn.execute('UPDATE videos SET poster_ok=1 WHERE id=?', (vid,))
+            conn.commit()
+    backdrop_ok = False
+    if backdrop_path:
+        backdrop_ok = _download_backdrop(backdrop_path, vid)
+        if backdrop_ok:
+            conn.execute('UPDATE videos SET backdrop_ok=1 WHERE id=?', (vid,))
+            conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "title": tmdb_title, "year": tmdb_year,
+                    "poster_ok": poster_ok, "backdrop_ok": backdrop_ok})
+
+
+@video_station_bp.route("/rename/<int:vid>", methods=["POST"])
+
+def rename_video(vid):
+    """Rename a video file on disk and update DB path/filename."""
+    d = request.json or {}
+    new_name = (d.get("name") or "").strip()
+    if not new_name:
+        return jsonify({"error": "Brak nowej nazwy."}), 400
+    conn = _get_db()
+    r = conn.execute(
+        "SELECT id, path, filename, folder FROM videos WHERE id=?", (vid,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify({"error": "Nie znaleziono."}), 404
+    old_ext = os.path.splitext(r["filename"])[1].lower()
+    new_base, new_ext = os.path.splitext(new_name)
+    if not new_ext:
+        new_name = new_name + old_ext
+    elif new_ext.lower() != old_ext:
+        conn.close()
+        return jsonify({"error": "Nie można zmienić rozszerzenia pliku."}), 400
+    folder = r["folder"]
+    new_path = os.path.join(folder, new_name)
+    try:
+        new_path = safe_path(new_path, '/')
+        old_path = safe_path(r["path"], '/')
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    if not os.path.isfile(old_path):
+        conn.close()
+        return jsonify({"error": "Plik nie istnieje na dysku."}), 404
+    if os.path.exists(new_path) and new_path != old_path:
+        conn.close()
+        return jsonify({"error": "Plik o tej nazwie już istnieje."}), 400
+    try:
+        os.rename(old_path, new_path)
+    except OSError as e:
+        conn.close()
+        return jsonify({"error": "Błąd zmiany nazwy: " + str(e)}), 500
+    conn.execute(
+        "UPDATE videos SET path=?, filename=? WHERE id=?",
+        (new_path, new_name, vid))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "new_path": new_path, "new_name": new_name})

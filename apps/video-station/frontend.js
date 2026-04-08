@@ -30,7 +30,8 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         ? NAS.logClient('video-station', level, msg, details) : console.log('[video-station]', msg, details || '');
 
     /* ── state ─────────────────────────────────────────────── */
-    let activeSection  = 'library';
+    let activeSection  = 'home';
+    let sidebarCollapsed = localStorage.getItem('vs_sidebar_collapsed') === '1';
     let libraryItems   = [];
     let libraryTotal   = 0;
     let libraryOffset  = 0;
@@ -152,15 +153,23 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 
         body.innerHTML = `
 <style>${getCSS()}</style>
-<div class="vs-layout">
+<div class="vs-layout${sidebarCollapsed ? ' vs-sidebar-collapsed' : ''}">
   <div class="vs-sidebar">
-    <div class="vs-nav-section">${t('Biblioteka')}</div>
-    <div class="vs-nav-item active" data-section="library"><i class="fas fa-film"></i><span>${t('Wszystkie filmy')}</span></div>
+    <div class="vs-sidebar-header">
+      <span class="vs-sidebar-logo"><i class="fas fa-film"></i><span> Video Station</span></span>
+      <button class="vs-hamburger" id="vs-hamburger" title="${t('Zwiń/rozwiń')}"><i class="fas fa-bars"></i></button>
+    </div>
+    <div class="vs-nav-section vs-nav-label">${t('Odkrywaj')}</div>
+    <div class="vs-nav-item active" data-section="home"><i class="fas fa-home"></i><span>${t('Strona główna')}</span></div>
+    <div class="vs-nav-label vs-nav-section">${t('Biblioteka')}</div>
+    <div class="vs-nav-item" data-section="library"><i class="fas fa-film"></i><span>${t('Wszystkie filmy')}</span></div>
     <div class="vs-nav-item" data-section="recent"><i class="fas fa-clock"></i><span>${t('Ostatnie')}</span></div>
+    <div class="vs-nav-item" data-section="history"><i class="fas fa-history"></i><span>${t('Historia')}</span></div>
     <div class="vs-nav-item" data-section="collections"><i class="fas fa-folder-open"></i><span>${t('Kolekcje')}</span></div>
     <div class="vs-nav-item" data-section="hidden"><i class="fas fa-eye-slash"></i><span>${t('Ukryte')}</span>${hiddenCount ? '<span class="vs-nav-badge">' + hiddenCount + '</span>' : ''}</div>
-    <div class="vs-nav-section">${t('Zarządzanie')}</div>
-    <div class="vs-nav-item" data-section="folders"><i class="fas fa-cog"></i><span>${t('Foldery')}</span></div>
+    <div class="vs-nav-label vs-nav-section">${t('Zarządzanie')}</div>
+    <div class="vs-nav-item" data-section="settings"><i class="fas fa-sliders-h"></i><span>${t('Ustawienia')}</span></div>
+    <div class="vs-nav-item" data-section="folders"><i class="fas fa-folder-open"></i><span>${t('Foldery')}</span></div>
     <div class="vs-sidebar-stats" id="vs-sidebar-stats"></div>
   </div>
   <div class="vs-main">
@@ -183,10 +192,20 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
       <option value="2">2x</option>
     </select>
     <button class="vs-pip-btn" id="vs-pip-btn" title="${t('Obraz w obrazie')}"><i class="fas fa-external-link-alt"></i></button>
+    <button class="vs-cast-btn" id="vs-cast-btn" title="${t('Cast na TV')}" style="display:none"><i class="fas fa-tv"></i></button>
+    <button class="vs-stats-btn" id="vs-stats-btn" title="${t('Statystyki dla geeków')}"><i class="fas fa-chart-bar"></i></button>
     <button class="vs-fs-btn" id="vs-fs-btn" title="${t('Pełny ekran')}"><i class="fas fa-expand"></i></button>
     <button class="vs-player-close" id="vs-player-close"><i class="fas fa-times"></i></button>
   </div>
   <video id="vs-player-video" controls autoplay playsinline></video>
+  <div class="vs-seek-hint vs-seek-hint-left" id="vs-seek-hint-left"><i class="fas fa-backward"></i><span>-10s</span></div>
+  <div class="vs-seek-hint vs-seek-hint-right" id="vs-seek-hint-right"><i class="fas fa-forward"></i><span>+10s</span></div>
+  <div class="vs-swipe-hint" id="vs-swipe-hint"></div>
+  <div class="vs-stats-overlay" id="vs-stats-overlay" style="display:none"></div>
+  <div class="vs-thumbstrip-preview" id="vs-thumbstrip-preview" style="display:none">
+    <canvas id="vs-thumbstrip-canvas" width="160" height="90"></canvas>
+    <span class="vs-thumbstrip-time" id="vs-thumbstrip-time"></span>
+  </div>
   <div class="vs-resume-dialog" id="vs-resume-dialog" style="display:none">
     <div class="vs-resume-box">
       <div class="vs-resume-text" id="vs-resume-text"></div>
@@ -207,8 +226,384 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             n.onclick = () => switchSection(n.dataset.section);
         });
 
-        switchSection('library');
+        // Hamburger toggle
+        const hamburger = body.querySelector('#vs-hamburger');
+        if (hamburger) {
+            hamburger.onclick = () => {
+                sidebarCollapsed = !sidebarCollapsed;
+                localStorage.setItem('vs_sidebar_collapsed', sidebarCollapsed ? '1' : '0');
+                body.querySelector('.vs-layout').classList.toggle('vs-sidebar-collapsed', sidebarCollapsed);
+            };
+        }
+
+        switchSection('home');
+
+        // Async HW health check — show banner if drivers missing
+        _checkHwHealth(body);
     }
+
+    /* ── HW health banner & setup wizard ──────────────────── */
+    async function _checkHwHealth(body) {
+        let health;
+        try { health = await api('/video-station/hw-health'); } catch(e) { return; }
+        if (!health || health.is_hw || health.status === 'cpu_only') return;
+
+        // Inject banner into vs-main (above toolbar)
+        const vsMain = body.querySelector('.vs-main');
+        if (!vsMain || vsMain.querySelector('.vs-hw-banner')) return;
+
+        const isError = health.status === 'permission_denied' || health.status === 'missing_driver';
+        const banner = document.createElement('div');
+        banner.className = 'vs-hw-banner' + (isError ? ' vs-hw-banner-error' : '');
+        banner.innerHTML =
+            '<i class="fas fa-' + (isError ? 'lock' : 'exclamation-triangle') + '"></i>' +
+            '<span class="vs-hw-banner-msg">' +
+              escH(health.message || t('Akceleracja sprzętowa niedostępna.')) +
+            '</span>' +
+            '<button class="vs-hw-banner-btn"><i class="fas fa-tools"></i> ' + t('Napraw') + '</button>' +
+            '<button class="vs-hw-banner-close" title="' + t('Zamknij') + '"><i class="fas fa-times"></i></button>';
+
+        const toolbar = vsMain.querySelector('#vs-toolbar');
+        vsMain.insertBefore(banner, toolbar);
+
+        banner.querySelector('.vs-hw-banner-btn').onclick = () => _openHwWizard(body, health);
+        banner.querySelector('.vs-hw-banner-close').onclick = () => banner.remove();
+    }
+
+    function _openHwWizard(body, health) {
+        // Remove existing modal if any
+        const existing = body.querySelector('.vs-hw-modal');
+        if (existing) existing.remove();
+
+        const stepsHtml = (health.setup_steps || []).map(step => {
+            const cmds = (step.commands || []).map(cmd =>
+                '<div class="vs-hw-cmd">' +
+                  '<code>' + escH(cmd) + '</code>' +
+                  '<button class="vs-hw-cmd-copy" data-cmd="' + escH(cmd) + '" title="' + t('Kopiuj') + '">' +
+                    '<i class="fas fa-copy"></i>' +
+                  '</button>' +
+                '</div>'
+            ).join('');
+            return '<div class="vs-hw-step"><div class="vs-hw-step-title">' + escH(step.title) + '</div>' + cmds + '</div>';
+        }).join('');
+
+        const hwIcon = health.is_intel ? 'fa-microchip' : health.is_nvidia ? 'fa-bolt' : 'fa-server';
+        const cpuLabel = health.cpu_model ? '<span class="vs-hw-cpu-label">' + escH(health.cpu_model) + '</span>' : '';
+        const grpLabel = health.render_grp ? escH(t('Dostęp do grupy') + ' "' + health.render_grp + '"') : t('Dostęp do grupy render');
+        const dockerWarning = health.in_docker
+            ? '<div class="vs-hw-docker-warn"><i class="fab fa-docker"></i> ' +
+              t('Wykryto środowisko Docker. Dodaj flagę') +
+              ' <code>--device /dev/dri:/dev/dri</code> ' +
+              t('do konfiguracji kontenera.') + '</div>'
+            : '';
+
+        // iHD-specific alert banner (shown prominently for IHD_INIT_FAILED)
+        const ihdAlert = health.status === 'ihd_init_failed'
+            ? '<div class="vs-hw-ihd-alert">' +
+              '<div class="vs-hw-ihd-alert-header">' +
+                '<i class="fas fa-exclamation-circle"></i>' +
+                '<strong>' + t('Wykryto procesor Intel N100, ale sterownik iHD nie może wystartować.') + '</strong>' +
+              '</div>' +
+              '<div class="vs-hw-ihd-alert-body">' +
+                '<div class="vs-hw-ihd-row">' +
+                  '<span class="vs-hw-ihd-label">iHD_drv_video.so</span>' +
+                  '<span class="vs-hw-ihd-val' + (health.iHD_present ? ' ok' : ' fail') + '">' +
+                    (health.iHD_present ? t('Znaleziony') + ' — init failed' : t('Brak')) +
+                  '</span>' +
+                '</div>' +
+                '<div class="vs-hw-ihd-row">' +
+                  '<span class="vs-hw-ihd-label">LIBVA_DRIVER_NAME</span>' +
+                  '<span class="vs-hw-ihd-val' + (health.libva_correct ? ' ok' : ' warn') + '">' +
+                    (health.libva_driver_name ? escH(health.libva_driver_name) : t('Nie ustawiono')) +
+                    (health.libva_correct ? '' : ' → ' + t('powinno być: ihd')) +
+                  '</span>' +
+                '</div>' +
+              '</div>' +
+            '</div>'
+            : '';
+
+        const modal = document.createElement('div');
+        modal.className = 'vs-hw-modal';
+        modal.innerHTML =
+          '<div class="vs-hw-modal-backdrop"></div>' +
+          '<div class="vs-hw-modal-box">' +
+            '<div class="vs-hw-modal-header">' +
+              '<i class="fas ' + hwIcon + '"></i> ' +
+              '<span>' + t('Konfiguracja akceleracji sprzętowej') + '</span>' +
+              '<button class="vs-hw-modal-close"><i class="fas fa-times"></i></button>' +
+            '</div>' +
+            '<div class="vs-hw-modal-body">' +
+              ihdAlert +
+              (ihdAlert ? '' :
+                '<div class="vs-hw-modal-status vs-hw-status-' + escH(health.status) + '">' +
+                  '<i class="fas fa-info-circle"></i> ' + escH(health.message) +
+                '</div>'
+              ) +
+              dockerWarning +
+              (cpuLabel ? '<div class="vs-hw-modal-cpu"><i class="fas fa-microchip"></i> ' + cpuLabel +
+                (health.process_user ? ' &nbsp;·&nbsp; <i class="fas fa-user"></i> ' + escH(health.process_user) : '') +
+              '</div>' : '') +
+              '<div class="vs-hw-modal-diag">' +
+                _hwDiagRow(t('Węzeł GPU (/dev/dri/renderD128)'), health.render_node) +
+                _hwDiagRow(grpLabel, health.in_render_grp) +
+                _hwDiagRow(t('Sterownik iHD_drv_video.so'), health.iHD_present) +
+                (health.status === 'ihd_init_failed' ? _hwDiagRow('LIBVA_DRIVER_NAME=ihd', health.libva_correct) : '') +
+                _hwDiagRow(t('Sterownik VAAPI aktywny'), health.driver_ok) +
+                _hwDiagRow(t('Aktywna akceleracja HW'), health.is_hw) +
+              '</div>' +
+              (stepsHtml ? '<div class="vs-hw-modal-steps">' + stepsHtml + '</div>' : '') +
+              '<div id="vs-hw-vainfo-result" class="vs-hw-vainfo-result" style="display:none"></div>' +
+            '</div>' +
+            '<div class="vs-hw-modal-footer">' +
+              (health.status !== 'ok' && health.status !== 'cpu_only' ?
+                '<button id="vs-hw-autoinstall-btn" class="app-btn app-btn-primary">' +
+                  '<i class="fas fa-magic"></i> ' + t('Zainstaluj automatycznie') +
+                '</button>' : '') +
+              '<button id="vs-hw-vainfo-btn" class="app-btn">' +
+                '<i class="fas fa-vial"></i> ' + t('Testuj ponownie') +
+              '</button>' +
+              '<button id="vs-hw-rescan-btn" class="app-btn">' +
+                '<i class="fas fa-sync-alt"></i> ' + t('Skanuj ponownie') +
+              '</button>' +
+              '<button class="vs-hw-modal-close-btn app-btn">' + t('Zamknij') + '</button>' +
+            '</div>' +
+            '<pre id="vs-hw-install-log" class="vs-hw-install-log" style="display:none"></pre>' +
+          '</div>';
+
+        body.appendChild(modal);
+
+        // Close handlers
+        const closeFn = () => modal.remove();
+        modal.querySelector('.vs-hw-modal-close').onclick = closeFn;
+        modal.querySelector('.vs-hw-modal-close-btn').onclick = closeFn;
+        modal.querySelector('.vs-hw-modal-backdrop').onclick = closeFn;
+
+        // Copy buttons
+        modal.querySelectorAll('.vs-hw-cmd-copy').forEach(btn => {
+            btn.onclick = () => {
+                navigator.clipboard.writeText(btn.dataset.cmd).then(() => {
+                    btn.innerHTML = '<i class="fas fa-check"></i>';
+                    setTimeout(() => { btn.innerHTML = '<i class="fas fa-copy"></i>'; }, 1500);
+                });
+            };
+        });
+
+        // Auto-install button
+        const autoBtn = modal.querySelector('#vs-hw-autoinstall-btn');
+        if (autoBtn) {
+            autoBtn.onclick = async () => {
+                const log = modal.querySelector('#vs-hw-install-log');
+                autoBtn.disabled = true;
+                autoBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> ' + t('Instaluję...');
+                log.style.display = 'block';
+                log.textContent = '';
+
+                try {
+                    const resp = await fetch('/api/video-station/hw-install', {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': 'Bearer ' + NAS.token,
+                            'X-CSRF-Token': NAS.csrfToken || '',
+                        }
+                    });
+                    const reader = resp.body.getReader();
+                    const decoder = new TextDecoder();
+                    let buffer = '';
+                    let finalData = null;
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        buffer += decoder.decode(value, { stream: true });
+                        const parts = buffer.split('\n\n');
+                        buffer = parts.pop();
+                        for (const part of parts) {
+                            if (!part.startsWith('data: ')) continue;
+                            try {
+                                const ev = JSON.parse(part.slice(6));
+                                if (ev.line) {
+                                    log.textContent += ev.line + '\n';
+                                    log.scrollTop = log.scrollHeight;
+                                }
+                                if (ev.done) finalData = ev;
+                            } catch(e) {}
+                        }
+                    }
+
+                    if (finalData && finalData.ok) {
+                        if (finalData.restart_required) {
+                            toast(t('Sterowniki zainstalowane — wymagany restart serwisu EthOS'), 'warning');
+                        } else {
+                            toast(t('Akceleracja sprzętowa aktywna!') + ' (' + (finalData.hw_encoder || '') + ')', 'success');
+                            modal.remove();
+                            body.querySelector('.vs-hw-banner')?.remove();
+                            _updateHwBadges(body, true);
+                        }
+                    } else {
+                        toast(t('Instalacja nie powiodła się — sprawdź log poniżej'), 'error');
+                        autoBtn.disabled = false;
+                        autoBtn.innerHTML = '<i class="fas fa-magic"></i> ' + t('Zainstaluj automatycznie');
+                    }
+                } catch(e) {
+                    toast(t('Błąd połączenia') + ': ' + e.message, 'error');
+                    autoBtn.disabled = false;
+                    autoBtn.innerHTML = '<i class="fas fa-magic"></i> ' + t('Zainstaluj automatycznie');
+                }
+            };
+        }
+
+        // Testuj ponownie — runs vainfo directly
+        modal.querySelector('#vs-hw-vainfo-btn').onclick = async () => {
+            const btn = modal.querySelector('#vs-hw-vainfo-btn');
+            const resultBox = modal.querySelector('#vs-hw-vainfo-result');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> ' + t('Testuję...');
+            resultBox.style.display = 'none';
+            try {
+                const res = await api('/video-station/vainfo-test');
+                if (res.ok) {
+                    const profileList = (res.profiles || []).slice(0, 8).map(p =>
+                        '<li>' + escH(p) + '</li>'
+                    ).join('');
+                    resultBox.className = 'vs-hw-vainfo-result vs-hw-vainfo-ok';
+                    resultBox.innerHTML =
+                        '<i class="fas fa-check-circle"></i> <strong>' + t('vainfo: OK') + '</strong>' +
+                        (profileList ? '<ul class="vs-hw-vainfo-profiles">' + profileList + '</ul>' : '');
+                    resultBox.style.display = 'block';
+                    toast(t('GPU działa prawidłowo — akceleracja Intel QuickSync aktywna'), 'success');
+                    body.querySelector('.vs-hw-banner')?.remove();
+                    _updateHwBadges(body, true);
+                } else {
+                    resultBox.className = 'vs-hw-vainfo-result vs-hw-vainfo-fail';
+                    resultBox.innerHTML =
+                        '<i class="fas fa-times-circle"></i> <strong>' + t('vainfo: błąd') + '</strong>' +
+                        (res.error ? '<div class="vs-hw-vainfo-err">' + escH(res.error) + '</div>' : '');
+                    resultBox.style.display = 'block';
+                }
+            } catch(e) {
+                toast(t('Błąd testu vainfo') + ': ' + e.message, 'error');
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-vial"></i> ' + t('Testuj ponownie');
+            }
+        };
+
+        // Rescan
+        modal.querySelector('#vs-hw-rescan-btn').onclick = async () => {
+            const btn = modal.querySelector('#vs-hw-rescan-btn');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> ' + t('Sprawdzam...');
+            try {
+                const fresh = await api('/video-station/hw-health');
+                modal.remove();
+                body.querySelector('.vs-hw-banner')?.remove();
+                if (fresh && fresh.is_hw) {
+                    toast(t('Akceleracja sprzętowa aktywna!') + ' (' + escH(fresh.hw_encoder) + ')', 'success');
+                    _updateHwBadges(body, true);
+                } else {
+                    _checkHwHealth(body);
+                    _openHwWizard(body, fresh || health);
+                }
+            } catch(e) {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-sync-alt"></i> ' + t('Skanuj ponownie');
+            }
+        };
+    }
+
+    /** Update all HW encoder badges in the current app window to reflect active/confirmed state. */
+    function _updateHwBadges(body, active) {
+        body.querySelectorAll('.vs-hw-badge').forEach(badge => {
+            badge.classList.remove('vs-hw-badge-sw', 'vs-hw-badge-hw', 'vs-hw-badge-active');
+            badge.classList.add(active ? 'vs-hw-badge-active' : 'vs-hw-badge-sw');
+            const icon = badge.querySelector('i');
+            if (icon) icon.className = active ? 'fas fa-bolt' : 'fas fa-exclamation-triangle';
+            const txt = badge.querySelector('span') || badge.lastChild;
+            if (txt && txt.nodeType === Node.TEXT_NODE) {
+                txt.textContent = active ? ' GPU (QuickSync)' : ' CPU';
+            }
+            if (active) {
+                badge.title = 'Intel QuickSync (iHD) — Aktywny';
+            } else {
+                badge.title = 'libx264 (CPU) — akceleracja GPU niedostępna';
+            }
+        });
+    }
+
+    /** Re-test GPU: resets encoder cache and probes H264/HEVC/VP9/AV1 via backend. */
+    async function _retestGpu(container) {
+        const btn = container.querySelector('#vs-gpu-retest-btn');
+        const badge = container.querySelector('#vs-hw-badge-encoder');
+        const pillsEl = container.querySelector('#vs-codec-pills');
+        if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> ' + t('Testuję GPU...'); }
+
+        try {
+            const res = await api('/video-station/gpu-retest', { method: 'POST' });
+            if (!res) throw new Error('Brak odpowiedzi');
+
+            // Update badge
+            if (badge) {
+                badge.classList.remove('vs-hw-badge-sw', 'vs-hw-badge-hw', 'vs-hw-badge-active');
+                if (res.ok && res.is_hw) {
+                    badge.classList.add('vs-hw-badge-active');
+                    badge.title = res.tooltip || 'Intel QuickSync (iHD) — Aktywny';
+                    badge.innerHTML = '<i class="fas fa-bolt"></i> GPU (' + escH(res.hw_encoder) + ')';
+                } else {
+                    const errIcon = res.error_code ? 'fa-exclamation-triangle' : 'fa-microchip';
+                    badge.classList.add('vs-hw-badge-sw');
+                    badge.title = res.tooltip || 'libx264 (CPU) — akceleracja GPU niedostępna';
+                    badge.innerHTML = '<i class="fas ' + errIcon + '"></i> CPU (libx264)';
+                }
+            }
+
+            // Codec pills
+            if (pillsEl && res.codecs) {
+                const codecList = [
+                    { key: 'h264', label: 'H.264' },
+                    { key: 'hevc', label: 'H.265/HEVC' },
+                    { key: 'vp9',  label: 'VP9' },
+                    { key: 'av1',  label: 'AV1' },
+                ];
+                pillsEl.innerHTML = codecList.map(c =>
+                    '<span class="vs-codec-pill ' + (res.codecs[c.key] ? 'vs-codec-pill-ok' : 'vs-codec-pill-fail') + '" ' +
+                    'title="' + c.label + ': ' + (res.codecs[c.key] ? t('obsługiwany przez GPU') : t('tylko CPU')) + '">' +
+                    '<i class="fas fa-' + (res.codecs[c.key] ? 'check' : 'times') + '"></i> ' + c.label +
+                    '</span>'
+                ).join('');
+            }
+
+            // Also update all player badges in the window
+            _updateHwBadges(bodyEl, res.ok && res.is_hw);
+
+            if (res.ok) {
+                toast(t('GPU aktywny!') + ' Intel QuickSync (iHD)', 'success');
+                bodyEl.querySelector('.vs-hw-banner')?.remove();
+            } else if (res.error_code === 'IHD_INIT_FAILED') {
+                toast(t('iHD init failed — sprawdź sterowniki i LIBVA_DRIVER_NAME'), 'error');
+                // Re-open wizard with fresh health data
+                const health = await api('/video-station/hw-health').catch(() => null);
+                if (health) _openHwWizard(bodyEl, health);
+            } else {
+                toast(t('GPU niedostępny') + (res.error_code ? ' (' + res.error_code + ')' : ''), 'warning');
+            }
+        } catch(e) {
+            toast(t('Błąd testu GPU') + ': ' + e.message, 'error');
+        } finally {
+            if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-vial"></i> ' + t('Re-test GPU'); }
+        }
+    }
+
+    function _hwDiagRow(label, ok) {
+        return '<div class="vs-hw-diag-row">' +
+            '<span>' + label + '</span>' +
+            '<span class="vs-hw-diag-' + (ok ? 'ok' : 'fail') + '">' +
+              '<i class="fas fa-' + (ok ? 'check-circle' : 'times-circle') + '"></i> ' +
+              (ok ? t('OK') : t('Brak')) +
+            '</span>' +
+        '</div>';
+    }
+
+
 
     /* ── section switching ─────────────────────────────────── */
     function switchSection(id) {
@@ -222,11 +617,14 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         if (!toolbar || !content) return;
 
         switch (id) {
+            case 'home':       toolbar.innerHTML = ''; loadHome(); break;
             case 'library':    renderLibraryToolbar(toolbar); loadLibrary(); break;
             case 'recent':     toolbar.innerHTML = '<div class="vs-toolbar-title">' + t('Ostatnio dodane') + '</div>'; loadRecent(); break;
+            case 'history':    toolbar.innerHTML = '<div class="vs-toolbar-title"><i class="fas fa-history"></i> ' + t('Historia oglądania') + '</div>'; loadHistory(); break;
             case 'collections': toolbar.innerHTML = '<div class="vs-toolbar-title">' + t('Kolekcje') + '</div>'; loadCollections(); break;
             case 'folders':    toolbar.innerHTML = '<div class="vs-toolbar-title">' + t('Foldery biblioteki') + '</div>'; loadFolders(); break;
             case 'hidden':     toolbar.innerHTML = '<div class="vs-toolbar-title"><i class="fas fa-eye-slash"></i> ' + t('Ukryte filmy') + '</div>'; loadHidden(); break;
+            case 'settings':   toolbar.innerHTML = '<div class="vs-toolbar-title"><i class="fas fa-sliders-h"></i> ' + t('Ustawienia') + '</div>'; loadSettingsSection(); break;
         }
         _exitSelectMode();
     }
@@ -261,22 +659,7 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
     '<option value="1"' + (currentWatched === '1' ? ' selected' : '') + '>' + t('Obejrzane') + '</option>' +
   '</select>' +
   '<button id="vs-select-toggle" class="app-btn app-btn-sm" title="' + t('Zaznaczanie') + '"><i class="fas fa-check-square"></i></button>' +
-'</div>' +
-'<div class="vs-toolbar-group">' +
-  '<div class="vs-scan-wrap" id="vs-scan-wrap">' +
-    '<label class="vs-tmdb-check" title="' + t('Rozpoznaj filmy przez TMDb') + '">' +
-      '<input type="checkbox" id="vs-tmdb-check"' + (useTmdb ? ' checked' : '') + '> ' +
-      '<i class="fas fa-magic"></i> TMDb' +
-    '</label>' +
-    '<button id="vs-scan-btn" class="app-btn app-btn-sm"><i class="fas fa-sync-alt"></i> ' + t('Skanuj') + '</button>' +
-    '<button id="vs-reindex-btn" class="app-btn app-btn-sm" title="' + t('Ponownie odczytaj metadane (kodeki, czas trwania) wszystkich filmów') + '"><i class="fas fa-database"></i> ' + t('Reindeksuj') + '</button>' +
-    '<button id="vs-match-all-btn" class="app-btn app-btn-sm" title="' + t('Dopasuj wszystkie nierozpoznane filmy do TMDb') + '"><i class="fas fa-wand-magic-sparkles"></i> ' + t('Dopasuj') + '</button>' +
-    '<div class="vs-scan-progress" id="vs-scan-bar" style="display:none">' +
-      '<div class="vs-prog-bar"><div class="vs-prog-fill" id="vs-scan-fill"></div></div>' +
-      '<span class="vs-scan-text" id="vs-scan-text"></span>' +
-      '<button id="vs-scan-stop" class="app-btn app-btn-sm" style="color:var(--danger)"><i class="fas fa-stop"></i></button>' +
-    '</div>' +
-  '</div>' +
+  '<button class="app-btn app-btn-sm" title="' + t('Ustawienia, skanowanie, TMDb') + '" id="vs-lib-settings-btn"><i class="fas fa-sliders-h"></i></button>' +
 '</div>';
 
         let searchTimer = null;
@@ -290,22 +673,8 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         bodyEl.querySelector('#vs-watched-filter').onchange = (e) => {
             currentWatched = e.target.value; libraryOffset = 0; loadLibrary();
         };
-        bodyEl.querySelector('#vs-scan-btn').onclick = startScan;
-        bodyEl.querySelector('#vs-scan-stop').onclick = stopScan;
-        bodyEl.querySelector('#vs-tmdb-check').onchange = (e) => { useTmdb = e.target.checked; };
-        bodyEl.querySelector('#vs-match-all-btn').onclick = matchAll;
         bodyEl.querySelector('#vs-select-toggle').onclick = _toggleSelectMode;
-        bodyEl.querySelector('#vs-reindex-btn').onclick = async () => {
-            const btn = bodyEl.querySelector('#vs-reindex-btn');
-            btn.disabled = true;
-            btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> ' + t('Reindeksacja...');
-            const res = await api('/video-station/rescan-metadata', { method: 'POST', body: { all: true } });
-            btn.disabled = false;
-            btn.innerHTML = '<i class="fas fa-database"></i> ' + t('Reindeksuj');
-            if (res.error) { toast(res.error, 'error'); return; }
-            toast(t('Zreindeksowano {n} z {t} filmów', { n: res.updated || 0, t: res.total || 0 }), 'success');
-            loadLibrary();
-        };
+        bodyEl.querySelector('#vs-lib-settings-btn').onclick = () => switchSection('settings');
 
         if (scanning) checkScanStatus();
     }
@@ -381,6 +750,113 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         });
     }
 
+    /* ── home (Netflix-style) ──────────────────────────────────── */
+    async function loadHome() {
+        const content = bodyEl.querySelector('#vs-content');
+        if (!content) return;
+        content.innerHTML = '<div class="vs-loading"><i class="fas fa-spinner fa-spin"></i></div>';
+        const data = await api('/video-station/home');
+        if (data.error) { content.innerHTML = '<div class="vs-empty">' + escH(data.error) + '</div>'; return; }
+
+        let html = '<div class="vs-home">';
+
+        // Hero banner
+        const hero = data.hero;
+        if (hero) {
+            const heroImg = hero.backdrop_ok
+                ? '/api/video-station/backdrop/' + hero.id + '?token=' + NAS.token
+                : (hero.poster_ok ? '/api/video-station/poster/' + hero.id + '?token=' + NAS.token : '');
+            const stars = hero.tmdb_rating ? '★ ' + hero.tmdb_rating.toFixed(1) : '';
+            const overview = (hero.tmdb_overview || '').slice(0, 220) + ((hero.tmdb_overview || '').length > 220 ? '…' : '');
+            html += '<div class="vs-hero" data-vid="' + hero.id + '">';
+            if (heroImg) html += '<div class="vs-hero-backdrop" style="background-image:url(' + heroImg + ')"></div>';
+            html += '<div class="vs-hero-grad"></div>';
+            html += '<div class="vs-hero-info">';
+            if (stars) html += '<div class="vs-hero-rating"><i class="fas fa-star"></i> ' + escH(stars.replace('★ ', '')) + '</div>';
+            html += '<h1 class="vs-hero-title">' + escH(hero.tmdb_title || hero.title) + '</h1>';
+            if (hero.tmdb_year) html += '<span class="vs-hero-year">' + escH(hero.tmdb_year) + '</span>';
+            if (_genreBadges(hero.tmdb_genres)) html += _genreBadges(hero.tmdb_genres);
+            if (overview) html += '<p class="vs-hero-overview">' + escH(overview) + '</p>';
+            html += '<div class="vs-hero-btns">';
+            html += '<button class="vs-hero-play" data-vid="' + hero.id + '"><i class="fas fa-play"></i> ' + t('Odtwórz') + '</button>';
+            html += '<button class="vs-hero-info-btn" data-vid="' + hero.id + '"><i class="fas fa-info-circle"></i> ' + t('Szczegóły') + '</button>';
+            html += '</div></div></div>';
+        }
+
+        // Rows
+        const rows = [];
+        if (data.continue_watching && data.continue_watching.length)
+            rows.push({ title: t('Oglądaj dalej'), items: data.continue_watching, cls: 'vs-row-continue' });
+        if (data.recently_added && data.recently_added.length)
+            rows.push({ title: t('Ostatnio dodane'), items: data.recently_added, cls: 'vs-row-recent' });
+        (data.genres || []).forEach(g => {
+            const name = _GENRE_MAP[g.genre_id] || t('Inne');
+            if (g.items && g.items.length)
+                rows.push({ title: name, items: g.items, cls: 'vs-row-genre' });
+        });
+
+        rows.forEach(row => {
+            html += '<div class="vs-row ' + row.cls + '">';
+            html += '<div class="vs-row-header"><h2 class="vs-row-title">' + escH(row.title) + '</h2>';
+            html += '<div class="vs-row-arrows"><button class="vs-row-prev"><i class="fas fa-chevron-left"></i></button>'
+                  + '<button class="vs-row-next"><i class="fas fa-chevron-right"></i></button></div></div>';
+            html += '<div class="vs-row-track">';
+            row.items.forEach(v => {
+                const img = v.poster_ok
+                    ? '/api/video-station/poster/' + v.id + '?token=' + NAS.token
+                    : (v.thumb_ok ? '/api/video-station/thumb/' + v.id + '?token=' + NAS.token : '');
+                const pct = v.duration > 0 ? Math.round(v.position / v.duration * 100) : 0;
+                const rating = v.tmdb_rating ? v.tmdb_rating.toFixed(1) : '';
+                const overview = (v.tmdb_overview || '').slice(0, 100) + ((v.tmdb_overview || '').length > 100 ? '…' : '');
+                html += '<div class="vs-row-card" data-vid="' + v.id + '">';
+                html += '<div class="vs-row-card-img">';
+                if (img) html += '<img src="' + img + '" loading="lazy" />';
+                else html += '<div class="vs-row-card-noimg"><i class="fas fa-film"></i></div>';
+                if (pct > 5 && pct < 95) html += '<div class="vs-row-progress"><div style="width:' + pct + '%"></div></div>';
+                html += '<div class="vs-row-card-hover">';
+                html += '<button class="vs-row-play-btn" data-vid="' + v.id + '"><i class="fas fa-play"></i></button>';
+                if (rating) html += '<div class="vs-row-hover-rating"><i class="fas fa-star"></i> ' + rating + '</div>';
+                if (overview) html += '<div class="vs-row-hover-overview">' + escH(overview) + '</div>';
+                html += _genreBadges(v.tmdb_genres);
+                html += '</div></div>';
+                html += '<div class="vs-row-card-title">' + escH(v.tmdb_title || v.title) + '</div>';
+                html += '</div>';
+            });
+            html += '</div></div>';
+        });
+
+        if (!hero && !rows.length) {
+            html += '<div class="vs-empty"><i class="fas fa-film"></i><p>' + t('Biblioteka jest pusta. Dodaj foldery i zeskanuj.') + '</p></div>';
+        }
+        html += '</div>';
+        content.innerHTML = html;
+
+        // Hero buttons
+        content.querySelectorAll('.vs-hero-play').forEach(btn =>
+            btn.onclick = () => openPlayer(parseInt(btn.dataset.vid)));
+        content.querySelectorAll('.vs-hero-info-btn').forEach(btn =>
+            btn.onclick = () => _showInfoModal(parseInt(btn.dataset.vid)));
+        content.querySelectorAll('.vs-hero').forEach(el =>
+            el.onclick = (e) => { if (e.target === el || el.querySelector('.vs-hero-backdrop') === e.target) openPlayer(parseInt(el.dataset.vid)); });
+
+        // Row cards
+        content.querySelectorAll('.vs-row-card').forEach(card => {
+            card.onclick = (e) => {
+                if (e.target.closest('.vs-row-play-btn')) return;
+                openPlayer(parseInt(card.dataset.vid));
+            };
+        });
+        content.querySelectorAll('.vs-row-play-btn').forEach(btn =>
+            btn.onclick = (e) => { e.stopPropagation(); openPlayer(parseInt(btn.dataset.vid)); });
+
+        // Scroll arrows
+        content.querySelectorAll('.vs-row').forEach(rowEl => {
+            const track = rowEl.querySelector('.vs-row-track');
+            rowEl.querySelector('.vs-row-prev').onclick = () => track.scrollBy({ left: -track.offsetWidth * 0.8, behavior: 'smooth' });
+            rowEl.querySelector('.vs-row-next').onclick = () => track.scrollBy({ left: track.offsetWidth * 0.8, behavior: 'smooth' });
+        });
+    }
+
     /* ── recent ────────────────────────────────────────────── */
     async function loadRecent() {
         const content = bodyEl.querySelector('#vs-content');
@@ -396,6 +872,45 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             return;
         }
         content.innerHTML = renderGrid(items);
+        attachGridEvents(content);
+    }
+
+    /* ── history ───────────────────────────────────────────── */
+    async function loadHistory() {
+        const content = bodyEl.querySelector('#vs-content');
+        if (!content) return;
+        content.innerHTML = '<div class="vs-loading"><i class="fas fa-spinner fa-spin"></i></div>';
+
+        const data = await api('/video-station/history?limit=40');
+        if (data.error) { content.innerHTML = '<div class="vs-empty">' + escH(data.error) + '</div>'; return; }
+
+        const items = data.items || [];
+        if (!items.length) {
+            content.innerHTML = '<div class="vs-empty"><i class="fas fa-history"></i><p>' + t('Brak historii oglądania') + '</p><p class="vs-empty-sub">' + t('Obejrzane filmy pojawią się tutaj') + '</p></div>';
+            return;
+        }
+
+        // Group by date
+        const groups = {};
+        const now = Date.now() / 1000;
+        items.forEach(v => {
+            const ts = v.last_watched_at || 0;
+            let label;
+            const diff = now - ts;
+            if (diff < 86400) label = t('Dzisiaj');
+            else if (diff < 172800) label = t('Wczoraj');
+            else if (diff < 604800) label = t('Ten tydzień');
+            else label = new Date(ts * 1000).toLocaleDateString('pl-PL', { month: 'long', year: 'numeric' });
+            if (!groups[label]) groups[label] = [];
+            groups[label].push(v);
+        });
+
+        let html = '';
+        Object.entries(groups).forEach(([label, grpItems]) => {
+            html += '<div class="vs-section-header"><i class="fas fa-calendar-alt"></i> ' + escH(label) + '</div>';
+            html += renderGrid(grpItems, true);
+        });
+        content.innerHTML = html;
         attachGridEvents(content);
     }
 
@@ -436,6 +951,168 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
                 switchSection('library');
             };
         });
+    }
+
+    /* ── settings section ──────────────────────────────────── */
+    async function loadSettingsSection() {
+        const content = bodyEl.querySelector('#vs-content');
+        if (!content) return;
+        content.innerHTML = '<div class="vs-loading"><i class="fas fa-spinner fa-spin"></i></div>';
+
+        const [tmdbConf, encInfo, watcherInfo, foldersData] = await Promise.all([
+            api('/video-station/tmdb-config'),
+            api('/video-station/hls/encoder-info'),
+            api('/video-station/watcher-status'),
+            api('/video-station/folders'),
+        ]);
+        const folders = (foldersData && foldersData.folders) || [];
+
+        content.innerHTML =
+'<div class="vs-settings-page">' +
+
+// ── TMDb ──
+'<div class="vs-settings-card">' +
+  '<div class="vs-settings-card-title"><i class="fas fa-magic"></i> TMDb — ' + t('rozpoznawanie filmów') + '</div>' +
+  '<p class="vs-settings-desc">' + t('Klucz API z') + ' <a href="https://www.themoviedb.org/settings/api" target="_blank" style="color:var(--accent)">themoviedb.org</a></p>' +
+  '<div class="vs-tmdb-key-row">' +
+    '<input type="text" id="vs-tmdb-key" class="vs-input" placeholder="' + t('Klucz API TMDb (v3)') + '">' +
+    '<button id="vs-tmdb-save" class="app-btn app-btn-sm app-btn-primary"><i class="fas fa-save"></i> ' + t('Zapisz') + '</button>' +
+  '</div>' +
+  '<div id="vs-tmdb-status" class="vs-tmdb-status" style="margin-top:8px">' +
+    (tmdbConf && tmdbConf.has_key
+      ? '<i class="fas fa-check-circle" style="color:var(--success)"></i> ' + t('Klucz aktywny') + ' (' + escH(tmdbConf.key_preview || '') + ')'
+      : '<i class="fas fa-exclamation-circle" style="color:var(--warning)"></i> ' + t('Brak klucza')) +
+  '</div>' +
+'</div>' +
+
+// ── Skanowanie ──
+'<div class="vs-settings-card">' +
+  '<div class="vs-settings-card-title"><i class="fas fa-sync-alt"></i> ' + t('Skanowanie biblioteki') + '</div>' +
+  '<div class="vs-settings-row">' +
+    '<label class="vs-tmdb-check" title="' + t('Rozpoznaj filmy przez TMDb podczas skanowania') + '">' +
+      '<input type="checkbox" id="vs-settings-tmdb-check"' + (useTmdb ? ' checked' : '') + '> ' +
+      '<i class="fas fa-magic"></i> ' + t('Użyj TMDb przy skanowaniu') +
+    '</label>' +
+  '</div>' +
+  '<div class="vs-settings-actions">' +
+    '<button id="vs-set-scan-btn" class="app-btn app-btn-primary"><i class="fas fa-sync-alt"></i> ' + t('Skanuj foldery') + '</button>' +
+    '<button id="vs-set-reindex-btn" class="app-btn"><i class="fas fa-database"></i> ' + t('Reindeksuj metadane') + '</button>' +
+    '<button id="vs-set-match-btn" class="app-btn"><i class="fas fa-wand-magic-sparkles"></i> ' + t('Dopasuj wszystko do TMDb') + '</button>' +
+  '</div>' +
+  '<div class="vs-scan-progress" id="vs-set-scan-bar" style="display:none">' +
+    '<div class="vs-prog-bar"><div class="vs-prog-fill" id="vs-set-scan-fill"></div></div>' +
+    '<span class="vs-scan-text" id="vs-set-scan-text"></span>' +
+    '<button id="vs-set-scan-stop" class="app-btn app-btn-sm" style="color:var(--danger)"><i class="fas fa-stop"></i></button>' +
+  '</div>' +
+'</div>' +
+
+// ── Enkoder ──
+'<div class="vs-settings-card">' +
+  '<div class="vs-settings-card-title"><i class="fas fa-microchip"></i> ' + t('Transkodowanie wideo') + '</div>' +
+  '<div id="vs-hw-badge-encoder" class="vs-hw-badge ' +
+       (encInfo && encInfo.type === 'hw' ? 'vs-hw-badge-hw' : 'vs-hw-badge-sw') + '" ' +
+       'title="' + escH(encInfo && encInfo.tooltip ? encInfo.tooltip : (encInfo && encInfo.type === 'hw' ? 'Intel QuickSync (iHD) — Aktywny' : 'libx264 (CPU) — akceleracja GPU niedostępna')) + '">' +
+    '<i class="fas fa-' + (encInfo && encInfo.type === 'hw' ? 'bolt' : (encInfo ? 'exclamation-triangle' : 'microchip')) + '"></i> ' +
+    escH(encInfo && encInfo.label ? encInfo.label : 'libx264 (CPU)') +
+  '</div>' +
+  '<div id="vs-codec-pills" class="vs-codec-pills"></div>' +
+  '<div class="vs-settings-actions" style="margin-top:10px">' +
+    '<button id="vs-gpu-retest-btn" class="app-btn"><i class="fas fa-vial"></i> ' + t('Re-test GPU') + '</button>' +
+  '</div>' +
+  '<p class="vs-settings-desc">' + t('Akceleracja sprzętowa wykrywana automatycznie przy starcie serwera.') + '</p>' +
+  '<p class="vs-settings-desc"><i class="fas fa-info-circle"></i> ' + t('Limit jednoczesnych sesji') + ': <strong>3</strong>. ' + t('Starsze sesje są automatycznie zamykane.') + '</p>' +
+'</div>' +
+
+// ── Foldery z rescan ──
+'<div class="vs-settings-card">' +
+  '<div class="vs-settings-card-title"><i class="fas fa-folder"></i> ' + t('Foldery biblioteki — rescan') + '</div>' +
+  '<p class="vs-settings-desc">' + t('Kliknij "Skanuj folder", aby zaktualizować zawartość wybranego folderu.') + '</p>' +
+  '<div id="vs-folder-rescan-list">' +
+  (folders.length ? folders.map((f, i) =>
+    '<div class="vs-folder-rescan-row">' +
+      '<span class="vs-folder-rescan-path">' + escH(f) + '</span>' +
+      '<button class="app-btn app-btn-sm vs-folder-rescan-btn" data-folder="' + escH(f) + '" data-idx="' + i + '">' +
+        '<i class="fas fa-sync-alt"></i> ' + t('Skanuj folder') +
+      '</button>' +
+    '</div>'
+  ).join('') : '<p class="vs-settings-desc">' + t('Brak skonfigurowanych folderów.') + '</p>') +
+  '</div>' +
+'</div>' +
+
+// ── File Watcher ──
+'<div class="vs-settings-card">' +
+  '<div class="vs-settings-card-title"><i class="fas fa-eye"></i> ' + t('Automatyczne wykrywanie nowych filmów') + '</div>' +
+  '<div class="vs-hw-badge ' + (watcherInfo && watcherInfo.ok ? 'vs-hw-badge-hw' : 'vs-hw-badge-sw') + '">' +
+    '<i class="fas fa-' + (watcherInfo && watcherInfo.ok ? 'check-circle' : 'times-circle') + '"></i> ' +
+    (watcherInfo && watcherInfo.ok ? t('Watcher aktywny') + ' (' + (watcherInfo.watched || []).length + ' ' + t('folderów') + ')' : t('Nieaktywny')) +
+  '</div>' +
+  '<p class="vs-settings-desc">' + t('Foldery sprawdzane co 60 sekund. Nowe pliki są dodawane automatycznie do biblioteki.') + '</p>' +
+'</div>' +
+
+'</div>';
+
+        // TMDb save
+        content.querySelector('#vs-tmdb-save').onclick = async () => {
+            const key = content.querySelector('#vs-tmdb-key').value.trim();
+            if (!key) { toast(t('Podaj klucz API'), 'warning'); return; }
+            const res = await api('/video-station/tmdb-config', { method: 'POST', body: { api_key: key } });
+            if (res.error) { toast(res.error, 'error'); return; }
+            toast(t('Klucz TMDb zapisany!'), 'success');
+            content.querySelector('#vs-tmdb-key').value = '';
+            content.querySelector('#vs-tmdb-status').innerHTML =
+                '<i class="fas fa-check-circle" style="color:var(--success)"></i> ' + t('Klucz aktywny');
+        };
+        content.querySelector('#vs-settings-tmdb-check').onchange = (e) => { useTmdb = e.target.checked; };
+
+        // Scan
+        content.querySelector('#vs-set-scan-btn').onclick = () => _settingsScan(content);
+        content.querySelector('#vs-set-scan-stop').onclick = stopScan;
+        content.querySelector('#vs-set-reindex-btn').onclick = async () => {
+            const btn = content.querySelector('#vs-set-reindex-btn');
+            btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> ' + t('Reindeksowanie...');
+            const res = await api('/video-station/rescan-metadata', { method: 'POST' });
+            btn.disabled = false; btn.innerHTML = '<i class="fas fa-database"></i> ' + t('Reindeksuj metadane');
+            if (res.error) { toast(res.error, 'error'); return; }
+            toast(t('Odświeżono metadane dla {n} filmów', { n: res.updated || 0 }), 'success');
+        };
+        content.querySelector('#vs-set-match-btn').onclick = async () => {
+            const btn = content.querySelector('#vs-set-match-btn');
+            btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> ' + t('Dopasowuję...');
+            const res = await api('/video-station/tmdb-match-all', { method: 'POST' });
+            btn.disabled = false; btn.innerHTML = '<i class="fas fa-wand-magic-sparkles"></i> ' + t('Dopasuj wszystko do TMDb');
+            if (res.error) { toast(res.error, 'error'); return; }
+            toast(t('Dopasowano {n} filmów', { n: res.matched || 0 }), 'success');
+        };
+
+        // Re-test GPU
+        content.querySelector('#vs-gpu-retest-btn').onclick = () => _retestGpu(content);
+
+        // Per-folder rescan buttons
+        content.querySelectorAll('.vs-folder-rescan-btn').forEach(btn => {
+            btn.onclick = async () => {
+                const folder = btn.dataset.folder;
+                btn.disabled = true;
+                btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> ' + t('Skanuję...');
+                const res = await api('/video-station/scan-folder', { method: 'POST', body: { folder, use_tmdb: useTmdb } });
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fas fa-sync-alt"></i> ' + t('Skanuj folder');
+                if (res.error) { toast(res.error, 'error'); return; }
+                toast(t('Skanowanie folderu rozpoczęte w tle'), 'success');
+            };
+        });
+    }
+
+    async function _settingsScan(content) {
+        const bar = content.querySelector('#vs-set-scan-bar');
+        const fill = content.querySelector('#vs-set-scan-fill');
+        const text = content.querySelector('#vs-set-scan-text');
+        if (!bar) { startScan(); return; }
+        bar.style.display = '';
+        fill.style.width = '0%';
+        text.textContent = t('Skanowanie...');
+        const res = await api('/video-station/scan', { method: 'POST', body: { use_tmdb: useTmdb } });
+        if (res.error) { toast(res.error, 'error'); bar.style.display = 'none'; return; }
+        // progress via socket
     }
 
     /* ── folders settings ──────────────────────────────────── */
@@ -593,7 +1270,23 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
     }
 
     /* ── grid rendering ────────────────────────────────────── */
-    function renderGrid(items) {
+    const _GENRE_MAP = {
+        28:'Akcja',12:'Przygodowy',16:'Animacja',35:'Komedia',80:'Kryminał',
+        99:'Dok.',18:'Dramat',10751:'Familijny',14:'Fantasy',36:'Historyczny',
+        27:'Horror',10402:'Muzyczny',9648:'Tajemnica',10749:'Romans',878:'Sci-Fi',
+        53:'Thriller',10752:'Wojenny',37:'Western',10759:'Akcja i Przygoda',
+        10762:'Dla dzieci',10763:'Informacyjny',10764:'Reality',10765:'Sci-Fi & Fantasy',
+        10766:'Telenowela',10767:'Talk-show',10768:'Wojenny i Polityczny',
+    };
+    function _genreBadges(tmdbGenres) {
+        if (!tmdbGenres) return '';
+        const ids = tmdbGenres.split(',');
+        const names = ids.slice(0, 2).map(id => _GENRE_MAP[parseInt(id.trim())] || '').filter(Boolean);
+        if (!names.length) return '';
+        return '<div class="vs-genre-badges">' + names.map(n => '<span class="vs-genre-badge">' + escH(n) + '</span>').join('') + '</div>';
+    }
+
+    function renderGrid(items, showWatched) {
         let html = '<div class="vs-grid' + (selectMode ? ' vs-select-mode' : '') + '">';
         items.forEach(v => {
             const dur = formatDuration(v.duration);
@@ -601,7 +1294,7 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             const res = v.height ? (v.height >= 2160 ? '4K' : v.height >= 1080 ? '1080p' : v.height >= 720 ? '720p' : v.height + 'p') : '';
             const codec = v.codec || '';
             const size = v.file_size ? formatBytes(v.file_size) : '';
-            const meta = [res, codec, size].filter(Boolean).join(' \u00b7 ');
+            const meta = [v.tmdb_year || '', res, codec].filter(Boolean).join(' · ');
             const hasPoster = v.poster_ok;
             const imgSrc = hasPoster
                 ? '/api/video-station/poster/' + v.id + '?token=' + NAS.token
@@ -619,9 +1312,11 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
     (rating ? '<span class="vs-rating"><i class="fas fa-star"></i> ' + rating + '</span>' : '') +
     (pct > 0 && !v.watched ? '<div class="vs-progress" style="width:' + pct + '%"></div>' : '') +
     (v.watched ? '<span class="vs-watched"><i class="fas fa-check-circle"></i></span>' : '') +
+    '<div class="vs-card-hover-play"><i class="fas fa-play"></i></div>' +
   '</div>' +
   '<div class="vs-title" title="' + escH(v.title || v.filename || '') + '">' + escH(v.title || v.filename || '') + '</div>' +
   (meta ? '<div class="vs-meta">' + escH(meta) + '</div>' : '') +
+  _genreBadges(v.tmdb_genres) +
 '</div>';
         });
         html += '</div>';
@@ -649,6 +1344,8 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         const isHiddenSection = (activeSection === 'hidden');
         let items =
             '<div class="vs-ctx-item" data-action="select"><i class="fas fa-check-square"></i> ' + t('Zaznacz') + '</div>' +
+            '<div class="vs-ctx-item" data-action="rename"><i class="fas fa-pen"></i> ' + t('Zmień nazwę') + '</div>' +
+            '<div class="vs-ctx-item" data-action="tmdb"><i class="fas fa-wand-magic-sparkles"></i> ' + t('Pobierz z TMDb…') + '</div>' +
             '<div class="vs-ctx-item" data-action="unwatch"><i class="fas fa-eye-slash"></i> ' + t('Oznacz jako nieobejrzane') + '</div>' +
             '<div class="vs-ctx-item" data-action="info"><i class="fas fa-info-circle"></i> ' + t('Szczegóły') + '</div>';
         if (isHiddenSection) {
@@ -671,6 +1368,10 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
                     if (!selectMode) _enterSelectMode();
                     selectedIds.add(String(vid));
                     _refreshGrid();
+                } else if (action === 'rename') {
+                    _showRenameDialog(vid);
+                } else if (action === 'tmdb') {
+                    _showTmdbSearchDialog(vid);
                 } else if (action === 'unwatch') {
                     await api('/video-station/watched/' + vid, { method: 'POST', body: { watched: false, position: 0 } });
                     toast(t('Oznaczono jako nieobejrzane'), 'success');
@@ -764,7 +1465,11 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         html += '</div>';
 
         // Play button
+        html += '<div class="vs-info-actions">';
         html += '<button class="vs-info-play" id="vs-info-play"><i class="fas fa-play"></i> ' + t('Odtwórz') + '</button>';
+        html += '<button class="vs-info-tmdb-btn" id="vs-info-tmdb"><i class="fas fa-wand-magic-sparkles"></i> ' + t('Pobierz z TMDb') + '</button>';
+        html += '<button class="vs-info-rename-btn" id="vs-info-rename"><i class="fas fa-pen"></i> ' + t('Zmień nazwę') + '</button>';
+        html += '</div>';
 
         html += '</div></div></div>';
 
@@ -773,8 +1478,119 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 
         modal.querySelector('#vs-info-close').onclick = () => { modal.style.display = 'none'; };
         modal.querySelector('#vs-info-play').onclick = () => { modal.style.display = 'none'; openPlayer(vid); };
+        modal.querySelector('#vs-info-tmdb').onclick = () => { modal.style.display = 'none'; _showTmdbSearchDialog(vid); };
+        modal.querySelector('#vs-info-rename').onclick = () => { modal.style.display = 'none'; _showRenameDialog(vid); };
         modal.onclick = (e) => { if (e.target === modal) modal.style.display = 'none'; };
     }
+
+    /* ── rename dialog ─────────────────────────────────────────── */
+    function _showRenameDialog(vid) {
+        const item = libraryItems.find(i => String(i.id) === String(vid));
+        const currentName = item ? item.filename : '';
+        const overlay = document.createElement('div');
+        overlay.className = 'vs-modal-overlay vs-rename-overlay';
+        overlay.innerHTML =
+            '<div class="vs-rename-dialog">' +
+            '<div class="vs-rename-header"><span>' + t('Zmień nazwę pliku') + '</span>' +
+            '<button class="vs-rename-close"><i class="fas fa-times"></i></button></div>' +
+            '<div class="vs-rename-body">' +
+            '<label class="vs-rename-label">' + t('Nowa nazwa pliku') + '</label>' +
+            '<input class="vs-rename-input" id="vs-rename-input" type="text" value="' + (currentName || '').replace(/"/g, '&quot;') + '" />' +
+            '<p class="vs-rename-hint">' + t('Rozszerzenie zostanie zachowane automatycznie') + '</p>' +
+            '</div>' +
+            '<div class="vs-rename-footer">' +
+            '<button class="vs-btn-secondary vs-rename-cancel">' + t('Anuluj') + '</button>' +
+            '<button class="vs-btn-primary vs-rename-confirm"><i class="fas fa-check"></i> ' + t('Zmień nazwę') + '</button>' +
+            '</div></div>';
+        document.body.appendChild(overlay);
+        const input = overlay.querySelector('#vs-rename-input');
+        const extIdx = currentName ? currentName.lastIndexOf('.') : -1;
+        input.focus();
+        if (extIdx > 0) input.setSelectionRange(0, extIdx);
+
+        overlay.querySelector('.vs-rename-close').onclick = () => overlay.remove();
+        overlay.querySelector('.vs-rename-cancel').onclick = () => overlay.remove();
+        overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+        overlay.querySelector('.vs-rename-confirm').onclick = async () => {
+            const newName = input.value.trim();
+            if (!newName) return;
+            try {
+                const res = await api('/video-station/rename/' + vid, { method: 'POST', body: JSON.stringify({ name: newName }) });
+                if (res.error) { toast(res.error, 'error'); return; }
+                toast(t('Zmieniono nazwę na: ') + res.filename, 'success');
+                overlay.remove();
+                _reloadSection();
+            } catch (e) { toast(t('Błąd zmiany nazwy'), 'error'); }
+        };
+    }
+
+    /* ── TMDb search dialog ─────────────────────────────────────── */
+    function _showTmdbSearchDialog(vid) {
+        const item = libraryItems.find(i => String(i.id) === String(vid));
+        const initialQuery = item ? (item.title || item.filename || '').replace(/\.[^.]+$/, '') : '';
+        const overlay = document.createElement('div');
+        overlay.className = 'vs-modal-overlay vs-tmdb-overlay';
+        overlay.innerHTML =
+            '<div class="vs-tmdb-dialog">' +
+            '<div class="vs-tmdb-header"><span><i class="fas fa-wand-magic-sparkles"></i> ' + t('Wyszukaj w TMDb') + '</span>' +
+            '<button class="vs-tmdb-close"><i class="fas fa-times"></i></button></div>' +
+            '<div class="vs-tmdb-search-row">' +
+            '<input class="vs-tmdb-search-input" id="vs-tmdb-q" type="text" placeholder="' + t('Tytuł filmu lub serialu…') + '" value="' + initialQuery.replace(/"/g, '&quot;') + '" />' +
+            '<button class="vs-btn-primary vs-tmdb-search-btn" id="vs-tmdb-search-btn"><i class="fas fa-search"></i> ' + t('Szukaj') + '</button>' +
+            '</div>' +
+            '<div class="vs-tmdb-results" id="vs-tmdb-results"><p class="vs-tmdb-hint">' + t('Wpisz tytuł i kliknij Szukaj') + '</p></div>' +
+            '</div>';
+        document.body.appendChild(overlay);
+        overlay.querySelector('.vs-tmdb-close').onclick = () => overlay.remove();
+        overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+
+        const doSearch = async () => {
+            const q = overlay.querySelector('#vs-tmdb-q').value.trim();
+            if (!q) return;
+            const resultsEl = overlay.querySelector('#vs-tmdb-results');
+            resultsEl.innerHTML = '<p class="vs-tmdb-hint"><i class="fas fa-spinner fa-spin"></i> ' + t('Szukam…') + '</p>';
+            try {
+                const res = await api('/video-station/tmdb-search-list?q=' + encodeURIComponent(q));
+                if (res.error) { resultsEl.innerHTML = '<p class="vs-tmdb-hint vs-tmdb-error">' + res.error + '</p>'; return; }
+                if (!res.results || !res.results.length) { resultsEl.innerHTML = '<p class="vs-tmdb-hint">' + t('Brak wyników') + '</p>'; return; }
+                resultsEl.innerHTML = res.results.map(r => {
+                    const poster = r.poster_path ? 'https://image.tmdb.org/t/p/w92' + r.poster_path : '';
+                    const year = (r.release_date || r.first_air_date || '').slice(0, 4);
+                    const badge = r.media_type === 'tv'
+                        ? '<span class="vs-tmdb-type-badge vs-tmdb-tv">TV</span>'
+                        : '<span class="vs-tmdb-type-badge vs-tmdb-movie">Film</span>';
+                    return '<div class="vs-tmdb-result" data-id="' + r.id + '" data-type="' + r.media_type + '">' +
+                        (poster ? '<img class="vs-tmdb-poster" src="' + poster + '" loading="lazy" />'
+                                : '<div class="vs-tmdb-poster vs-tmdb-no-poster"><i class="fas fa-film"></i></div>') +
+                        '<div class="vs-tmdb-result-info">' +
+                        '<div class="vs-tmdb-result-title">' + (r.title || r.name || '') + ' ' + badge + '</div>' +
+                        '<div class="vs-tmdb-result-year">' + (year || '') + '</div>' +
+                        '<div class="vs-tmdb-result-overview">' + (r.overview || '').slice(0, 120) + ((r.overview || '').length > 120 ? '…' : '') + '</div>' +
+                        '</div></div>';
+                }).join('');
+                resultsEl.querySelectorAll('.vs-tmdb-result').forEach(el => {
+                    el.onclick = async () => {
+                        el.style.opacity = '0.5';
+                        try {
+                            const r2 = await api('/video-station/tmdb-apply/' + vid, {
+                                method: 'POST',
+                                body: JSON.stringify({ tmdb_id: el.dataset.id, type: el.dataset.type })
+                            });
+                            if (r2.error) { toast(r2.error, 'error'); el.style.opacity = ''; return; }
+                            toast(t('Metadane zaktualizowane!'), 'success');
+                            overlay.remove();
+                            _reloadSection();
+                        } catch(e) { toast(t('Błąd aktualizacji metadanych'), 'error'); el.style.opacity = ''; }
+                    };
+                });
+            } catch(e) { resultsEl.innerHTML = '<p class="vs-tmdb-hint vs-tmdb-error">' + t('Błąd wyszukiwania') + '</p>'; }
+        };
+
+        overlay.querySelector('#vs-tmdb-search-btn').onclick = doSearch;
+        overlay.querySelector('#vs-tmdb-q').onkeydown = (e) => { if (e.key === 'Enter') doSearch(); };
+        if (initialQuery) doSearch();
+    }
+
 
     /* ── multi-select ──────────────────────────────────────── */
     function _toggleSelectMode() {
@@ -919,6 +1735,7 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
     function _reloadSection() {
         if (activeSection === 'library') loadLibrary();
         else if (activeSection === 'recent') loadRecent();
+        else if (activeSection === 'history') loadHistory();
         else if (activeSection === 'collections') loadCollections();
         else if (activeSection === 'hidden') loadHidden();
     }
@@ -1085,6 +1902,7 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
     let _hlsInstance = null;
     let _knownDuration = 0;
     let _startOffset = 0;
+    let _heartbeatTimer = null;
 
     function _buildStreamUrl(vid) {
         return '/api/video-station/stream/' + vid + '?token=' + NAS.token;
@@ -1100,6 +1918,115 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             s.onerror = reject;
             document.head.appendChild(s);
         });
+    }
+
+    /** Thumbstrip seek preview using VTT sprite from backend */
+    let _thumbVtt = null;
+    let _thumbImg = null;
+    let _thumbVid = null;
+
+    async function _initThumbstrip(vid, videoEl, duration) {
+        const preview = bodyEl.querySelector('#vs-thumbstrip-preview');
+        const canvas = bodyEl.querySelector('#vs-thumbstrip-canvas');
+        const timeEl = bodyEl.querySelector('#vs-thumbstrip-time');
+        if (!preview || !canvas || !videoEl) return;
+
+        _thumbVtt = null;
+        _thumbImg = null;
+        _thumbVid = vid;
+
+        // Load VTT metadata
+        try {
+            const vttUrl = '/api/video-station/thumbstrip/' + vid + '?token=' + NAS.token;
+            const resp = await fetch(vttUrl);
+            if (!resp.ok) return; // 202 = not ready yet
+            const vttText = await resp.text();
+            _thumbVtt = _parseVtt(vttText, vttUrl);
+            // Load sprite image
+            if (_thumbVtt && _thumbVtt.length > 0 && _thumbVtt[0].imgUrl) {
+                _thumbImg = new Image();
+                _thumbImg.src = _thumbVtt[0].imgUrl + '?token=' + NAS.token;
+            }
+        } catch (_) { return; }
+
+        // Seek-bar preview: listen on progress bar mousemove
+        const seekBar = videoEl.parentElement ? videoEl.parentElement.querySelector('input[type=range]') : null;
+        // Since we use native controls, hook into mousemove on the overlay bottom area
+        const overlay = bodyEl.querySelector('#vs-player-overlay');
+        if (!overlay) return;
+
+        overlay.addEventListener('mousemove', _onSeekHover);
+
+        function _onSeekHover(e) {
+            if (!_thumbVtt || !_thumbImg || !_thumbImg.complete || _thumbVid !== vid) return;
+            const rect = overlay.getBoundingClientRect();
+            const relY = e.clientY - rect.top;
+            // Only show preview when mouse is in bottom 60px (near seek bar)
+            if (relY < rect.height - 80 || relY > rect.height - 10) {
+                preview.style.display = 'none'; return;
+            }
+            const relX = e.clientX - rect.left;
+            const fraction = Math.max(0, Math.min(1, relX / rect.width));
+            const seekTime = fraction * duration;
+            const entry = _thumbVtt.find(t => seekTime >= t.start && seekTime <= t.end)
+                || _thumbVtt[0];
+            if (!entry) { preview.style.display = 'none'; return; }
+
+            const ctx = canvas.getContext('2d');
+            canvas.width = entry.w || 160;
+            canvas.height = entry.h || 90;
+            try {
+                ctx.drawImage(_thumbImg, entry.x || 0, entry.y || 0, entry.w || 160, entry.h || 90, 0, 0, canvas.width, canvas.height);
+            } catch (_) { preview.style.display = 'none'; return; }
+
+            timeEl.textContent = formatDuration(seekTime);
+            const px = Math.max(80, Math.min(rect.width - 80, e.clientX - rect.left));
+            preview.style.left = (px - canvas.width / 2) + 'px';
+            preview.style.bottom = '70px';
+            preview.style.display = 'flex';
+        }
+
+        overlay._tsCleanup = () => overlay.removeEventListener('mousemove', _onSeekHover);
+        // Hide when mouse leaves bottom area
+        overlay.addEventListener('mouseleave', () => { preview.style.display = 'none'; });
+    }
+
+    function _parseVtt(text, baseUrl) {
+        const lines = text.split('\n');
+        const entries = [];
+        const base = baseUrl.replace(/[^/]*$/, '');
+        let i = 0;
+        while (i < lines.length) {
+            const line = lines[i].trim();
+            if (line.includes('-->')) {
+                const [startStr, endStr] = line.split('-->').map(s => s.trim());
+                const start = _vttTime(startStr);
+                const end = _vttTime(endStr);
+                const imgLine = (lines[i + 1] || '').trim();
+                if (imgLine) {
+                    const hashIdx = imgLine.indexOf('#xywh=');
+                    let imgUrl, x = 0, y = 0, w = 160, h = 90;
+                    if (hashIdx !== -1) {
+                        imgUrl = imgLine.slice(0, hashIdx);
+                        const parts = imgLine.slice(hashIdx + 6).split(',').map(Number);
+                        [x, y, w, h] = parts;
+                    } else {
+                        imgUrl = imgLine;
+                    }
+                    if (!imgUrl.startsWith('http') && !imgUrl.startsWith('/')) imgUrl = base + imgUrl;
+                    entries.push({ start, end, imgUrl, x, y, w, h });
+                }
+                i += 2;
+            } else { i++; }
+        }
+        return entries;
+    }
+
+    function _vttTime(s) {
+        const parts = s.replace(',', '.').split(':').map(Number);
+        if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+        if (parts.length === 2) return parts[0] * 60 + parts[1];
+        return parts[0];
     }
 
     async function openPlayer(vid) {
@@ -1126,6 +2053,38 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 
         title.textContent = info.title || info.filename || '';
         badge.style.display = needsTranscode ? '' : 'none';
+
+        // Backdrop blur background on player overlay
+        if (info.backdrop_ok) {
+            overlay.style.backgroundImage = 'url(/api/video-station/backdrop/' + vid + '?token=' + NAS.token + ')';
+            overlay.style.backgroundSize = 'cover';
+            overlay.style.backgroundPosition = 'center';
+            overlay.classList.add('vs-player-has-backdrop');
+        } else {
+            overlay.style.backgroundImage = '';
+            overlay.style.backgroundSize = '';
+            overlay.classList.remove('vs-player-has-backdrop');
+        }
+
+        // RemotePlayback / Cast button
+        const castBtn = bodyEl.querySelector('#vs-cast-btn');
+        if (castBtn) {
+            const streamUrl = _buildStreamUrl(vid);
+            if ('remote' in HTMLVideoElement.prototype || video.remote) {
+                castBtn.style.display = '';
+                castBtn.onclick = () => {
+                    video.remote.prompt().catch(() => {});
+                };
+                video.remote.addEventListener('connecting', () => { castBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>'; });
+                video.remote.addEventListener('connect', () => { castBtn.innerHTML = '<i class="fas fa-tv" style="color:#1db954"></i>'; castBtn.title = t('Casting aktywny'); });
+                video.remote.addEventListener('disconnect', () => { castBtn.innerHTML = '<i class="fas fa-tv"></i>'; castBtn.title = t('Cast na TV'); });
+            } else {
+                castBtn.style.display = 'none';
+            }
+        }
+
+        // Thumbstrip seek preview
+        _initThumbstrip(vid, video, info.duration || 0);
 
         // Playback speed
         if (speedSel) {
@@ -1187,10 +2146,6 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 
         _loadSubtitles(vid, video);
 
-        // Preload thumbstrip sprite for future use
-        const _spriteImg = new Image();
-        _spriteImg.src = '/api/video-station/thumbstrip/' + vid + '?token=' + NAS.token;
-
         // HLS live-mode: intercept native seekbar drags beyond buffer
         if (needsTranscode) {
             video.onseeking = () => {
@@ -1239,19 +2194,121 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             }
         };
 
-        // keyboard shortcuts
+        // keyboard shortcuts (J=-10s, K=play/pause, L=+10s like YouTube)
         overlay._keyHandler = (e) => {
             if (e.key === ' ' || e.code === 'Space') { e.preventDefault(); video.paused ? video.play() : video.pause(); }
             else if (e.key === 'f') { toggleFullscreen(overlay); }
             else if (e.key === 'p') { togglePiP(video); }
             else if (e.key === 'Escape') { closePlayer(); }
-            else if (e.key === 'ArrowLeft') { seekPlayer(video, -10); }
-            else if (e.key === 'ArrowRight') { seekPlayer(video, 10); }
+            else if (e.key === 'ArrowLeft' || e.key === 'j' || e.key === 'J') { seekPlayer(video, -10); }
+            else if (e.key === 'ArrowRight' || e.key === 'l' || e.key === 'L') { seekPlayer(video, 10); }
+            else if (e.key === 'k' || e.key === 'K') { video.paused ? video.play() : video.pause(); }
             else if (e.key === 'ArrowUp') { e.preventDefault(); video.volume = Math.min(1, video.volume + 0.1); }
             else if (e.key === 'ArrowDown') { e.preventDefault(); video.volume = Math.max(0, video.volume - 0.1); }
             else if (e.key === 'm') { video.muted = !video.muted; }
         };
         document.addEventListener('keydown', overlay._keyHandler);
+
+        // Stats overlay
+        const statsBtn = bodyEl.querySelector('#vs-stats-btn');
+        const statsOverlay = bodyEl.querySelector('#vs-stats-overlay');
+        if (statsBtn && statsOverlay) {
+            statsBtn.onclick = async () => {
+                const visible = statsOverlay.style.display !== 'none';
+                if (visible) { statsOverlay.style.display = 'none'; return; }
+                const enc = await api('/video-station/hls/encoder-info').catch(() => null);
+                const isSw = !enc || enc.type !== 'hw';
+                const isIhd = enc && enc.type === 'hw' && enc.tooltip && enc.tooltip.includes('iHD');
+                const hwTooltip = enc && enc.tooltip ? enc.tooltip
+                    : (isIhd ? 'Intel QuickSync (iHD) — Aktywny' : (enc && enc.type === 'hw' ? 'Akceleracja GPU' : ''));
+                const swTip = isSw
+                    ? '<div class="vs-stats-hw-tip"><i class="fas fa-lightbulb"></i> ' +
+                      t('Używasz') + ' <strong>libx264 (CPU)</strong>. ' +
+                      t('Zainstaluj sterowniki VAAPI, aby odciążyć procesor i wydłużyć żywotność NucBoxa.') +
+                      ' <a class="vs-stats-hw-link" href="#" id="vs-stats-hw-setup">' + t('Jak naprawić?') + '</a></div>'
+                    : '';
+                statsOverlay.innerHTML =
+                    '<div class="vs-stats-row"><span>' + t('Enkoder') + '</span><span>' +
+                    escH(enc && enc.label ? enc.label : '—') + '</span></div>' +
+                    '<div class="vs-stats-row"><span>' + t('Typ') + '</span>' +
+                    '<span title="' + escH(hwTooltip) + '">' +
+                    (enc && enc.type === 'hw'
+                        ? '<i class="fas fa-bolt" style="color:var(--success)"></i> Intel QuickSync (iHD)'
+                        : '<i class="fas fa-' + (enc ? 'exclamation-triangle' : 'microchip') + '" style="color:var(--text-secondary)"></i> CPU (libx264)') +
+                    '</span></div>' +
+                    '<div class="vs-stats-row"><span>HLS</span><span>' + (_hlsSessionId ? escH(_hlsSessionId.slice(0,8) + '…') : t('Brak sesji')) + '</span></div>' +
+                    '<div class="vs-stats-row"><span>' + t('Pozycja') + '</span><span>' + Math.round(video.currentTime) + 's</span></div>' +
+                    swTip;
+                statsOverlay.style.display = '';
+
+                // "Jak naprawić?" link in stats overlay
+                const setupLink = statsOverlay.querySelector('#vs-stats-hw-setup');
+                if (setupLink) {
+                    setupLink.onclick = async (e) => {
+                        e.preventDefault();
+                        statsOverlay.style.display = 'none';
+                        const health = await api('/video-station/hw-health').catch(() => null);
+                        if (health) _openHwWizard(bodyEl, health);
+                    };
+                }
+            };
+        }
+
+        // Touch gestures: double-tap left/right for ±10s seek, vertical swipe for volume (right) / brightness (left)
+        let _lastTapTime = 0, _lastTapX = 0;
+        let _swipeStartY = 0, _swipeStartX = 0, _swipeSide = null, _swipeBrightness = 1;
+        const swipeHint = bodyEl.querySelector('#vs-swipe-hint');
+        const seekHintL = bodyEl.querySelector('#vs-seek-hint-left');
+        const seekHintR = bodyEl.querySelector('#vs-seek-hint-right');
+
+        function _showSeekHint(side) {
+            const el = side === 'left' ? seekHintL : seekHintR;
+            if (!el) return;
+            el.classList.add('vs-seek-hint-visible');
+            clearTimeout(el._ht);
+            el._ht = setTimeout(() => el.classList.remove('vs-seek-hint-visible'), 700);
+        }
+
+        video.addEventListener('touchstart', (e) => {
+            const touch = e.changedTouches[0];
+            const now = Date.now();
+            const rect = video.getBoundingClientRect();
+            const relX = touch.clientX - rect.left;
+            const relY = touch.clientY - rect.top;
+            _swipeStartX = relX; _swipeStartY = relY;
+            _swipeSide = relX < rect.width / 2 ? 'left' : 'right';
+
+            // Double-tap detection
+            if (now - _lastTapTime < 300 && Math.abs(relX - _lastTapX) < 80) {
+                e.preventDefault();
+                if (relX < rect.width / 2) { seekPlayer(video, -10); _showSeekHint('left'); }
+                else { seekPlayer(video, 10); _showSeekHint('right'); }
+                _lastTapTime = 0;
+            } else {
+                _lastTapTime = now; _lastTapX = relX;
+            }
+        }, { passive: false });
+
+        video.addEventListener('touchmove', (e) => {
+            const touch = e.changedTouches[0];
+            const rect = video.getBoundingClientRect();
+            const dy = _swipeStartY - (touch.clientY - rect.top);
+            if (Math.abs(dy) < 10) return;
+            const ratio = dy / rect.height;
+            if (_swipeSide === 'right') {
+                video.volume = Math.max(0, Math.min(1, video.volume + ratio * 0.5));
+                if (swipeHint) { swipeHint.textContent = t('Głośność') + ': ' + Math.round(video.volume * 100) + '%'; swipeHint.style.display = ''; }
+            } else {
+                _swipeBrightness = Math.max(0.2, Math.min(2, _swipeBrightness + ratio * 1.0));
+                video.style.filter = 'brightness(' + _swipeBrightness + ')';
+                if (swipeHint) { swipeHint.textContent = t('Jasność') + ': ' + Math.round(_swipeBrightness * 100) + '%'; swipeHint.style.display = ''; }
+            }
+            _swipeStartY = touch.clientY - rect.top;
+        }, { passive: true });
+
+        video.addEventListener('touchend', () => {
+            if (swipeHint) { setTimeout(() => { swipeHint.style.display = 'none'; }, 1200); }
+        });
 
         // PiP button
         const pipBtn = bodyEl.querySelector('#vs-pip-btn');
@@ -1299,6 +2356,10 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         }
         _hlsSessionId = res.session_id;
         _startOffset = res.start_offset || 0;
+        _startHeartbeat(video);
+
+        // Load embedded subtitle tracks from HLS start response
+        _loadSubtitleTracks(vid, res.sub_tracks || []);
 
         const playlistUrl = '/api/video-station/hls/' + _hlsSessionId + '/playlist.m3u8?token=' + NAS.token;
 
@@ -1362,7 +2423,18 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         });
     }
 
+    function _startHeartbeat(video) {
+        if (_heartbeatTimer) clearInterval(_heartbeatTimer);
+        _heartbeatTimer = setInterval(() => {
+            if (!_hlsSessionId) { clearInterval(_heartbeatTimer); return; }
+            const pos = video ? video.currentTime : 0;
+            api('/video-station/hls/' + _hlsSessionId + '/heartbeat',
+                { method: 'POST', body: { pos } });
+        }, 8000);
+    }
+
     function _destroyHls() {
+        if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
         if (_hlsInstance) {
             _hlsInstance.destroy();
             _hlsInstance = null;
@@ -1384,6 +2456,22 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             track.srclang = sub.language || 'und';
             track.src = '/api/video-station/subtitle-file/' + vid + '/' + encodeURIComponent(sub.filename) + '?token=' + NAS.token;
             if (i === 0) track.default = true;
+            video.appendChild(track);
+        });
+    }
+
+    function _loadSubtitleTracks(vid, subTracks) {
+        const video = bodyEl && bodyEl.querySelector('#vs-player-video');
+        if (!video || !subTracks || !subTracks.length) return;
+        // Remove existing embedded-sub tracks (not file-based ones)
+        video.querySelectorAll('track[data-embedded]').forEach(t => t.remove());
+        subTracks.forEach((sub, i) => {
+            const track = document.createElement('track');
+            track.kind = 'subtitles';
+            track.label = (sub.title || sub.language || ('Track ' + (i + 1)));
+            track.srclang = sub.language || 'und';
+            track.src = '/api/video-station/embedded-subs/' + vid + '/' + sub.index + '?token=' + NAS.token;
+            track.dataset.embedded = '1';
             video.appendChild(track);
         });
     }
@@ -1438,10 +2526,14 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             video.load();
         }
         if (overlay._keyHandler) { document.removeEventListener('keydown', overlay._keyHandler); overlay._keyHandler = null; }
+        if (overlay._tsCleanup) { overlay._tsCleanup(); overlay._tsCleanup = null; }
+        // clear backdrop
+        overlay.style.backgroundImage = '';
+        overlay.classList.remove('vs-player-has-backdrop');
+        _thumbVtt = null; _thumbImg = null; _thumbVid = null;
 
         // refresh current view to reflect watch state
-        if (activeSection === 'library') loadLibrary();
-        else if (activeSection === 'recent') loadRecent();
+        _reloadSection();
     }
 
     function stopPlayer() {
@@ -1547,7 +2639,12 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 '.vs-card-poster .vs-thumb{aspect-ratio:2/3}',
 '.vs-card-poster .vs-thumb img{object-fit:cover}',
 '.vs-title{padding:8px 10px 2px;font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
-'.vs-meta{padding:0 10px 8px;font-size:11px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+'.vs-meta{padding:0 10px 4px;font-size:11px;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+'.vs-genre-badges{padding:0 10px 8px;display:flex;gap:4px;flex-wrap:wrap}',
+'.vs-genre-badge{font-size:10px;background:rgba(79,140,255,.15);color:rgba(79,140,255,.9);border:1px solid rgba(79,140,255,.2);border-radius:3px;padding:1px 6px;white-space:nowrap}',
+'.vs-card-hover-play{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;z-index:4;opacity:0;transition:opacity .18s;background:rgba(0,0,0,.35)}',
+'.vs-card:hover .vs-card-hover-play{opacity:1}',
+'.vs-card-hover-play i{font-size:32px;color:#fff;filter:drop-shadow(0 2px 8px rgba(0,0,0,.7))}',
 
 /* collection card tweaks */
 '.vs-collection-thumb{aspect-ratio:16/10}',
@@ -1584,8 +2681,10 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 /* player overlay */
 '.vs-player-overlay{position:fixed;top:0;left:0;width:100vw;height:100vh;background:#000;z-index:10000;display:flex;flex-direction:column;overflow:hidden}',
 '.vs-player-overlay:fullscreen{width:100%;height:100%}',
+'.vs-player-overlay.vs-player-has-backdrop::before{content:"";position:absolute;inset:0;background:inherit;filter:blur(60px) brightness(0.25);transform:scale(1.1);z-index:0}',
+'#vs-player-video{position:relative;z-index:1;width:100%;height:100%;outline:none;object-fit:contain}',
 '.vs-player-top{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;z-index:10;background:linear-gradient(to bottom,rgba(0,0,0,.85),transparent);position:absolute;top:0;left:0;right:0}',
-'.vs-player-title{color:#fff;font-size:14px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+'.vs-player-title{color:#fff;font-size:14px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}',
 '.vs-player-close{background:none;border:none;color:#fff;font-size:20px;cursor:pointer;padding:4px 8px;opacity:.7;transition:opacity .15s}',
 '.vs-player-close:hover{opacity:1}',
 '.vs-player-badge{display:inline-flex;align-items:center;gap:5px;background:rgba(255,165,0,.85);color:#000;font-size:11px;font-weight:600;padding:3px 10px;border-radius:12px;white-space:nowrap}',
@@ -1593,7 +2692,6 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 '.vs-audio-select option{background:#222;color:#fff}',
 '.vs-speed-select{background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:4px;padding:2px 6px;font-size:12px;cursor:pointer}',
 '.vs-speed-select option{background:#222;color:#fff}',
-'#vs-player-video{width:100%;height:100%;outline:none;object-fit:contain}',
 '.vs-ctx-menu{position:fixed;background:var(--bg-elevated,#2a2a2e);border:1px solid var(--border);border-radius:var(--r-md,6px);padding:4px 0;z-index:9999;min-width:180px;box-shadow:0 8px 24px rgba(0,0,0,.5)}',
 '.vs-ctx-item{padding:8px 14px;cursor:pointer;font-size:13px;color:var(--text-primary,#fff);display:flex;align-items:center;gap:8px;white-space:nowrap}',
 '.vs-ctx-item:hover{background:var(--bg-hover,rgba(255,255,255,.08))}',
@@ -1601,11 +2699,18 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 '.vs-ctx-danger{color:var(--danger,#f87171)}',
 '.vs-ctx-danger:hover{background:rgba(248,113,113,.12)}',
 
-/* PiP & fullscreen buttons */
+/* PiP, fullscreen & cast buttons */
 '.vs-pip-btn{background:none;border:none;color:#fff;font-size:15px;cursor:pointer;padding:4px 8px;opacity:.7;transition:opacity .15s}',
 '.vs-pip-btn:hover{opacity:1}',
 '.vs-fs-btn{background:none;border:none;color:#fff;font-size:15px;cursor:pointer;padding:4px 8px;opacity:.7;transition:opacity .15s}',
 '.vs-fs-btn:hover{opacity:1}',
+'.vs-cast-btn{background:none;border:none;color:#fff;font-size:15px;cursor:pointer;padding:4px 8px;opacity:.7;transition:opacity .15s}',
+'.vs-cast-btn:hover{opacity:1;color:#1db954}',
+
+/* Thumbstrip seek preview */
+'.vs-thumbstrip-preview{position:absolute;display:flex;flex-direction:column;align-items:center;gap:4px;pointer-events:none;z-index:15;bottom:70px}',
+'.vs-thumbstrip-preview canvas{border-radius:4px;border:2px solid rgba(255,255,255,.3);box-shadow:0 4px 16px rgba(0,0,0,.8)}',
+'.vs-thumbstrip-time{color:#fff;font-size:11px;font-weight:600;background:rgba(0,0,0,.7);padding:2px 8px;border-radius:4px;font-variant-numeric:tabular-nums}',
 
 /* Resume dialog */
 '.vs-resume-dialog{position:absolute;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:20}',
