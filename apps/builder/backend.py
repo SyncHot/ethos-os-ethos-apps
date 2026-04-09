@@ -537,8 +537,8 @@ def get_build_spec():
 @builder_bp.route('/spec', methods=['PUT'])
 def update_build_spec():
     """Update build spec with provided values."""
-    data = request.json
-    if not data:
+    data = request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
         return jsonify({'error': 'No spec data provided'}), 400
     try:
         # Load current, merge updates, save
@@ -582,7 +582,7 @@ def build_release():
     """Build a release package. Streams progress via SSE."""
     if _build_state['status'] == 'building':
         return jsonify({'error': 'Build already in progress. Wait for completion or cancel.'}), 409
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
     bump = data.get('bump', '')  # patch, minor, major or empty
     changelog_title = data.get('changelog_title', '').strip()
     changelog_changes = data.get('changelog_changes', [])
@@ -1720,7 +1720,7 @@ df -h "$ROOT" 2>/dev/null | tail -1 || true
 
 if [ "$BASE_DISTRO" = "ubuntu" ]; then
     echo "LOG:Ubuntu: upgrading kernel and linux-firmware if newer available..."
-    chroot "$ROOT" apt-get install -y -qq --only-upgrade linux-image-amd64 linux-firmware 2>&1 | tail -5 || echo "LOG:Kernel/firmware upgrade skipped"
+    chroot "$ROOT" apt-get install -y -qq --only-upgrade linux-image-generic linux-firmware 2>&1 | tail -5 || echo "LOG:Kernel/firmware upgrade skipped"
 else
     echo "LOG:Installing linux-image-amd64 from backports..."
     chroot "$ROOT" apt-get install -y -qq -t ${{DEBIAN_RELEASE}}-backports linux-image-amd64 2>&1 | tail -5 || echo "LOG:Backports kernel skipped"
@@ -2399,8 +2399,12 @@ echo "PREFLIGHT:START"
 echo "PREFLIGHT:kernel=$(uname -r)"
 SYSTEMD_STATE=$(systemctl is-system-running --wait --timeout=30 2>/dev/null || echo unknown)
 echo "PREFLIGHT:SYSTEMD:$SYSTEMD_STATE"
+# Check whichever EthOS service is expected to be active
+# On installer images ethos-preboot.service runs; on installed systems ethos.service runs.
 if systemctl is-active ethos.service >/dev/null 2>&1; then
     echo "PREFLIGHT:ETHOS:OK"
+elif systemctl is-active ethos-preboot.service >/dev/null 2>&1; then
+    echo "PREFLIGHT:ETHOS:PREBOOT_OK"
 else
     echo "PREFLIGHT:ETHOS:FAIL"
 fi
@@ -2416,8 +2420,8 @@ if [ -f /etc/sysctl.d/91-ethos-security.conf ]; then
 else
     echo "PREFLIGHT:HARDENING:FAIL"
 fi
-# Flask available
-if python3 -c "import flask" 2>/dev/null; then
+# Flask available (check venv python, not system python)
+if /opt/ethos/venv/bin/python -c "import flask" 2>/dev/null; then
     echo "PREFLIGHT:FLASK:OK"
 else
     echo "PREFLIGHT:FLASK:FAIL"
@@ -2426,14 +2430,19 @@ echo "PREFLIGHT:DONE"
 systemctl disable ethos-preflight.service 2>/dev/null || true
 rm -f /usr/local/sbin/ethos-preflight.sh /etc/systemd/system/ethos-preflight.service
 systemctl daemon-reload 2>/dev/null || true
-shutdown -h now
+# Only power off in QA/beacon mode — when ETHOS_BUILD_HOST is set in ethos.env
+# (injected by builder when ETHOS_QA_BUILD_HOST env var is set on the build host).
+# Without it the image runs normally so the user can access the web UI.
+if grep -q "^ETHOS_BUILD_HOST=" /opt/ethos/ethos.env 2>/dev/null; then
+    shutdown -h now
+fi
+exit 0
 PFSCRIPT
     chmod +x "$ROOT/usr/local/sbin/ethos-preflight.sh"
     cat > "$ROOT/etc/systemd/system/ethos-preflight.service" <<'PFSVC'
 [Unit]
 Description=EthOS Pre-flight Health Check
-After=ethos.service
-Wants=ethos.service
+After=network.target ethos-preboot.service ethos.service
 ConditionPathExists=/usr/local/sbin/ethos-preflight.sh
 
 [Service]
