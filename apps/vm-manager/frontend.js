@@ -160,6 +160,7 @@ function renderVMManager(body) {
         main.innerHTML = `
             <div class="vm-toolbar">
                 <span class="vm-toolbar-title"><i class="fas fa-desktop"></i> Wirtualne maszyny <span class="vm-badge" id="vm-cnt">0</span></span>
+                <button class="vm-btn vm-btn-ethos" id="vm-quick-ethos-btn"><i class="fas fa-bolt"></i> Quick EthOS</button>
                 <button class="vm-btn vm-btn-primary" id="vm-create-btn"><i class="fas fa-plus"></i> Nowa VM</button>
                 <button class="vm-btn" id="vm-import-btn" title="${t('Importuj istniejący dysk qcow2/vmdk/vdi/raw')}"><i class="fas fa-file-import"></i> Importuj dysk</button>
                 <button class="vm-btn" id="vm-refresh-btn"><i class="fas fa-sync-alt"></i></button>
@@ -181,6 +182,7 @@ function renderVMManager(body) {
             </div>
         `;
         main.querySelector('#vm-create-btn').addEventListener('click', showCreateModal);
+        main.querySelector('#vm-quick-ethos-btn').addEventListener('click', quickCreateEthOS);
         main.querySelector('#vm-import-btn').addEventListener('click', showImportDiskModal);
         main.querySelector('#vm-refresh-btn').addEventListener('click', async () => {
             await loadMachines(); fillMachinesTable();
@@ -213,7 +215,8 @@ function renderVMManager(body) {
             if (running && net.net_type === 'user' && net.port_forwards?.length) {
                 quickLinks = net.port_forwards.map(pf => {
                     const lbl = pf.label ? esc(pf.label) : `${pf.guest}`;
-                    return `<a href="http://${_vmHost}:${pf.host}" target="_blank" class="vm-link-chip" style="padding:3px 8px;font-size:11px" title="${pf.proto} :${pf.host}→:${pf.guest}" onclick="event.stopPropagation()"><i class="fas fa-external-link-alt"></i> ${lbl} :${pf.host}</a>`;
+                    const proto = [443, 8443, 9443].includes(pf.guest) ? 'https' : 'http';
+                    return `<a href="${proto}://${_vmHost}:${pf.host}" target="_blank" class="vm-link-chip" style="padding:3px 8px;font-size:11px" title="${pf.proto} :${pf.host}→:${pf.guest}" onclick="event.stopPropagation()"><i class="fas fa-external-link-alt"></i> ${lbl} :${pf.host}</a>`;
                 }).join(' ');
             }
             return `<tr class="vm-row" data-id="${esc(vm.id)}">
@@ -322,6 +325,15 @@ function renderVMManager(body) {
                     </div>
                     <div class="vm-form-row">
                         <div class="vm-form-group">
+                            <label>${t('Magistrala dysku')}</label>
+                            <select id="vm-new-diskbus" class="vm-input">
+                                <option value="virtio" selected>VirtIO (najszybszy)</option>
+                                <option value="scsi">SCSI</option>
+                                <option value="sata">SATA</option>
+                                <option value="ide">IDE</option>
+                            </select>
+                        </div>
+                        <div class="vm-form-group">
                             <label>Typ systemu</label>
                             <select id="vm-new-os" class="vm-input">
                                 <option value="linux">Linux</option>
@@ -338,6 +350,7 @@ function renderVMManager(body) {
                                 </select>
                                 <button class="vm-btn" id="vm-new-browse-iso" title="${t('Przeglądaj dyski')}" style="padding:6px 10px"><i class="fas fa-folder-open"></i></button>
                             </div>
+                            <div id="vm-new-ethos-hint" class="vm-ethos-port-hint" style="display:none"></div>
                         </div>
                     </div>
                     <div class="vm-form-group">
@@ -358,6 +371,21 @@ function renderVMManager(body) {
         overlay.querySelector('#vm-modal-cancel').addEventListener('click', close);
         overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
 
+        const ethosHint = overlay.querySelector('#vm-new-ethos-hint');
+        const imageSel = overlay.querySelector('#vm-new-image');
+        function updateEthosHint() {
+            const val = imageSel.value || '';
+            const name = val.split('/').pop().toLowerCase();
+            if (name.includes('ethos')) {
+                ethosHint.innerHTML = `<i class="fas fa-info-circle"></i> ${t('Obraz EthOS wykryty — porty 9000 (Web UI) i SSH zostaną automatycznie zmapowane na wolne porty hosta.')}`;
+                ethosHint.style.display = '';
+            } else {
+                ethosHint.style.display = 'none';
+            }
+        }
+        imageSel.addEventListener('change', updateEthosHint);
+        updateEthosHint();
+
         overlay.querySelector('#vm-new-browse-iso').addEventListener('click', () => {
             openIsoPicker('/media', (filePath, fileName) => {
                 const sel = overlay.querySelector('#vm-new-image');
@@ -370,6 +398,7 @@ function renderVMManager(body) {
                     sel.appendChild(opt);
                 }
                 sel.value = filePath;
+                updateEthosHint();
             });
         });
 
@@ -382,6 +411,7 @@ function renderVMManager(body) {
                 ram: parseInt(overlay.querySelector('#vm-new-ram').value) || 2048,
                 disk_size: overlay.querySelector('#vm-new-disk').value || '20G',
                 disk_format: overlay.querySelector('#vm-new-diskfmt').value || 'qcow2',
+                disk_bus: overlay.querySelector('#vm-new-diskbus').value || 'virtio',
                 os_type: overlay.querySelector('#vm-new-os').value || 'linux',
                 boot_image: overlay.querySelector('#vm-new-image').value || '',
                 description: overlay.querySelector('#vm-new-desc').value || '',
@@ -395,6 +425,65 @@ function renderVMManager(body) {
                 toast(e.message || t('Błąd tworzenia VM'), 'error');
             }
         });
+    }
+
+
+    // ─── QUICK CREATE ETHOS ───
+
+    async function quickCreateEthOS() {
+        const btn = main.querySelector('#vm-quick-ethos-btn');
+        if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Tworzenie...'; }
+        try {
+            const r = await api('/vm/quick-create-ethos', { method: 'POST', body: {} });
+            if (r.error) { toast(r.error, 'error'); return; }
+
+            // Show success dialog with port info and option to start
+            const ports = (r.ports || []).map(p => `<div class="vm-qc-port"><span class="vm-qc-port-label">${esc(p.label)}</span><span class="vm-qc-port-map">${_vmHost}:${p.host} → :${p.guest}</span></div>`).join('');
+            const overlay = document.createElement('div');
+            overlay.className = 'vm-modal-overlay';
+            overlay.innerHTML = `
+                <div class="vm-modal" style="max-width:460px">
+                    <div class="vm-modal-header">
+                        <span><i class="fas fa-check-circle" style="color:#10b981;margin-right:8px"></i>${t('EthOS VM utworzona')}</span>
+                        <button class="vm-modal-close">&times;</button>
+                    </div>
+                    <div class="vm-modal-body">
+                        <div class="vm-qc-summary">
+                            <div class="vm-qc-row"><span class="vm-qc-label">${t('Nazwa')}</span><span>${esc(r.name)}</span></div>
+                            <div class="vm-qc-row"><span class="vm-qc-label">${t('Obraz')}</span><span>${esc(r.image)} <span class="vm-qc-source">${r.image_source === 'builder' ? 'Builder' : 'Obrazy VM'}</span></span></div>
+                            <div class="vm-qc-row"><span class="vm-qc-label">${t('Parametry')}</span><span>2 vCPU · 2 GB RAM · 20 GB VirtIO</span></div>
+                            ${ports ? `<div class="vm-qc-row vm-qc-row-ports"><span class="vm-qc-label">${t('Porty')}</span><div class="vm-qc-ports">${ports}</div></div>` : ''}
+                        </div>
+                    </div>
+                    <div class="vm-modal-footer">
+                        <button class="vm-btn" id="vm-qc-close">${t('Zamknij')}</button>
+                        <button class="vm-btn vm-btn-success" id="vm-qc-start"><i class="fas fa-play"></i> ${t('Uruchom teraz')}</button>
+                    </div>
+                </div>
+            `;
+            body.appendChild(overlay);
+
+            const close = () => { overlay.remove(); loadMachines().then(fillMachinesTable); };
+            overlay.querySelector('.vm-modal-close').addEventListener('click', close);
+            overlay.querySelector('#vm-qc-close').addEventListener('click', close);
+            overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+
+            overlay.querySelector('#vm-qc-start').addEventListener('click', async () => {
+                const startBtn = overlay.querySelector('#vm-qc-start');
+                startBtn.disabled = true;
+                startBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Uruchamianie...';
+                try {
+                    const sr = await api(`/vm/machines/${r.id}/start`, { method: 'POST' });
+                    if (sr && sr.error) { toast(sr.error, 'error'); }
+                    else { toast(sr.message || 'VM uruchomiona', 'success'); }
+                } catch (e) { toast(e.message || t('Błąd uruchomienia'), 'error'); }
+                close();
+            });
+        } catch (e) {
+            toast(e.message || t('Błąd tworzenia EthOS VM'), 'error');
+        } finally {
+            if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fas fa-bolt"></i> Quick EthOS'; }
+        }
     }
 
 
@@ -590,11 +679,12 @@ function renderVMManager(body) {
                 <span class="vm-vnc-hint">${t('Połącz klientem VNC (np. TigerVNC, Remmina)')}</span>
             </div>` : ''}
             <div class="vm-detail-tabs">
-                ${running && vm.ws_port ? `<div class="vm-dtab ${S.detailTab === 'console' ? 'active' : ''}" data-t="console"><i class="fas fa-tv"></i> Konsola</div>` : ''}
-                <div class="vm-dtab ${S.detailTab === 'info' ? 'active' : ''}" data-t="info">Konfiguracja</div>
-                <div class="vm-dtab ${S.detailTab === 'network' ? 'active' : ''}" data-t="network"><i class="fas fa-network-wired"></i> Sieć</div>
-                <div class="vm-dtab ${S.detailTab === 'snapshots' ? 'active' : ''}" data-t="snapshots">Snapshoty</div>
-                <div class="vm-dtab ${S.detailTab === 'disk' ? 'active' : ''}" data-t="disk">Dysk</div>
+                ${running && vm.ws_port ? `<div class="vm-dtab ${S.detailTab === 'console' ? 'active' : ''}" data-t="console"><i class="fas fa-tv"></i> ${t('Konsola')}</div>` : ''}
+                ${running && vm.serial_ws_port ? `<div class="vm-dtab ${S.detailTab === 'serial' ? 'active' : ''}" data-t="serial"><i class="fas fa-terminal"></i> ${t('Serial')}</div>` : ''}
+                <div class="vm-dtab ${S.detailTab === 'info' ? 'active' : ''}" data-t="info">${t('Konfiguracja')}</div>
+                <div class="vm-dtab ${S.detailTab === 'network' ? 'active' : ''}" data-t="network"><i class="fas fa-network-wired"></i> ${t('Sieć')}</div>
+                <div class="vm-dtab ${S.detailTab === 'snapshots' ? 'active' : ''}" data-t="snapshots">${t('Snapshoty')}</div>
+                <div class="vm-dtab ${S.detailTab === 'disk' ? 'active' : ''}" data-t="disk">${t('Dysk')}</div>
             </div>
             <div id="vm-detail-content"></div>
         `;
@@ -636,8 +726,11 @@ function renderVMManager(body) {
     function renderDetailContent() {
         const dc = main.querySelector('#vm-detail-content');
         if (!dc) return;
+        // Cleanup serial terminal when switching away
+        if (S.detailTab !== 'serial') _cleanupSerial();
         switch (S.detailTab) {
             case 'console': renderConsolePanel(dc); break;
+            case 'serial': renderSerialPanel(dc); break;
             case 'info': renderInfoPanel(dc); break;
             case 'network': renderNetworkPanel(dc); break;
             case 'snapshots': renderSnapshotsPanel(dc); break;
@@ -674,6 +767,104 @@ function renderVMManager(body) {
         });
     }
 
+    // Serial console panel (xterm.js via websockify)
+    let _serialTerm = null;
+    let _serialWs = null;
+
+    function _cleanupSerial() {
+        if (_serialWs) { try { _serialWs.close(); } catch(e) {} _serialWs = null; }
+        if (_serialTerm) { try { _serialTerm.dispose(); } catch(e) {} _serialTerm = null; }
+    }
+
+    function renderSerialPanel(dc) {
+        const vm = S.selectedVM;
+        if (!vm || vm.status !== 'running' || !vm.serial_ws_port) {
+            dc.innerHTML = `<div class="vm-empty">${t('Konsola szeregowa dostępna tylko dla działających maszyn.')}</div>`;
+            return;
+        }
+        dc.innerHTML = `
+            <div class="vm-serial-wrap">
+                <div class="vm-console-toolbar">
+                    <span><i class="fas fa-terminal"></i> Serial Console — ${esc(vm.name)}</span>
+                    <button class="vm-btn vm-btn-sm" id="vm-serial-reconnect" title="${t('Połącz ponownie')}"><i class="fas fa-sync"></i></button>
+                    <button class="vm-btn vm-btn-sm" id="vm-serial-fullscreen" title="${t('Pełny ekran')}"><i class="fas fa-expand"></i></button>
+                </div>
+                <div id="vm-serial-terminal" class="vm-serial-terminal"></div>
+            </div>
+        `;
+
+        _connectSerial(vm);
+
+        dc.querySelector('#vm-serial-reconnect')?.addEventListener('click', () => _connectSerial(vm));
+        const termEl = dc.querySelector('#vm-serial-terminal');
+        dc.querySelector('#vm-serial-fullscreen')?.addEventListener('click', () => {
+            if (termEl.requestFullscreen) termEl.requestFullscreen();
+            else if (termEl.webkitRequestFullscreen) termEl.webkitRequestFullscreen();
+        });
+    }
+
+    function _connectSerial(vm) {
+        _cleanupSerial();
+
+        const el = main.querySelector('#vm-serial-terminal');
+        if (!el) return;
+        el.innerHTML = '';
+
+        const term = new Terminal({
+            cursorBlink: true,
+            cursorStyle: 'bar',
+            fontSize: 14,
+            fontFamily: "'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace",
+            theme: { background: '#1a1a2e', foreground: '#e0e0e0', cursor: '#4fc3f7' },
+            scrollback: 10000,
+            convertEol: true,
+        });
+
+        const fitAddon = new FitAddon.FitAddon();
+        term.loadAddon(fitAddon);
+        term.open(el);
+        setTimeout(() => fitAddon.fit(), 50);
+
+        const ro = new ResizeObserver(() => { try { fitAddon.fit(); } catch(e) {} });
+        ro.observe(el);
+
+        term.writeln('\x1b[36m── Serial Console connecting... ──\x1b[0m');
+
+        const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const wsUrl = `${wsProto}://${_vmHost}:${vm.serial_ws_port}`;
+        const ws = new WebSocket(wsUrl);
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+            term.writeln('\x1b[32m── Connected ──\x1b[0m\r\n');
+            // Send Enter to get a fresh prompt/output
+            ws.send(new Uint8Array([13]));
+        };
+        ws.onmessage = (evt) => {
+            if (evt.data instanceof ArrayBuffer) {
+                term.write(new Uint8Array(evt.data));
+            } else {
+                term.write(evt.data);
+            }
+        };
+        ws.onclose = () => {
+            term.writeln('\r\n\x1b[31m── Disconnected ──\x1b[0m');
+        };
+        ws.onerror = () => {
+            term.writeln('\r\n\x1b[31m── Connection error ──\x1b[0m');
+        };
+
+        term.onData((data) => {
+            if (ws.readyState === WebSocket.OPEN) {
+                const encoder = new TextEncoder();
+                ws.send(encoder.encode(data));
+            }
+        });
+
+        _serialTerm = term;
+        _serialWs = ws;
+    }
+
     // Info / Config panel
     function renderInfoPanel(dc) {
         const vm = S.selectedVM;
@@ -688,7 +879,8 @@ function renderVMManager(body) {
             const links = [];
             if (net.net_type === 'user' && net.port_forwards?.length) {
                 for (const pf of net.port_forwards) {
-                    const url = `http://${host}:${pf.host}`;
+                    const proto = [443, 8443, 9443].includes(pf.guest) ? 'https' : 'http';
+                    const url = `${proto}://${host}:${pf.host}`;
                     const label = pf.label ? esc(pf.label) : `${pf.proto}/${pf.guest}`;
                     links.push(`<a href="${esc(url)}" target="_blank" class="vm-link-chip" title="${esc(pf.proto)} host:${pf.host} → guest:${pf.guest}"><i class="fas fa-external-link-alt"></i> ${label} <span class="vm-link-port">:${pf.host}</span></a>`);
                 }
@@ -1177,6 +1369,7 @@ function renderVMManager(body) {
                     <thead><tr>
                         <th>${t('ID')}</th>
                         <th>${t('Format')}</th>
+                        <th>${t('Magistrala')}</th>
                         <th>${t('Rozmiar wirtualny')}</th>
                         <th>${t('Rozmiar na dysku')}</th>
                         <th>${t('Plik')}</th>
@@ -1188,6 +1381,7 @@ function renderVMManager(body) {
             html += `<tr>
                 <td>${esc(d.id)}${isBoot ? ' <i class="fas fa-boot" title="Boot"></i>' : ''}</td>
                 <td>${esc(d.format || '-')}</td>
+                <td>${esc(d.bus || 'virtio')}</td>
                 <td>${esc(d.virtual_size_human || '-')}</td>
                 <td>${esc(d.actual_size_human || '-')}</td>
                 <td class="vm-mono" style="font-size:11px">${esc(d.filename || '-')}</td>
@@ -1233,13 +1427,57 @@ function renderVMManager(body) {
 
         // Add disk
         dc.querySelector('#vm-disk-add')?.addEventListener('click', async () => {
-            const sizeStr = await promptDialog(t('Dodaj dysk'), t('Rozmiar nowego dysku (np. 20G, 500M):'), '20G');
-            if (!sizeStr) return;
-            try {
-                const r = await api(`/vm/machines/${vm.id}/disks`, { method: 'POST', body: { size: sizeStr, format: 'qcow2' } });
-                toast(r.message || t('Dysk dodany'), 'success');
-                renderDiskPanel(dc);
-            } catch (e) { toast(e.message || t('Błąd'), 'error'); }
+            const overlay = document.createElement('div');
+            overlay.className = 'vm-modal-overlay';
+            overlay.innerHTML = `
+                <div class="vm-modal" style="max-width:400px">
+                    <div class="vm-modal-header"><span>${t('Dodaj dysk')}</span><button class="vm-modal-close">&times;</button></div>
+                    <div class="vm-modal-body">
+                        <div class="vm-form-group">
+                            <label>${t('Rozmiar')}</label>
+                            <input type="text" id="vda-size" class="vm-input" value="20G" placeholder="np. 20G, 512M">
+                        </div>
+                        <div class="vm-form-row">
+                            <div class="vm-form-group">
+                                <label>${t('Format')}</label>
+                                <select id="vda-fmt" class="vm-input">
+                                    <option value="qcow2" selected>QCOW2</option>
+                                    <option value="raw">RAW</option>
+                                </select>
+                            </div>
+                            <div class="vm-form-group">
+                                <label>${t('Magistrala')}</label>
+                                <select id="vda-bus" class="vm-input">
+                                    <option value="virtio" selected>VirtIO</option>
+                                    <option value="scsi">SCSI</option>
+                                    <option value="sata">SATA</option>
+                                    <option value="ide">IDE</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="vm-modal-footer">
+                        <button class="vm-btn" id="vda-cancel">${t('Anuluj')}</button>
+                        <button class="vm-btn vm-btn-primary" id="vda-ok">${t('Dodaj')}</button>
+                    </div>
+                </div>`;
+            body.appendChild(overlay);
+            const close = () => overlay.remove();
+            overlay.querySelector('.vm-modal-close').addEventListener('click', close);
+            overlay.querySelector('#vda-cancel').addEventListener('click', close);
+            overlay.addEventListener('click', e => { if (e.target === overlay) close(); });
+            overlay.querySelector('#vda-ok').addEventListener('click', async () => {
+                const sizeStr = overlay.querySelector('#vda-size').value.trim();
+                const fmt = overlay.querySelector('#vda-fmt').value;
+                const bus = overlay.querySelector('#vda-bus').value;
+                if (!sizeStr) return;
+                close();
+                try {
+                    const r = await api(`/vm/machines/${vm.id}/disks`, { method: 'POST', body: { size: sizeStr, format: fmt, bus } });
+                    toast(r.message || t('Dysk dodany'), 'success');
+                    renderDiskPanel(dc);
+                } catch (e) { toast(e.message || t('Błąd'), 'error'); }
+            });
         });
     }
 

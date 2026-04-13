@@ -86,7 +86,7 @@
         {
             "id": "download-manager",
             "name": "Download Manager",
-            "version": "1.0.2",
+            "version": "1.0.3",
             "icon": "fa-cloud-download-alt",
             "color": "#10b981",
             "category": "Tools",
@@ -135,7 +135,7 @@
         {
             "id": "vm-manager",
             "name": "VM Manager",
-            "version": "1.0.3",
+            "version": "1.0.4",
             "icon": "fa-desktop",
             "color": "#8b5cf6",
             "category": "System",
@@ -215,7 +215,7 @@
         {
             "id": "builder",
             "name": "Builder",
-            "version": "1.0.6",
+            "version": "1.0.7",
             "icon": "fa-hammer",
             "color": "#f97316",
             "category": "System",
@@ -673,6 +673,42 @@
             "install_endpoint": "/api/radio-music/install",
             "uninstall_endpoint": "/api/radio-music/uninstall",
             "status_endpoint": "/api/radio-music/pkg-status"
+        },
+        {
+            "id": "naslink",
+            "name": "NASLink",
+            "version": "0.0.1",
+            "icon": "fa-network-wired",
+            "color": "#06b6d4",
+            "category": "Network",
+            "admin_only": false,
+            "description": "Lacznosc i synchronizacja miedzy urzadzeniami NAS.",
+            "apt_deps": [],
+            "pip_deps": []
+        },
+        {
+            "id": "packages",
+            "name": "Package Manager",
+            "version": "0.0.1",
+            "icon": "fa-store",
+            "color": "#a855f7",
+            "category": "System",
+            "admin_only": true,
+            "description": "Menedzer pakietow systemowych (legacy).",
+            "apt_deps": [],
+            "pip_deps": []
+        },
+        {
+            "id": "services",
+            "name": "Services",
+            "version": "0.0.1",
+            "icon": "fa-cogs",
+            "color": "#64748b",
+            "category": "System",
+            "admin_only": true,
+            "description": "Zarzadzanie uslugami systemowymi.",
+            "apt_deps": [],
+            "pip_deps": []
         }
     ]
 }

@@ -22,6 +22,7 @@ Endpoints:
   POST   /api/vm/machines/<id>/snapshots                 — create snapshot
   POST   /api/vm/machines/<id>/snapshots/<tag>           — restore snapshot
   DELETE /api/vm/machines/<id>/snapshots/<tag>           — delete snapshot
+  POST   /api/vm/quick-create-ethos                      — quick-create EthOS VM
   POST   /api/vm/import-disk                             — import disk image
   POST   /api/vm/convert                                 — convert disk format
 """
@@ -71,7 +72,7 @@ def _iso_root():
 # ─── State ───────────────────────────────────────────────────
 
 _STATE_FILE = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'vm_state.json')
-_running_vms = {}  # vm_id -> { 'proc': Popen, 'pid': int, 'started': float, 'vnc_port': int }
+_running_vms = {}  # vm_id -> { 'proc': Popen, 'pid': int, 'started': float, 'vnc_port': int, 'serial_port': int }
 
 
 def _load_vms():
@@ -122,10 +123,67 @@ def _get_disk(vm, disk_id):
     return None
 
 
-def _default_network(os_type='linux'):
-    """Return sensible default network config based on OS type."""
+def _is_ethos_image(boot_image):
+    """Check if a boot image filename looks like an EthOS image."""
+    if not boot_image:
+        return False
+    name = os.path.basename(boot_image).lower()
+    return 'ethos' in name
+
+
+def _used_host_ports():
+    """Collect all host ports already mapped by existing VMs."""
+    used = set()
+    try:
+        vms = _load_vms()
+    except Exception:
+        vms = {}
+    for vm in vms.values():
+        net = vm.get('network') or {}
+        for pf in net.get('port_forwards', []):
+            hp = int(pf.get('host', 0))
+            if hp > 0:
+                used.add(hp)
+    return used
+
+
+def _find_free_host_port(preferred, used_ports):
+    """Find a free host port starting from preferred, skipping used and busy ports."""
+    import socket
+    candidate = preferred
+    for _ in range(200):
+        if candidate in used_ports:
+            candidate += 1
+            continue
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(('', candidate))
+            s.close()
+            return candidate
+        except OSError:
+            candidate += 1
+        finally:
+            s.close()
+    return 0
+
+
+def _default_network(os_type='linux', boot_image=''):
+    """Return sensible default network config based on OS type.
+    When boot_image looks like an EthOS image, auto-maps ports 9000, 9443 and 22
+    to free host ports that don't conflict with the host or other VMs.
+    """
     pf = []
-    if os_type == 'linux':
+    if _is_ethos_image(boot_image):
+        used = _used_host_ports()
+        ethos_port = _find_free_host_port(9000, used)
+        used.add(ethos_port)
+        https_port = _find_free_host_port(9443, used)
+        used.add(https_port)
+        ssh_port = _find_free_host_port(2222, used)
+        pf.append({'proto': 'tcp', 'host': ethos_port, 'guest': 9000, 'label': 'EthOS Web'})
+        pf.append({'proto': 'tcp', 'host': https_port, 'guest': 9443, 'label': 'EthOS HTTPS'})
+        pf.append({'proto': 'tcp', 'host': ssh_port, 'guest': 22, 'label': 'SSH'})
+    elif os_type == 'linux':
         pf.append({'proto': 'tcp', 'host': 0, 'guest': 22, 'label': 'SSH'})
     elif os_type == 'windows':
         pf.append({'proto': 'tcp', 'host': 0, 'guest': 3389, 'label': 'RDP'})
@@ -555,6 +613,24 @@ def _next_ws_port():
     return 6179
 
 
+def _next_serial_port():
+    """Find the next available TCP port for serial console (4000+)."""
+    used = {v.get('serial_port', 0) for v in _running_vms.values()}
+    for p in range(4000, 4100):
+        if p not in used:
+            return p
+    return 4099
+
+
+def _next_serial_ws_port():
+    """Find the next available WebSocket port for serial console (6180+)."""
+    used = {v.get('serial_ws_port', 0) for v in _running_vms.values()}
+    for p in range(6180, 6280):
+        if p not in used:
+            return p
+    return 6279
+
+
 _NOVNC_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data', 'novnc')
 _WEBSOCKIFY_BIN = os.path.join(os.path.dirname(__file__), '..', '..', 'venv', 'bin', 'websockify')
 
@@ -592,6 +668,42 @@ def _stop_websockify(info):
                 ws_proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 ws_proc.kill()
+        except Exception:
+            pass
+
+
+def _start_serial_websockify(serial_port, serial_ws_port):
+    """Start websockify to proxy WebSocket→serial TCP for xterm.js browser client."""
+    ws_bin = os.path.abspath(_WEBSOCKIFY_BIN)
+    if not os.path.isfile(ws_bin):
+        return None
+    try:
+        proc = subprocess.Popen(
+            [ws_bin, str(serial_ws_port), f'localhost:{serial_port}'],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        time.sleep(1.0)
+        if proc.poll() is not None:
+            out = proc.stderr.read().decode('utf-8', errors='replace')[:300]
+            log.error("serial websockify exited early: %s", out)
+            return None
+        return proc
+    except Exception:
+        return None
+
+
+def _stop_serial_websockify(info):
+    """Stop the serial websockify process associated with a VM."""
+    proc = info.get('serial_ws_proc')
+    if proc:
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
         except Exception:
             pass
 
@@ -675,6 +787,7 @@ def _check_vm_process(vm_id):
         return True
     # Process is dead, clean up websockify and socat proxies too
     _stop_websockify(info)
+    _stop_serial_websockify(info)
     _stop_socat_proxies(info)
     _running_vms.pop(vm_id, None)
     return False
@@ -725,6 +838,7 @@ def list_vms():
             'vnc_port': info.get('vnc_port') if is_running else None,
             'vnc_display': info.get('vnc_display') if is_running else None,
             'ws_port': info.get('ws_port') if is_running else None,
+            'serial_ws_port': info.get('serial_ws_port') if is_running else None,
             'pid': info.get('pid') if is_running else None,
             'started': info.get('started') if is_running else None,
             'created': vm.get('created', ''),
@@ -759,11 +873,12 @@ def create_vm():
     boot_image = data.get('boot_image', '')  # ISO/IMG file to boot from
     description = data.get('description', '')
     disk_format = data.get('disk_format', 'qcow2')  # qcow2, raw
+    disk_bus = data.get('disk_bus', 'virtio')  # virtio, scsi, sata, ide
 
     # Network configuration
     network = data.get('network')
     if network is None:
-        network = _default_network(os_type)
+        network = _default_network(os_type, boot_image)
 
     # Validate
     if cpu < 1 or cpu > 32:
@@ -772,6 +887,8 @@ def create_vm():
         return jsonify({'error': 'RAM: 256 MB - 64 GB'}), 400
     if not re.match(r'^\d+[GMK]?$', disk_size):
         return jsonify({'error': 'Invalid disk size (e.g. 20G, 512M)'}), 400
+    if disk_bus not in ('virtio', 'scsi', 'sata', 'ide'):
+        return jsonify({'error': 'Disk bus must be virtio, scsi, sata, or ide'}), 400
     if boot_image:
         boot_image_real = os.path.realpath(boot_image)
         if not _is_allowed_image_path(boot_image_real):
@@ -812,7 +929,7 @@ def create_vm():
             'file': disk_file,
             'format': disk_format,
             'size': disk_size,
-            'bus': 'virtio',
+            'bus': disk_bus,
         }],
         'os_type': os_type,
         'boot_image': boot_image,
@@ -822,7 +939,141 @@ def create_vm():
     }
     _save_vms(vms)
 
-    return jsonify({'status': 'ok', 'id': vm_id, 'name': name})
+    # Build a user-friendly message with port info for EthOS images
+    msg = 'VM utworzona'
+    pf_list = network.get('port_forwards', [])
+    active_pf = [p for p in pf_list if p.get('host')]
+    if active_pf:
+        ports_str = ', '.join(f"{p['label']}: {p['host']}\u2192{p['guest']}" for p in active_pf)
+        msg = f"VM utworzona. Porty: {ports_str}"
+
+    return jsonify({'status': 'ok', 'id': vm_id, 'name': name, 'message': msg})
+
+
+@vm_bp.route('/quick-create-ethos', methods=['POST'])
+@admin_required
+@_require_qemu
+def quick_create_ethos():
+    """Quick-create an EthOS VM with optimal defaults.
+
+    Automatically finds the best EthOS image from VM images and builder
+    images, generates a unique name, and creates the VM with EthOS-optimized
+    settings (2 CPU, 2 GB RAM, 20 GB virtio/qcow2 disk, auto-mapped ports).
+    Optionally auto-starts the VM.
+    """
+    err = require_tools('qemu-img')
+    if err:
+        return err
+
+    data = request.get_json(force=True) if request.data else {}
+
+    # ── Find best EthOS image (prefer VM images dir, then builder images) ──
+    def _find_ethos_images():
+        candidates = []
+        valid_exts = {'.iso', '.img', '.raw', '.qcow2'}
+        # VM images directory
+        iso_dir = _iso_root()
+        if os.path.isdir(iso_dir):
+            for entry in os.listdir(iso_dir):
+                if 'ethos' in entry.lower() and os.path.splitext(entry)[1].lower() in valid_exts:
+                    fpath = os.path.join(iso_dir, entry)
+                    candidates.append(('images', fpath, os.path.getmtime(fpath)))
+        # Builder images directory
+        builder_dir = _app_path('installer/images')
+        if builder_dir and os.path.isdir(builder_dir):
+            for entry in os.listdir(builder_dir):
+                if 'ethos' in entry.lower() and os.path.splitext(entry)[1].lower() in valid_exts:
+                    fpath = os.path.join(builder_dir, entry)
+                    candidates.append(('builder', fpath, os.path.getmtime(fpath)))
+        # Sort by modification time (newest first)
+        candidates.sort(key=lambda c: c[2], reverse=True)
+        return candidates
+
+    candidates = _find_ethos_images()
+    if not candidates:
+        return jsonify({
+            'error': 'Nie znaleziono obrazu EthOS. Zbuduj obraz w aplikacji Builder lub prześlij go w zakładce Obrazy.'
+        }), 404
+
+    source, boot_image, _ = candidates[0]
+
+    # ── Generate unique name ──
+    vms = _load_vms()
+    existing_names = {vm.get('name', '').lower() for vm in vms.values()}
+    name = 'EthOS VM'
+    if name.lower() in existing_names:
+        for i in range(2, 100):
+            candidate_name = f'EthOS VM {i}'
+            if candidate_name.lower() not in existing_names:
+                name = candidate_name
+                break
+
+    # ── Create VM with optimal EthOS defaults ──
+    cpu = 2
+    ram = 2048
+    disk_size = '20G'
+    disk_format = 'qcow2'
+    disk_bus = 'virtio'
+    os_type = 'linux'
+
+    network = _default_network(os_type, boot_image)
+
+    vm_id = _sanitize_name(name).lower().replace(' ', '-')
+    vm_id = re.sub(r'-+', '-', vm_id)
+    ts = str(int(time.time()))[-6:]
+    vm_id = f'{vm_id}-{ts}'
+
+    vm_path = _vm_dir(vm_id)
+    os.makedirs(vm_path, exist_ok=True)
+
+    disk_file = os.path.join(vm_path, f'disk0.{disk_format}')
+    try:
+        r = host_run(f'qemu-img create -f {disk_format} "{disk_file}" {disk_size}', timeout=60)
+        if r.returncode != 0:
+            return jsonify({'error': f'Disk creation error: {r.stderr}'}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+    vms[vm_id] = {
+        'name': name,
+        'cpu': cpu,
+        'ram': ram,
+        'disk_size': disk_size,
+        'disk_format': disk_format,
+        'disk_file': disk_file,
+        'disks': [{
+            'id': 'disk0',
+            'file': disk_file,
+            'format': disk_format,
+            'size': disk_size,
+            'bus': disk_bus,
+        }],
+        'os_type': os_type,
+        'boot_image': boot_image,
+        'description': f'Quick-created EthOS VM (image: {os.path.basename(boot_image)})',
+        'network': network,
+        'created': time.strftime('%Y-%m-%d %H:%M:%S'),
+    }
+    _save_vms(vms)
+
+    # Port info for the response
+    pf_list = network.get('port_forwards', [])
+    active_pf = [p for p in pf_list if p.get('host')]
+    ports_str = ', '.join(f"{p['label']}: {p['host']}\u2192{p['guest']}" for p in active_pf) if active_pf else ''
+
+    msg = f'EthOS VM utworzona ({os.path.basename(boot_image)})'
+    if ports_str:
+        msg += f'. Porty: {ports_str}'
+
+    return jsonify({
+        'status': 'ok',
+        'id': vm_id,
+        'name': name,
+        'image': os.path.basename(boot_image),
+        'image_source': source,
+        'ports': [{'label': p['label'], 'host': p['host'], 'guest': p['guest']} for p in active_pf],
+        'message': msg,
+    })
 
 
 @vm_bp.route('/machines/<vm_id>', methods=['PUT'])
@@ -1086,6 +1337,7 @@ def start_vm(vm_id):
         return jsonify({'error': 'VM not found'}), 404
 
     vnc_display, vnc_port = _next_vnc_port()
+    serial_port = _next_serial_port()
     kvm = _kvm_available()
 
     boot_image = vm.get('boot_image', '')
@@ -1240,6 +1492,7 @@ def start_vm(vm_id):
         cmd += ['-vnc', f':{vnc_display}']
         cmd += ['-device', 'virtio-gpu-pci']
         cmd += ['-device', 'usb-ehci', '-device', 'usb-tablet']
+        cmd += ['-serial', f'tcp:127.0.0.1:{serial_port},server=on,wait=off']
         cmd += ['-monitor', 'none']
 
     # ── x86_64 VM ─────────────────────────────────────────────
@@ -1286,18 +1539,37 @@ def start_vm(vm_id):
         if not disks and vm.get('disk_file'):
             disks = [{'id': 'disk0', 'file': vm['disk_file'],
                        'format': vm.get('disk_format', 'qcow2')}]
+
+        # Track which controller types are needed for non-virtio buses
+        need_scsi_ctrl = any(d.get('bus') == 'scsi' for d in disks)
+        need_sata_ctrl = any(d.get('bus') == 'sata' for d in disks)
+        if need_scsi_ctrl:
+            cmd += ['-device', 'virtio-scsi-pci,id=scsi0']
+        if need_sata_ctrl:
+            cmd += ['-device', 'ich9-ahci,id=sata0']
+
+        scsi_idx = 0
+        sata_idx = 0
+        boot_offset = 1 if has_disk_boot_image else 0
         for i, disk in enumerate(disks):
             df = disk.get('file', '')
             if not df or not os.path.exists(df):
                 continue
             dfmt = disk.get('format', 'qcow2')
             did = disk.get('id', f'disk{i}')
+            bus = disk.get('bus', 'virtio')
             cmd += ['-drive', f'file={df},format={dfmt},if=none,id={did}']
-            if i == 0:
-                boot_idx = 1 if has_disk_boot_image else 0
-                cmd += ['-device', f'virtio-blk-pci,drive={did},bootindex={boot_idx}']
+            boot_str = f',bootindex={i + boot_offset}'
+            if bus == 'scsi':
+                cmd += ['-device', f'scsi-hd,bus=scsi0.0,drive={did},lun={scsi_idx}{boot_str}']
+                scsi_idx += 1
+            elif bus == 'sata':
+                cmd += ['-device', f'ide-hd,bus=sata0.{sata_idx},drive={did}{boot_str}']
+                sata_idx += 1
+            elif bus == 'ide':
+                cmd += ['-device', f'ide-hd,drive={did}{boot_str}']
             else:
-                cmd += ['-device', f'virtio-blk-pci,drive={did}']
+                cmd += ['-device', f'virtio-blk-pci,drive={did}{boot_str}']
 
         # ISO boot image (CD-ROM)
         if boot_image and os.path.exists(boot_image):
@@ -1345,6 +1617,9 @@ def start_vm(vm_id):
         # VGA adapter — virtio-gpu for best performance in VNC/noVNC
         cmd += ['-vga', 'virtio']
 
+        # Serial console on TCP for browser-based terminal (xterm.js via websockify)
+        cmd += ['-serial', f'tcp:127.0.0.1:{serial_port},server=on,wait=off']
+
         # Daemonize — no, we manage the process ourselves
         cmd += ['-monitor', 'none']
 
@@ -1370,8 +1645,11 @@ def start_vm(vm_id):
             'started': time.time(),
             'vnc_port': vnc_port,
             'vnc_display': vnc_display,
+            'serial_port': serial_port,
             'ws_proc': None,
             'ws_port': None,
+            'serial_ws_proc': None,
+            'serial_ws_port': None,
             'tap_dev': tap_dev,
             'socat_procs': [],
         }
@@ -1387,12 +1665,20 @@ def start_vm(vm_id):
             _running_vms[vm_id]['ws_proc'] = ws_proc
             _running_vms[vm_id]['ws_port'] = ws_port
 
+        # Start websockify for serial console (xterm.js)
+        serial_ws_port = _next_serial_ws_port()
+        serial_ws_proc = _start_serial_websockify(serial_port, serial_ws_port)
+        if serial_ws_proc:
+            _running_vms[vm_id]['serial_ws_proc'] = serial_ws_proc
+            _running_vms[vm_id]['serial_ws_port'] = serial_ws_port
+
         return jsonify({
             'ok': True,
             'pid': proc.pid,
             'vnc_port': vnc_port,
             'vnc_display': vnc_display,
             'ws_port': _running_vms[vm_id].get('ws_port'),
+            'serial_ws_port': _running_vms[vm_id].get('serial_ws_port'),
             'kvm': kvm,
             'message': f'VM started (VNC: :{vnc_display})',
         })
@@ -1430,6 +1716,7 @@ def stop_vm(vm_id):
         pass
 
     _stop_websockify(info)
+    _stop_serial_websockify(info)
     _stop_socat_proxies(info)
     _destroy_tap(info.get('tap_dev'))
     _running_vms.pop(vm_id, None)
@@ -1452,6 +1739,7 @@ def restart_vm(vm_id):
             except subprocess.TimeoutExpired:
                 proc.kill()
             _stop_websockify(info)
+            _stop_serial_websockify(info)
             _stop_socat_proxies(info)
             _destroy_tap(info.get('tap_dev'))
         _running_vms.pop(vm_id, None)
@@ -1848,8 +2136,11 @@ def add_disk(vm_id):
     data = request.get_json(force=True) if request.data else {}
     size = data.get('size', '20G')
     fmt = data.get('format', 'qcow2')
+    bus = data.get('bus', 'virtio')
     if fmt not in ('qcow2', 'raw'):
         return jsonify({'error': 'Format must be qcow2 or raw'}), 400
+    if bus not in ('virtio', 'scsi', 'sata', 'ide'):
+        return jsonify({'error': 'Bus must be virtio, scsi, sata, or ide'}), 400
     if not re.match(r'^\d+[GMK]$', size):
         return jsonify({'error': 'Invalid size (e.g. 20G, 512M)'}), 400
 
@@ -1864,7 +2155,7 @@ def add_disk(vm_id):
         return jsonify({'error': str(e)}), 500
 
     new_disk = {'id': disk_id, 'file': disk_file, 'format': fmt,
-                'size': size, 'bus': 'virtio'}
+                'size': size, 'bus': bus}
     vm.setdefault('disks', []).append(new_disk)
     _save_vms(vms)
     return jsonify({'status': 'ok', 'disk': new_disk})
@@ -2120,6 +2411,7 @@ def _on_uninstall(wipe):
         try:
             info = _running_vms[vm_id]
             _stop_websockify(info)
+            _stop_serial_websockify(info)
             _stop_socat_proxies(info)
             proc = info.get('proc')
             if proc:

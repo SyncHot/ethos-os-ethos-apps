@@ -205,6 +205,25 @@ _load_build_state()
 _HOST_NASOS_DIR = None
 
 # ── Optional app JS files (excluded from base image; installed via Package Center) ──
+
+def _get_published_app_ids():
+    """Return set of app IDs that are published to GitHub (available for download).
+    Only strip files from the image for apps that can be re-downloaded.
+    Returns None if GitHub is unreachable (caller should keep all files)."""
+    try:
+        import importlib, sys as _sys
+        _bp_dir = os.path.join(os.path.dirname(__file__))
+        _sys.path.insert(0, os.path.join(_bp_dir, '..'))
+        am = importlib.import_module('blueprints.app_manager')
+        url = am.GITHUB_CATALOG_URL
+        req = urllib.request.Request(url, headers={'User-Agent': 'EthOS-Builder/1.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        apps = data if isinstance(data, list) else data.get('apps', [])
+        return {a['id'] for a in apps if isinstance(a, dict) and 'id' in a}
+    except Exception:
+        return None  # if can't reach GitHub, don't strip anything
+
 def _compute_optional_js():
     try:
         import importlib, sys as _sys
@@ -216,12 +235,20 @@ def _compute_optional_js():
             fn = am._get_frontend_filename(aid)
             if fn:
                 core_js.add(fn + '.js')
+        # Only strip apps that are published to GitHub (downloadable after install)
+        published = _get_published_app_ids()
+        if published is None:
+            return []  # can't verify what's downloadable — keep all files
         optional = set()
         for app in am.BUILTIN_CATALOG:
-            if app['id'] not in am.CORE_APPS:
-                fn = am._get_frontend_filename(app['id'])
-                if fn and fn + '.js' not in core_js:
-                    optional.add(fn + '.js')
+            aid = app['id']
+            if aid in am.CORE_APPS:
+                continue
+            if aid not in published:
+                continue  # keep bundled — not yet published for download
+            fn = am._get_frontend_filename(aid)
+            if fn and fn + '.js' not in core_js:
+                optional.add(fn + '.js')
         return sorted(optional)
     except Exception:
         return []
@@ -235,12 +262,16 @@ def _compute_optional_py():
         _bp_dir = os.path.join(os.path.dirname(__file__))
         _sys.path.insert(0, os.path.join(_bp_dir, '..'))
         am = importlib.import_module('blueprints.app_manager')
+        published = _get_published_app_ids()
+        if published is None:
+            return []  # can't verify what's downloadable — keep all files
         seen = set()
         result = []
         for app_id, (module_name, _, _, _) in am._OPTIONAL_BLUEPRINTS.items():
-            # Don't strip core app backends — they must stay on disk
             if app_id in am.CORE_APPS:
                 continue
+            if app_id not in published:
+                continue  # keep bundled — not yet published for download
             if module_name not in seen:
                 seen.add(module_name)
                 result.append(module_name + '.py')
@@ -1327,6 +1358,19 @@ cat > "$ROOT/etc/logrotate.d/ethos" <<'LOGROTATE'
     maxsize 100M
 }}
 LOGROTATE
+
+# ── Persistent journald (survive reboots — critical for NAS debugging) ──
+mkdir -p "$ROOT/etc/systemd/journald.conf.d"
+cat > "$ROOT/etc/systemd/journald.conf.d/ethos.conf" <<'JOURNALD'
+[Journal]
+Storage=persistent
+SystemMaxUse=100M
+SystemKeepFree=200M
+MaxRetentionSec=2week
+Compress=yes
+JOURNALD
+mkdir -p "$ROOT/var/log/journal"
+
 cat > "$ROOT/etc/hosts" <<HOSTS
 127.0.0.1   localhost
 127.0.1.1   $DEFAULT_HOSTNAME
@@ -1540,11 +1584,16 @@ DEVMONSVC
 ln -sf /etc/systemd/system/devmon@.service "$ROOT/etc/systemd/system/multi-user.target.wants/devmon@devmon.service"
 echo "LOG:devmon USB automount OK"
 
-# NetworkManager config for AP shared mode (dnsmasq) and WiFi scan
+# NetworkManager config — manage ALL devices (Ubuntu server defaults to WiFi-only)
 mkdir -p "$ROOT/etc/NetworkManager/conf.d"
 cat > "$ROOT/etc/NetworkManager/conf.d/00-ethos.conf" <<'NMCFG'
 [main]
 dns=dnsmasq
+
+[keyfile]
+# Override Ubuntu's 10-globally-managed-devices.conf which only manages WiFi.
+# EthOS needs NM to manage ethernet too (no netplan/networkd).
+unmanaged-devices=none
 
 [device]
 wifi.scan-rand-mac-address=no
@@ -1609,7 +1658,7 @@ cat > "$ROOT/etc/default/grub" <<GRUBDEF
 GRUB_DEFAULT=0
 GRUB_TIMEOUT=3
 GRUB_DISTRIBUTOR="EthOS"
-GRUB_CMDLINE_LINUX_DEFAULT="quiet net.ifnames=0 biosdevname=0"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet loglevel=3 rd.systemd.show_status=auto vt.global_cursor_default=0 splash net.ifnames=0 biosdevname=0"
 GRUB_CMDLINE_LINUX=""
 GRUBDEF
 
@@ -1641,8 +1690,13 @@ if [ "$GRUB_RC" -ne 0 ] || [ ! -f "$GRUB_EFI_BIN" ]; then
     exit 1
 fi
 
-KERN=$(ls "$ROOT/boot/vmlinuz-"* 2>/dev/null | sort -V | tail -1 | sed "s|$ROOT||")
-INITRD=$(ls "$ROOT/boot/initrd.img-"* 2>/dev/null | sort -V | tail -1 | sed "s|$ROOT||")
+KERN=$(ls "$ROOT/boot/vmlinuz-"* 2>/dev/null | sort -V | tail -1 | sed "s|$ROOT||") || true
+INITRD=$(ls "$ROOT/boot/initrd.img-"* 2>/dev/null | sort -V | tail -1 | sed "s|$ROOT||") || true
+
+# If kernel not found at this stage (e.g. initrd not yet generated), use symlinks as fallback
+if [ -z "$KERN" ] && [ -L "$ROOT/boot/vmlinuz" ]; then
+    KERN="/boot/vmlinuz"
+fi
 
 mkdir -p "$ROOT/boot/grub"
 cat > "$ROOT/boot/grub/grub.cfg" <<GRUBCFG
@@ -1653,17 +1707,27 @@ insmod ext2
 insmod gzio
 menuentry "EthOS v${{VERSION}}" {{
     search --no-floppy --fs-uuid --set=root ${{ROOT_UUID}}
-    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro quiet net.ifnames=0 biosdevname=0 fsck.repair=preen console=ttyS0,115200n8
+    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro quiet loglevel=3 rd.systemd.show_status=auto vt.global_cursor_default=0 splash net.ifnames=0 biosdevname=0 fsck.repair=preen console=tty0 console=ttyS0,115200n8
     initrd ${{INITRD}}
 }}
 menuentry "EthOS v${{VERSION}} (recovery)" {{
     search --no-floppy --fs-uuid --set=root ${{ROOT_UUID}}
-    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro single nomodeset fsck.repair=preen
+    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro single nomodeset fsck.repair=preen console=tty0 console=ttyS0,115200n8
     initrd ${{INITRD}}
 }}
 GRUBCFG
 
 cp "$ROOT/boot/grub/grub.cfg" "$ROOT/boot/efi/EFI/BOOT/grub.cfg"
+
+# GRUB's embedded prefix is /boot/grub — create that path on the ESP too,
+# so insmod ext2 and grub.cfg are found regardless of which device GRUB sees as root
+mkdir -p "$ROOT/boot/efi/boot/grub/x86_64-efi"
+cp "$ROOT/boot/grub/grub.cfg" "$ROOT/boot/efi/boot/grub/grub.cfg"
+for _mod in ext2 part_gpt part_msdos gzio linux normal search search_fs_uuid \
+            search_label configfile all_video boot fat efi_gop video video_fb; do
+    cp "$ROOT/boot/grub/x86_64-efi/${{_mod}}.mod" \
+       "$ROOT/boot/efi/boot/grub/x86_64-efi/" 2>/dev/null || true
+done
 
 # Copy kernel + initrd to ESP recovery directory
 mkdir -p "$ROOT/boot/efi/EFI/recovery"
@@ -1692,13 +1756,30 @@ chroot "$ROOT" apt-get install -y -qq \
     gnupg age \
     2>&1 | tail -10 || echo "LOG:Some packages skipped"
 
+echo "LOG:Installing Plymouth for boot splash..."
+chroot "$ROOT" apt-get install -y -qq plymouth plymouth-themes 2>&1 | tail -5 || echo "LOG:Plymouth skipped"
+# Set Plymouth theme without -R (initramfs is rebuilt later in the script)
+chroot "$ROOT" plymouth-set-default-theme spinner 2>/dev/null || echo "LOG:Plymouth theme alternatives skipped"
+mkdir -p "$ROOT/etc/plymouth"
+cat > "$ROOT/etc/plymouth/plymouthd.conf" <<PLYCFG
+[Daemon]
+Theme=spinner
+ShowDelay=0
+PLYCFG
+echo "LOG:Plymouth theme set to spinner"
+
 echo "LOG:Installing firmware..."
 if [ "$BASE_DISTRO" = "ubuntu" ]; then
-    chroot "$ROOT" apt-get install -y -qq linux-firmware bluez 2>&1 | tail -5 || echo "LOG:Some firmware skipped"
+    # Selective firmware: WiFi + NIC essentials only (~50MB vs ~800MB for full linux-firmware)
+    chroot "$ROOT" apt-get install -y -qq \
+        linux-firmware \
+        2>&1 | tail -5 || echo "LOG:Some firmware skipped"
+    # NOTE: linux-firmware is needed for now (Ubuntu bundles all firmware in one package).
+    # When Ubuntu provides granular firmware packages, switch to selective.
 else
     chroot "$ROOT" apt-get install -y -qq \
         firmware-atheros firmware-realtek firmware-brcm80211 \
-        firmware-misc-nonfree firmware-linux-nonfree bluez firmware-intel-sound \
+        firmware-misc-nonfree firmware-linux-nonfree firmware-intel-sound \
         2>&1 | tail -10 || echo "LOG:Some firmware skipped"
 fi
 
@@ -1710,6 +1791,13 @@ chroot "$ROOT" apt-get install -y -qq \
     debootstrap squashfs-tools xorriso isolinux \
     parted dosfstools e2fsprogs btrfs-progs mtools \
     2>&1 | tail -5 || echo "LOG:Some builder tools skipped"
+
+# Install spec-defined extra packages (from build-spec.yaml packages.apt_extra)
+if [ -n "$APT_EXTRA_PKGS" ]; then
+    echo "LOG:Installing spec apt_extra packages: $APT_EXTRA_PKGS"
+    chroot "$ROOT" apt-get install -y -qq $APT_EXTRA_PKGS \
+        2>&1 | tail -10 || echo "LOG:Some apt_extra packages skipped"
+fi
 
 echo "STEP:73:Installing kernel and firmware updates..."
 
@@ -1749,12 +1837,12 @@ insmod ext2
 insmod gzio
 menuentry "EthOS v${{VERSION}}" {{
     search --no-floppy --fs-uuid --set=root ${{ROOT_UUID}}
-    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro quiet net.ifnames=0 biosdevname=0 fsck.repair=preen console=ttyS0,115200n8
+    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro quiet loglevel=3 rd.systemd.show_status=auto vt.global_cursor_default=0 splash net.ifnames=0 biosdevname=0 fsck.repair=preen console=tty0 console=ttyS0,115200n8
     initrd ${{INITRD}}
 }}
 menuentry "EthOS v${{VERSION}} (recovery)" {{
     search --no-floppy --fs-uuid --set=root ${{ROOT_UUID}}
-    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro single nomodeset fsck.repair=preen
+    linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro single nomodeset fsck.repair=preen console=tty0 console=ttyS0,115200n8
     initrd ${{INITRD}}
 }}
 GRUBCFG
@@ -1765,6 +1853,14 @@ cp "$ROOT/boot/${{INITRD##*/}}" "$ROOT/boot/efi/EFI/recovery/initrd.img" 2>/dev/
 # Re-run grub-install to refresh BOOTX64.EFI modules
 chroot "$ROOT" grub-install --target=x86_64-efi --efi-directory=/boot/efi \
     --boot-directory=/boot --removable --no-nvram 2>/dev/null || echo "LOG:grub-install refresh skipped"
+# grub-install overwrites ESP grub.cfg — re-copy everything to ESP
+cp "$ROOT/boot/grub/grub.cfg" "$ROOT/boot/efi/EFI/BOOT/grub.cfg"
+cp "$ROOT/boot/grub/grub.cfg" "$ROOT/boot/efi/boot/grub/grub.cfg"
+for _mod in ext2 part_gpt part_msdos gzio linux normal search search_fs_uuid \
+            search_label configfile all_video boot fat efi_gop video video_fb; do
+    cp "$ROOT/boot/grub/x86_64-efi/${{_mod}}.mod" \
+       "$ROOT/boot/efi/boot/grub/x86_64-efi/" 2>/dev/null || true
+done
 echo "LOG:GRUB refreshed for latest kernel"
 
 if [ "$BASE_DISTRO" = "ubuntu" ]; then
@@ -1831,6 +1927,7 @@ prereqs() {{ echo "$PREREQ"; }}
 case "$1" in prereqs) prereqs; exit 0 ;; esac
 grep -q "ethos.rootfs=squashfs" /proc/cmdline || exit 0
 [ -f "${{rootmnt}}/root.sqsh" ] || exit 0
+echo "ethos-overlay: starting SquashFS overlay setup"
 modprobe -q squashfs 2>/dev/null || true
 modprobe -q overlay 2>/dev/null || true
 modprobe -q loop 2>/dev/null || true
@@ -1855,6 +1952,7 @@ if [ -n "$DATA_DEV" ]; then
         WORK="$DATA_MNT/ethos/overlay/$SLOT/work"
         mkdir -p "$UPPER" "$WORK"
         DATA_UPPER=1
+        echo "ethos-overlay: using EthOS-Data btrfs for overlay upper=$UPPER"
     fi
 fi
 
@@ -1863,11 +1961,12 @@ if [ -z "$DATA_UPPER" ]; then
     UPPER=/run/ethos-rootfs/overlay/upper
     WORK=/run/ethos-rootfs/overlay/work
     mkdir -p "$UPPER" "$WORK"
+    echo "ethos-overlay: using Root partition for overlay upper=$UPPER"
 fi
 
 # dm-verity integrity check (optional — runs if roothash and verity data exist)
 VERITY_OK=0
-ROOTHASH_FILE="/run/ethos-rootfs/boot/efi/EFI/ethos/roothash"
+ROOTHASH_FILE="/run/ethos-rootfs/root.sqsh.roothash"
 VERITY_FILE="/run/ethos-rootfs/root.sqsh.verity"
 SQSH_FILE="/run/ethos-rootfs/root.sqsh"
 if [ -f "$ROOTHASH_FILE" ] && [ -f "$VERITY_FILE" ] && command -v veritysetup >/dev/null 2>&1; then
@@ -1894,15 +1993,20 @@ fi
 # Standard mount (no verity or verity unavailable)
 if [ "$VERITY_OK" = "0" ]; then
     mkdir -p /run/ethos-sqsh
-    if ! mount -t squashfs -o ro,loop "$SQSH_FILE" /run/ethos-sqsh 2>/dev/null; then
+    echo "ethos-overlay: mounting squashfs from $SQSH_FILE"
+    if ! mount -t squashfs -o ro,loop "$SQSH_FILE" /run/ethos-sqsh; then
+        echo "ethos-overlay: FAILED to mount squashfs — falling back to raw root"
         mount --move /run/ethos-rootfs "${{rootmnt}}"
         exit 0
     fi
+    echo "ethos-overlay: squashfs mounted OK"
 fi
 
+echo "ethos-overlay: mounting overlay lowerdir=/run/ethos-sqsh upperdir=$UPPER workdir=$WORK"
 if ! mount -t overlay overlay \
     -o "lowerdir=/run/ethos-sqsh,upperdir=$UPPER,workdir=$WORK" \
-    "${{rootmnt}}" 2>/dev/null; then
+    "${{rootmnt}}"; then
+    echo "ethos-overlay: FAILED to mount overlay — falling back to raw root"
     umount /run/ethos-sqsh 2>/dev/null
     [ "$VERITY_OK" = "1" ] && veritysetup close ethos-verity 2>/dev/null
     [ -n "$DATA_UPPER" ] && umount /run/ethos-data 2>/dev/null
@@ -1912,6 +2016,11 @@ fi
 mkdir -p "${{rootmnt}}/.squashfs" "${{rootmnt}}/.rootfs"
 mount --move /run/ethos-rootfs "${{rootmnt}}/.rootfs"
 mount --move /run/ethos-sqsh "${{rootmnt}}/.squashfs"
+# Ensure essential mount-point dirs exist (they may be absent from squashfs)
+for _d in dev proc sys run tmp media mnt; do
+    mkdir -p "${{rootmnt}}/$_d"
+done
+echo "ethos-overlay: overlay boot setup COMPLETE"
 # Expose data partition mount inside the new root for runtime use
 if [ -n "$DATA_UPPER" ]; then
     mkdir -p "${{rootmnt}}/run/ethos-data"
@@ -1919,6 +2028,32 @@ if [ -n "$DATA_UPPER" ]; then
 fi
 OVERLAYEOF
 chmod +x "$ROOT/etc/initramfs-tools/scripts/local-bottom/ethos-overlay"
+
+# ── Emergency boot diagnostics: dump dmesg to ESP ──
+cat > "$ROOT/etc/initramfs-tools/scripts/local-bottom/ethos-bootlog" <<'BOOTLOGEOF'
+#!/bin/sh
+# Emergency dmesg dump to ESP — accessible even if root fails to mount.
+# Saved to FAT32 EFI partition which is always mountable from rescue USB.
+PREREQ=""
+prereqs() {{ echo "$PREREQ"; }}
+case "$1" in prereqs) prereqs; exit 0 ;; esac
+ESP=""
+for p in /boot/efi /efi; do
+    if mountpoint -q "${{rootmnt}}$p" 2>/dev/null; then ESP="${{rootmnt}}$p"; break; fi
+done
+if [ -z "$ESP" ]; then
+    ESP_DEV=$(blkid -t TYPE=vfat -o device 2>/dev/null | sed -n '1p')
+    if [ -n "$ESP_DEV" ]; then
+        mkdir -p /run/ethos-esp
+        mount -t vfat "$ESP_DEV" /run/ethos-esp 2>/dev/null && ESP="/run/ethos-esp"
+    fi
+fi
+if [ -n "$ESP" ]; then
+    mkdir -p "$ESP/EFI/ethos/logs"
+    dmesg > "$ESP/EFI/ethos/logs/last-dmesg.log" 2>/dev/null || true
+fi
+BOOTLOGEOF
+chmod +x "$ROOT/etc/initramfs-tools/scripts/local-bottom/ethos-bootlog"
 
 # Rebuild initramfs with firmware + overlay hooks (only for the new kernel)
 echo "LOG:Przebudowa initramfs..."
@@ -2312,6 +2447,12 @@ if command -v mksquashfs >/dev/null 2>&1; then
     echo "STEP:87:Creating SquashFS immutable root image..."
 
     ETHOS_DIR_SQ="$ROOT/opt/ethos"
+    # Back up venv before symlinking (needed for installer on the raw image)
+    VENV_BACKUP="$WORK_DIR/venv-backup"
+    if [ -d "$ETHOS_DIR_SQ/venv/bin" ]; then
+        cp -a "$ETHOS_DIR_SQ/venv" "$VENV_BACKUP"
+        echo "LOG:venv backed up for installer restore"
+    fi
     # Prepare clean installed-system state (squashfs should NOT contain installer artifacts)
     for d in data logs backups uploads venv; do
         rm -rf "$ETHOS_DIR_SQ/$d"
@@ -2321,16 +2462,26 @@ if command -v mksquashfs >/dev/null 2>&1; then
     mkdir -p "$ROOT/mnt/data"
     mkdir -p "$ROOT/mnt/snapshots"
 
+    # Unmount bind-mounted pseudo-filesystems BEFORE cleaning/squashing.
+    # These were bind-mounted for chroot operations (apt, grub-install, etc.)
+    # and if left mounted, mksquashfs would include host /proc, /sys, /dev content.
+    for m in boot/efi run sys proc dev/shm dev/pts dev; do
+        umount "$ROOT/$m" 2>/dev/null || \
+            umount -l "$ROOT/$m" 2>/dev/null || true
+    done
+    sleep 1
+
+    # Clean virtual-fs directories: keep empty mount-point dirs in squashfs
+    # so the initramfs overlay has /dev, /proc, /sys, /run, /tmp available.
+    for vfs in dev proc sys run tmp media; do
+        rm -rf "$ROOT/$vfs"
+        mkdir -p "$ROOT/$vfs"
+    done
+
     SQSH_OUT="$WORK_DIR/ethos-root.sqsh"
     mksquashfs "$ROOT" "$SQSH_OUT" \
         -comp zstd -Xcompression-level $SQSH_COMPRESSION_LEVEL \
         -noappend -no-progress \
-        -e "$ROOT/proc" \
-        -e "$ROOT/sys" \
-        -e "$ROOT/dev" \
-        -e "$ROOT/run" \
-        -e "$ROOT/tmp" \
-        -e "$ROOT/media" \
         -e "$ROOT/lost+found" \
         -e "$ROOT/swapfile" \
         -e "$ROOT/var/swap" \
@@ -2376,10 +2527,19 @@ print('LOG:Manifest written: ' + p if p else 'LOG:WARNING: manifest signing fail
     fi
 
     # Restore USB/installer state (so the USB can still boot the installer)
-    for d in data logs backups uploads venv; do
+    for d in data logs backups uploads; do
         rm -f "$ETHOS_DIR_SQ/$d"
         mkdir -p "$ETHOS_DIR_SQ/$d"
     done
+    # Restore venv from backup (installer needs working Python + Flask)
+    rm -f "$ETHOS_DIR_SQ/venv"
+    if [ -d "$VENV_BACKUP/bin" ]; then
+        mv "$VENV_BACKUP" "$ETHOS_DIR_SQ/venv"
+        echo "LOG:venv restored for installer"
+    else
+        mkdir -p "$ETHOS_DIR_SQ/venv"
+        echo "LOG:WARNING: venv backup missing — installer may not work"
+    fi
     touch "$ETHOS_DIR_SQ/.installer-mode"
 else
     echo "LOG:WARNING: mksquashfs not found — SquashFS image will not be created"
