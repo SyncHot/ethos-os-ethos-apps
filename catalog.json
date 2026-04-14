@@ -215,7 +215,7 @@
         {
             "id": "builder",
             "name": "Builder",
-            "version": "1.0.7",
+            "version": "1.0.8",
             "icon": "fa-hammer",
             "color": "#f97316",
             "category": "System",
@@ -234,7 +234,7 @@
         {
             "id": "disk-repair",
             "name": "Disk Repair",
-            "version": "1.0.13",
+            "version": "1.0.14",
             "icon": "fa-wrench",
             "color": "#ef4444",
             "category": "Storage",
@@ -247,7 +247,8 @@
             "pip_deps": [],
             "install_endpoint": "/api/diskrepair/install",
             "uninstall_endpoint": "/api/diskrepair/uninstall",
-            "status_endpoint": "/api/diskrepair/pkg-status"
+            "status_endpoint": "/api/diskrepair/pkg-status",
+            "hidden": true
         },
         {
             "id": "remote-log",
@@ -267,7 +268,7 @@
         {
             "id": "sharing-samba",
             "name": "File Sharing (Samba)",
-            "version": "1.0.13",
+            "version": "1.0.14",
             "icon": "fa-windows",
             "color": "#6366f1",
             "category": "Network",
@@ -279,12 +280,13 @@
             "pip_deps": [],
             "install_endpoint": "/api/storage/samba/pkg-install",
             "uninstall_endpoint": "/api/storage/samba/pkg-uninstall",
-            "status_endpoint": "/api/storage/samba/pkg-status"
+            "status_endpoint": "/api/storage/samba/pkg-status",
+            "hidden": true
         },
         {
             "id": "sharing-nfs",
             "name": "NFS",
-            "version": "1.0.13",
+            "version": "1.0.14",
             "icon": "fa-network-wired",
             "color": "#6366f1",
             "category": "Network",
@@ -296,12 +298,13 @@
             "pip_deps": [],
             "install_endpoint": "/api/storage/nfs/pkg-install",
             "uninstall_endpoint": "/api/storage/nfs/pkg-uninstall",
-            "status_endpoint": "/api/storage/nfs/pkg-status"
+            "status_endpoint": "/api/storage/nfs/pkg-status",
+            "hidden": true
         },
         {
             "id": "sharing-dlna",
             "name": "DLNA (MiniDLNA)",
-            "version": "1.0.14",
+            "version": "1.0.15",
             "icon": "fa-photo-video",
             "color": "#6366f1",
             "category": "Media",
@@ -313,12 +316,13 @@
             "pip_deps": [],
             "install_endpoint": "/api/storage/dlna/pkg-install",
             "uninstall_endpoint": "/api/storage/dlna/pkg-uninstall",
-            "status_endpoint": "/api/storage/dlna/pkg-status"
+            "status_endpoint": "/api/storage/dlna/pkg-status",
+            "hidden": true
         },
         {
             "id": "sharing-webdav",
             "name": "WebDAV",
-            "version": "1.0.13",
+            "version": "1.0.14",
             "icon": "fa-globe",
             "color": "#6366f1",
             "category": "Network",
@@ -330,12 +334,13 @@
             "pip_deps": [],
             "install_endpoint": "/api/storage/webdav/pkg-install",
             "uninstall_endpoint": "/api/storage/webdav/pkg-uninstall",
-            "status_endpoint": "/api/storage/webdav/pkg-status"
+            "status_endpoint": "/api/storage/webdav/pkg-status",
+            "hidden": true
         },
         {
             "id": "sharing-sftp",
             "name": "SFTP",
-            "version": "1.0.13",
+            "version": "1.0.14",
             "icon": "fa-lock",
             "color": "#6366f1",
             "category": "Network",
@@ -347,12 +352,13 @@
             "pip_deps": [],
             "install_endpoint": "/api/storage/sftp/pkg-install",
             "uninstall_endpoint": "/api/storage/sftp/pkg-uninstall",
-            "status_endpoint": "/api/storage/sftp/pkg-status"
+            "status_endpoint": "/api/storage/sftp/pkg-status",
+            "hidden": true
         },
         {
             "id": "sharing-ftp",
             "name": "FTP",
-            "version": "1.0.13",
+            "version": "1.0.14",
             "icon": "fa-upload",
             "color": "#6366f1",
             "category": "Network",
@@ -364,7 +370,8 @@
             "pip_deps": [],
             "install_endpoint": "/api/storage/ftp/pkg-install",
             "uninstall_endpoint": "/api/storage/ftp/pkg-uninstall",
-            "status_endpoint": "/api/storage/ftp/pkg-status"
+            "status_endpoint": "/api/storage/ftp/pkg-status",
+            "hidden": true
         },
         {
             "id": "domains-manager",
@@ -416,7 +423,7 @@
         {
             "id": "raid-lvm",
             "name": "RAID / LVM",
-            "version": "1.0.13",
+            "version": "1.0.14",
             "icon": "fa-layer-group",
             "color": "#f59e0b",
             "category": "Storage",
@@ -429,7 +436,8 @@
             "pip_deps": [],
             "install_endpoint": "/api/raid/install",
             "uninstall_endpoint": "/api/raid/uninstall",
-            "status_endpoint": "/api/raid/pkg-status"
+            "status_endpoint": "/api/raid/pkg-status",
+            "hidden": true
         },
         {
             "id": "wireguard",
