@@ -135,7 +135,7 @@
         {
             "id": "vm-manager",
             "name": "VM Manager",
-            "version": "1.0.4",
+            "version": "1.0.5",
             "icon": "fa-desktop",
             "color": "#8b5cf6",
             "category": "System",
