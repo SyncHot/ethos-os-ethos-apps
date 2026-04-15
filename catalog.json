@@ -461,15 +461,17 @@
         {
             "id": "antivirus",
             "name": "Antivirus (ClamAV)",
-            "version": "1.0.3",
+            "version": "1.0.4",
             "icon": "fa-shield-virus",
             "color": "#16a34a",
             "category": "Security",
             "admin_only": true,
-            "description": "ClamAV antywirus — skanowanie na zadanie i zaplanowane.",
+            "description": "ClamAV antywirus — skanowanie na zadanie i zaplanowane (tryb daemon).",
             "apt_deps": [
                 "clamav",
-                "clamav-freshclam"
+                "clamav-freshclam",
+                "clamav-daemon",
+                "clamdscan"
             ],
             "pip_deps": [],
             "install_endpoint": "/api/antivirus/install",
