@@ -234,7 +234,7 @@
         {
             "id": "disk-repair",
             "name": "Disk Repair",
-            "version": "1.0.17",
+            "version": "1.0.18",
             "icon": "fa-wrench",
             "color": "#ef4444",
             "category": "Storage",
@@ -268,7 +268,7 @@
         {
             "id": "sharing-samba",
             "name": "File Sharing (Samba)",
-            "version": "1.0.17",
+            "version": "1.0.18",
             "icon": "fa-windows",
             "color": "#6366f1",
             "category": "Network",
@@ -286,7 +286,7 @@
         {
             "id": "sharing-nfs",
             "name": "NFS",
-            "version": "1.0.17",
+            "version": "1.0.18",
             "icon": "fa-network-wired",
             "color": "#6366f1",
             "category": "Network",
@@ -304,7 +304,7 @@
         {
             "id": "sharing-dlna",
             "name": "DLNA (MiniDLNA)",
-            "version": "1.0.18",
+            "version": "1.0.19",
             "icon": "fa-photo-video",
             "color": "#6366f1",
             "category": "Media",
@@ -322,7 +322,7 @@
         {
             "id": "sharing-webdav",
             "name": "WebDAV",
-            "version": "1.0.17",
+            "version": "1.0.18",
             "icon": "fa-globe",
             "color": "#6366f1",
             "category": "Network",
@@ -340,7 +340,7 @@
         {
             "id": "sharing-sftp",
             "name": "SFTP",
-            "version": "1.0.17",
+            "version": "1.0.18",
             "icon": "fa-lock",
             "color": "#6366f1",
             "category": "Network",
@@ -358,7 +358,7 @@
         {
             "id": "sharing-ftp",
             "name": "FTP",
-            "version": "1.0.17",
+            "version": "1.0.18",
             "icon": "fa-upload",
             "color": "#6366f1",
             "category": "Network",
@@ -423,7 +423,7 @@
         {
             "id": "raid-lvm",
             "name": "RAID / LVM",
-            "version": "1.0.17",
+            "version": "1.0.18",
             "icon": "fa-layer-group",
             "color": "#f59e0b",
             "category": "Storage",
@@ -719,6 +719,20 @@
             "description": "Zarzadzanie uslugami systemowymi.",
             "apt_deps": [],
             "pip_deps": []
+        },
+        {
+            "id": "ldap",
+            "name": "LDAP / Active Directory",
+            "version": "0.0.1",
+            "icon": "fa-sitemap",
+            "color": "#7c3aed",
+            "category": "System",
+            "admin_only": true,
+            "description": "Integracja z LDAP i Active Directory dla centralnego zarzadzania uzytkownikami.",
+            "apt_deps": [],
+            "pip_deps": [
+                "ldap3"
+            ]
         }
     ]
 }
