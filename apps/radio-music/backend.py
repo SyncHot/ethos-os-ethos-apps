@@ -75,7 +75,7 @@ from gevent.lock import BoundedSemaphore as _GeventBoundedSemaphore
 
 from flask import Blueprint, g, jsonify, request, Response, send_file, after_this_request, redirect
 
-from host import data_path, safe_path, q as shq
+from host import data_path, safe_path, q as shq, get_user_home
 
 log = logging.getLogger('ethos.radio_music')
 
@@ -747,6 +747,9 @@ def save_playback_state():
     pfile = _user_file('playback_state.json')
     _save_json(pfile, data)
     return jsonify({'ok': True})
+
+
+@radio_music_bp.route('/lyrics', methods=['GET'])
 def lyrics_search():
     """Fetch song lyrics from lrclib.net (free, no API key needed)."""
     title = request.args.get('title', '').strip()
@@ -824,13 +827,15 @@ def _music_folders_file():
 def _default_music_dir():
     """User's home Music folder, always included."""
     username = getattr(g, 'username', None) or 'default'
-    return os.path.join('/home', username, 'Music')
+    home = get_user_home(username)
+    return os.path.join(home, 'Music')
 
 
 def _default_audiobooks_dir():
     """User's home Audiobooks folder."""
     username = getattr(g, 'username', None) or 'default'
-    return os.path.join('/home', username, 'Audiobooks')
+    home = get_user_home(username)
+    return os.path.join(home, 'Audiobooks')
 
 
 def _get_music_folders():
@@ -1029,7 +1034,7 @@ def local_delete_folder():
     return jsonify({'ok': True})
 
 
-
+@radio_music_bp.route('/local/stream', methods=['GET'])
 def local_stream():
     """Stream a local audio file."""
     fpath = request.args.get('path', '').lstrip()
@@ -1178,6 +1183,37 @@ def _music_download_dir():
     return d
 
 
+_VARIOUS_ARTISTS_PLAYLIST = 'Various Artists'
+
+
+def _add_to_playlist_by_name(track_info, username, playlist_name):
+    """Auto-add a downloaded track to a named playlist (create if missing)."""
+    try:
+        user_dir = os.path.join(_DATA_DIR, 'users', username)
+        os.makedirs(user_dir, exist_ok=True)
+        pfile = os.path.join(user_dir, 'playlists.json')
+        pls = _load_json(pfile, [])
+        pl = next((p for p in pls if p.get('name') == playlist_name), None)
+        if not pl:
+            pl = {
+                'id': str(int(time.time() * 1000)),
+                'name': playlist_name,
+                'tracks': [],
+                'created_at': time.time(),
+                'updated_at': time.time(),
+            }
+            pls.append(pl)
+        # Skip if track URL already in this playlist
+        if any(t.get('url') == track_info.get('url') for t in pl.get('tracks', [])):
+            return
+        track_info['added_at'] = time.time()
+        pl['tracks'].append(track_info)
+        pl['updated_at'] = time.time()
+        _save_json(pfile, pls)
+    except Exception:
+        pass
+
+
 @radio_music_bp.route('/music/download', methods=['POST'])
 def music_download():
     """Download a track to the user's music folder using yt-dlp."""
@@ -1185,6 +1221,16 @@ def music_download():
     url = body.get('url', '').strip()
     title = body.get('title', 'Unknown')
     folder = body.get('folder', '').strip()
+    playlist = body.get('playlist', '').strip()
+    track_meta = {
+        'type': body.get('type', 'music'),
+        'url': url,
+        'title': title,
+        'artist': body.get('artist', ''),
+        'thumbnail': body.get('thumbnail', ''),
+        'duration': body.get('duration', 0),
+        'source': body.get('source', 'youtube'),
+    }
     if not url:
         return jsonify({'error': 'Brak URL'}), 400
 
@@ -1192,9 +1238,9 @@ def music_download():
     if not ytdlp:
         return jsonify({'error': 'yt-dlp nie jest zainstalowane'}), 503
 
+    username = getattr(g, 'username', None) or 'default'
     if folder:
-        username = getattr(g, 'username', None) or 'default'
-        dest = os.path.join('/home', username, folder)
+        dest = os.path.join(get_user_home(username), folder)
     else:
         dest = _music_download_dir()
     os.makedirs(dest, exist_ok=True)
@@ -1205,18 +1251,26 @@ def music_download():
             'title': title, 'error': None, 'path': None,
         }
 
+    target_playlist = playlist or _VARIOUS_ARTISTS_PLAYLIST
+
     from host import host_run
 
     def _do_download():
         try:
-            # Organize: Artist/Album/Title.mp3
-            # YouTube always has uploader; album may be missing
-            out_tmpl = os.path.join(
-                dest,
-                '%(uploader|Unknown Artist)s',
-                '%(album|Singles)s',
-                '%(title)s.%(ext)s'
-            )
+            if not playlist:
+                # Single track → flat file in Various Artists folder
+                out_tmpl = os.path.join(
+                    dest, _VARIOUS_ARTISTS_PLAYLIST,
+                    '%(title)s.%(ext)s'
+                )
+            else:
+                # Playlist context → Artist/Album/Title.mp3
+                out_tmpl = os.path.join(
+                    dest,
+                    '%(uploader|Unknown Artist)s',
+                    '%(album|Singles)s',
+                    '%(title)s.%(ext)s'
+                )
             cmd = (
                 f'{shq(ytdlp)} -f bestaudio -x --audio-format mp3 --audio-quality 0 '
                 f'--embed-thumbnail --embed-metadata --no-playlist --no-warnings '
@@ -1240,9 +1294,13 @@ def music_download():
                     _DOWNLOAD_JOBS[job_id]['status'] = 'done'
                     _DOWNLOAD_JOBS[job_id]['progress'] = 100
                     _DOWNLOAD_JOBS[job_id]['path'] = out_file or dest
+                    success = True
                 else:
                     _DOWNLOAD_JOBS[job_id]['status'] = 'error'
                     _DOWNLOAD_JOBS[job_id]['error'] = (r.stderr or 'Nieznany błąd')[:200]
+                    success = False
+            if success:
+                _add_to_playlist_by_name(track_meta, username, target_playlist)
         except Exception as e:
             with _DOWNLOAD_LOCK:
                 _DOWNLOAD_JOBS[job_id]['status'] = 'error'
@@ -1927,7 +1985,7 @@ def archive_start():
                         db3[key]['size_bytes'] = os.path.getsize(nas_path)
                         # Also copy to ~/Music/RadioMusic/ for direct file access
                         try:
-                            music_rm_dir = os.path.join('/home', req_username, 'Music', 'RadioMusic')
+                            music_rm_dir = os.path.join(get_user_home(req_username), 'Music', 'RadioMusic')
                             os.makedirs(music_rm_dir, exist_ok=True)
                             safe_title = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', title or key)[:120]
                             music_dest = os.path.join(music_rm_dir, safe_title + '.mp3')
@@ -1975,16 +2033,28 @@ def archive_batch():
     with _ARCHIVE_LOCK:
         db = _load_archive()
     results = {}
+    changed = False
     for url in urls:
         k = _archive_key(url)
         entry = db.get(k, {})
+        status = entry.get('status', 'none')
+        # If marked done but file was deleted from disk, reset to allow re-download
+        if status == 'done':
+            nas_path = entry.get('nas_path', '')
+            if not nas_path or not os.path.isfile(nas_path):
+                status = 'none'
+                db.pop(k, None)
+                changed = True
         results[url] = {
             'key': k,
-            'status': entry.get('status', 'none'),
+            'status': status,
             'progress': entry.get('progress', 0),
             'size_bytes': entry.get('size_bytes', 0),
             'title': entry.get('title', ''),
         }
+    if changed:
+        with _ARCHIVE_LOCK:
+            _save_archive(db)
     return jsonify({'results': results})
 
 
@@ -2039,7 +2109,12 @@ def archive_file(key):
         return jsonify({'error': 'Not found'}), 404
     nas_path = entry.get('nas_path')
     if not nas_path or not os.path.isfile(nas_path):
-        return jsonify({'error': 'File missing on NAS — was it deleted?'}), 404
+        # File deleted from disk — purge stale DB entry so UI resets to "not archived"
+        with _ARCHIVE_LOCK:
+            db2 = _load_archive()
+            db2.pop(key, None)
+            _save_archive(db2)
+        return jsonify({'error': 'File missing on NAS — re-archive to download again'}), 404
     resp = send_file(nas_path, mimetype='audio/mpeg', conditional=True)
     resp.headers['Access-Control-Allow-Origin'] = '*'
     resp.headers['Cache-Control'] = 'no-cache'

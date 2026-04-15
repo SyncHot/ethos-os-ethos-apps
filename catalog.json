@@ -668,7 +668,7 @@
         {
             "id": "radio-music",
             "name": "Radio & Music",
-            "version": "0.0.5",
+            "version": "0.0.6",
             "icon": "fa-broadcast-tower",
             "color": "#10b981",
             "category": "Media",
