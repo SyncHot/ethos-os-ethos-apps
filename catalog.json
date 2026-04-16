@@ -737,7 +737,7 @@
         {
             "id": "mail-server",
             "name": "Mail Server",
-            "version": "0.0.2",
+            "version": "0.0.3",
             "icon": "fa-envelope",
             "color": "#3b82f6",
             "category": "Network",
@@ -745,9 +745,12 @@
             "description": "Serwer poczty (Postfix + Dovecot) z obsluga IMAP/SMTP, DKIM, relay i certyfikatow SSL.",
             "apt_deps": [
                 "postfix",
+                "postfix-sqlite",
                 "dovecot-core",
                 "dovecot-imapd",
                 "dovecot-pop3d",
+                "dovecot-lmtpd",
+                "dovecot-sqlite",
                 "opendkim",
                 "opendkim-tools"
             ],
