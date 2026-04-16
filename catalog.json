@@ -737,7 +737,7 @@
         {
             "id": "mail-server",
             "name": "Mail Server",
-            "version": "0.0.3",
+            "version": "0.0.4",
             "icon": "fa-envelope",
             "color": "#3b82f6",
             "category": "Network",
