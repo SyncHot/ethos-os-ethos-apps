@@ -215,7 +215,7 @@ AppRegistry['mail-server'] = function (appDef) {
                 password: body.querySelector(`#${PREFIX}-wiz-password`).value,
             };
 
-            const res = await api('/mail-server/setup', { method: 'POST', body: JSON.stringify(data) });
+            const res = await api('/mail-server/setup', { method: 'POST', body: data });
             if (res.error) {
                 errDiv.textContent = res.error;
                 errDiv.style.display = 'block';
@@ -352,7 +352,7 @@ AppRegistry['mail-server'] = function (appDef) {
         dlg.body.querySelector(`#${PREFIX}-test-send-btn`).onclick = async () => {
             const from = dlg.body.querySelector(`#${PREFIX}-test-from`).value;
             const to = dlg.body.querySelector(`#${PREFIX}-test-to`).value;
-            const res = await api('/mail-server/test-send', { method: 'POST', body: JSON.stringify({ from, to }) });
+            const res = await api('/mail-server/test-send', { method: 'POST', body: { from, to } });
             if (res.ok) { toast(res.message || t('Wysłano'), 'success'); closeWindow('mail-test'); }
             else toast(res.error || t('Błąd'), 'error');
         };
@@ -414,7 +414,7 @@ AppRegistry['mail-server'] = function (appDef) {
         el.querySelectorAll(`.${PREFIX}-toggle-acc`).forEach(btn => {
             btn.onclick = async () => {
                 await api(`/mail-server/accounts/${encodeURIComponent(btn.dataset.email)}`, {
-                    method: 'PUT', body: JSON.stringify({ enabled: btn.dataset.enabled === '0' })
+                    method: 'PUT', body: { enabled: btn.dataset.enabled === '0' }
                 });
                 renderAccountsTab(el);
             };
@@ -438,11 +438,11 @@ AppRegistry['mail-server'] = function (appDef) {
         const dlg = createWindow('mail-new-acc', { title: t('Nowe konto'), width: 400, height: 320, modal: true });
         dlg.body.innerHTML = html;
         dlg.body.querySelector(`#${PREFIX}-save-account`).onclick = async () => {
-            const res = await api('/mail-server/accounts', { method: 'POST', body: JSON.stringify({
+            const res = await api('/mail-server/accounts', { method: 'POST', body: {
                 email: dlg.body.querySelector(`#${PREFIX}-new-email`).value,
                 password: dlg.body.querySelector(`#${PREFIX}-new-pass`).value,
                 quota_mb: parseInt(dlg.body.querySelector(`#${PREFIX}-new-quota`).value) || 1024,
-            })});
+            }});
             if (res.ok) { toast(t('Konto utworzone'), 'success'); closeWindow('mail-new-acc'); renderAccountsTab(parentEl); }
             else toast(res.error || t('Błąd'), 'error');
         };
@@ -484,7 +484,7 @@ AppRegistry['mail-server'] = function (appDef) {
         el.querySelector(`#${PREFIX}-add-domain`).onclick = async () => {
             const domain = prompt(t('Podaj domenę (np. example.com):'));
             if (!domain) return;
-            const res = await api('/mail-server/domains', { method: 'POST', body: JSON.stringify({ domain }) });
+            const res = await api('/mail-server/domains', { method: 'POST', body: { domain } });
             if (res.ok) { toast(t('Domena dodana'), 'success'); renderDomainsTab(el); }
             else toast(res.error || t('Błąd'), 'error');
         };
@@ -515,8 +515,13 @@ AppRegistry['mail-server'] = function (appDef) {
 
         let html = `
         <div style="margin:12px 0 8px">
-            <div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:8px">
+            <div style="font-size:13px;font-weight:600;color:var(--text-primary);margin-bottom:4px">
                 <i class="fas fa-info-circle" style="color:#3b82f6"></i> ${t('Dodaj te rekordy DNS u swojego dostawcy domeny:')}
+            </div>
+            <div style="font-size:11px;color:var(--text-muted);margin-bottom:10px">
+                <i class="fas fa-lightbulb" style="color:#f59e0b"></i>
+                ${t('Kolumna „Nazwa w DNS" pokazuje co wpisać w polu Name/Host u providera.')}
+                ${t('{at} oznacza domenę główną (root).', { at: '<code style="background:var(--bg-tertiary);padding:1px 5px;border-radius:3px;font-size:11px">@</code>' })}
             </div>
             <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
                 ${Object.keys(DNS_GUIDES).map(p => `<button class="btn btn-xs ${PREFIX}-dns-guide" data-provider="${p}">${p}</button>`).join('')}
@@ -526,7 +531,7 @@ AppRegistry['mail-server'] = function (appDef) {
         <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:8px">
             <thead><tr style="border-bottom:1px solid var(--border-color)">
                 <th style="padding:6px;text-align:left;color:var(--text-muted)">${t('Typ')}</th>
-                <th style="padding:6px;text-align:left;color:var(--text-muted)">${t('Nazwa')}</th>
+                <th style="padding:6px;text-align:left;color:var(--text-muted)">${t('Nazwa w DNS')}</th>
                 <th style="padding:6px;text-align:left;color:var(--text-muted)">${t('Wartość')}</th>
                 <th style="padding:6px;text-align:left;color:var(--text-muted)">${t('Co to jest?')}</th>
                 <th style="padding:6px"></th>
@@ -534,10 +539,13 @@ AppRegistry['mail-server'] = function (appDef) {
             <tbody>${records.map(r => `
                 <tr style="border-bottom:1px solid var(--border-color)">
                     <td style="padding:6px"><span style="background:#3b82f6;color:#fff;padding:2px 6px;border-radius:3px;font-size:11px;font-weight:600">${esc(r.type)}</span></td>
-                    <td style="padding:6px;color:var(--text-primary);word-break:break-all;max-width:150px">${esc(r.name)}</td>
+                    <td style="padding:6px;color:var(--text-primary);word-break:break-all;max-width:160px">
+                        <code style="background:var(--bg-tertiary);padding:2px 6px;border-radius:3px;font-weight:600">${esc(r.dns_name || r.name)}</code>
+                        <div style="font-size:10px;color:var(--text-muted);margin-top:2px">${esc(r.name)}</div>
+                    </td>
                     <td style="padding:6px;color:var(--text-primary);word-break:break-all;max-width:250px;font-family:monospace;font-size:11px">${esc(r.value)}</td>
                     <td style="padding:6px;color:var(--text-muted);font-size:11px">${esc(r.description)}</td>
-                    <td style="padding:6px"><button class="btn btn-xs ${PREFIX}-copy-dns" data-value="${esc(r.value)}" title="${t('Kopiuj')}"><i class="fas fa-copy"></i></button></td>
+                    <td style="padding:6px"><button class="btn btn-xs ${PREFIX}-copy-dns" data-value="${esc(r.value).replace(/"/g,'&quot;')}" title="${t('Kopiuj')}"><i class="fas fa-copy"></i></button></td>
                 </tr>
             `).join('')}</tbody>
         </table>`;
@@ -601,7 +609,7 @@ AppRegistry['mail-server'] = function (appDef) {
             if (!source) return;
             const dest = prompt(t('Cel (np. admin@domain.com):'));
             if (!dest) return;
-            const res = await api('/mail-server/aliases', { method: 'POST', body: JSON.stringify({ source, destination: dest }) });
+            const res = await api('/mail-server/aliases', { method: 'POST', body: { source, destination: dest } });
             if (res.ok) { toast(t('Alias dodany'), 'success'); renderAliasesTab(el); }
             else toast(res.error || t('Błąd'), 'error');
         };
@@ -672,13 +680,13 @@ AppRegistry['mail-server'] = function (appDef) {
         });
 
         el.querySelector(`#${PREFIX}-relay-save`).onclick = async () => {
-            const res = await api('/mail-server/relay', { method: 'PUT', body: JSON.stringify({
+            const res = await api('/mail-server/relay', { method: 'PUT', body: {
                 enabled: el.querySelector(`#${PREFIX}-relay-enabled`).checked,
                 host: el.querySelector(`#${PREFIX}-relay-host`).value,
                 port: parseInt(el.querySelector(`#${PREFIX}-relay-port`).value) || 587,
                 username: el.querySelector(`#${PREFIX}-relay-user`).value,
                 password: el.querySelector(`#${PREFIX}-relay-pass`).value,
-            })});
+            }});
             if (res.ok) toast(t('Relay zapisany'), 'success');
             else toast(res.error || t('Błąd'), 'error');
         };
