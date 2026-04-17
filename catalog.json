@@ -215,7 +215,7 @@
         {
             "id": "builder",
             "name": "Builder",
-            "version": "1.0.13",
+            "version": "1.0.14",
             "icon": "fa-hammer",
             "color": "#f97316",
             "category": "System",
@@ -613,7 +613,7 @@
         {
             "id": "photos-ai",
             "name": "Photos AI",
-            "version": "0.0.7",
+            "version": "0.0.8",
             "icon": "fa-brain",
             "color": "#8b5cf6",
             "category": "Media",
@@ -651,7 +651,7 @@
         {
             "id": "video-station",
             "name": "Video Station",
-            "version": "0.0.6",
+            "version": "0.0.7",
             "icon": "fa-film",
             "color": "#7c3aed",
             "category": "Media",
