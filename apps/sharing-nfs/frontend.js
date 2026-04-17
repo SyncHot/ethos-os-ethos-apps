@@ -3355,14 +3355,16 @@ async function _smSharing(el) {
 /* ═══════════════════════════════════════════════════════════
    Section: Diagnostics (from original diskrepair.js)
    ═══════════════════════════════════════════════════════════ */
+
+function _sto_escHtml(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
 function _smDiagnostics(el) {
     const body = el;
+    const escHtml = _sto_escHtml;
     const state = {
-        disks: [],
-        selectedDisk: null,
-        activeTab: 'info',
-        operation: null,
-        pollTimer: null,
         logOffset: 0,
         smartData: null,
         fsDetail: null,
@@ -3536,11 +3538,6 @@ function _smDiagnostics(el) {
 
     function isRunning() {
         return state.operation && (state.operation.status === 'running' || state.operation.status === 'starting');
-    }
-
-    function escHtml(s) {
-        if (!s) return '';
-        return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
 
     /* ─── Load disks ─── */
@@ -4253,6 +4250,7 @@ function _smMaintenance(el) {
     el.innerHTML = '<div style="padding:20px" id="mnt-root"><div style="color:var(--text-secondary)"><i class="fas fa-spinner fa-spin"></i> ' + t('Ładowanie...') + '</div></div>';
     const root = el.querySelector('#mnt-root');
     let pollTimer = null;
+    const escHtml = _sto_escHtml;
 
     async function load() {
         const [poolsRes, raidRes, statusRes, histRes, rootfsRes, appUsageRes, scrubInfoRes, schedsRes] = await Promise.allSettled([
@@ -4391,6 +4389,34 @@ function _smMaintenance(el) {
                 </div>`;
             }
             html += `</div></div>`;
+        }
+
+        // ── /tmp cleanup card ──
+        {
+            const tmpItem = appUsageItems.find(i => i.path === '/tmp');
+            const tmpBytes = tmpItem ? tmpItem.bytes : 0;
+            const tmpStr = tmpBytes >= 1073741824 ? (tmpBytes/1073741824).toFixed(1)+' GB'
+                         : tmpBytes >= 1048576 ? (tmpBytes/1048576).toFixed(0)+' MB'
+                         : (tmpBytes/1024).toFixed(0)+' KB';
+            const tmpWarn = tmpBytes >= 1073741824;
+            html += `<div style="background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:10px;padding:16px;margin-bottom:16px${tmpWarn ? ';border-left:3px solid #ef4444' : ''}">
+                <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+                    <div style="font-size:13px;font-weight:600">
+                        <i class="fas fa-broom" style="color:${tmpWarn ? '#ef4444' : 'var(--accent)'};margin-right:6px"></i>${t('Czyszczenie /tmp')}
+                        <span style="font-weight:400;font-size:12px;color:var(--text-muted);margin-left:8px">${t('Zajęte')}: <strong style="color:${tmpWarn ? '#ef4444' : 'var(--text-primary)'}">${tmpStr}</strong></span>
+                    </div>
+                    <div style="display:flex;gap:6px;align-items:center">
+                        <select id="mnt-tmp-age" style="padding:4px 8px;border-radius:6px;border:1px solid var(--border-color);background:var(--bg-primary);color:var(--text-primary);font-size:12px">
+                            <option value="0">${t('Wszystkie pliki')}</option>
+                            <option value="60" selected>${t('Starsze niż 1h')}</option>
+                            <option value="1440">${t('Starsze niż 24h')}</option>
+                            <option value="10080">${t('Starsze niż 7 dni')}</option>
+                        </select>
+                        <button class="dr-btn dr-btn-sm" id="mnt-clean-tmp"><i class="fas fa-broom"></i> ${t('Wyczyść')}</button>
+                    </div>
+                </div>
+                <div id="mnt-tmp-details" style="font-size:12px;color:var(--text-muted)"></div>
+            </div>`;
         }
 
         // Active tasks with progress bars
@@ -4627,6 +4653,40 @@ function _smMaintenance(el) {
             if (res.error) toast(res.error, 'error');
             else { toast(t('Harmonogram usunięty'), 'success'); load(); }
         });
+
+        // /tmp cleanup: load details + wire button
+        const tmpDetailsEl = root.querySelector('#mnt-tmp-details');
+        const tmpBtn = root.querySelector('#mnt-clean-tmp');
+        const tmpAgeSel = root.querySelector('#mnt-tmp-age');
+        if (tmpDetailsEl) {
+            api('/storage/clean-tmp').then(info => {
+                if (!info || info.error) return;
+                const fmtB = b => b >= 1073741824 ? (b/1073741824).toFixed(1)+' GB' : b >= 1048576 ? (b/1048576).toFixed(0)+' MB' : (b/1024).toFixed(0)+' KB';
+                const top = (info.items || []).slice(0, 8);
+                if (top.length) {
+                    tmpDetailsEl.innerHTML = `<div style="margin-bottom:4px">${t('Tmpfs')}: ${fmtB(info.used)} / ${fmtB(info.total)} (${info.pct}%)</div>`
+                        + `<div style="display:flex;flex-wrap:wrap;gap:4px">`
+                        + top.map(f => `<span style="background:var(--bg-primary);padding:2px 8px;border-radius:4px;font-size:11px" title="${f.name}">${f.is_dir ? '<i class="fas fa-folder" style="margin-right:3px;color:var(--accent)"></i>' : ''}${escHtml(f.name.length > 30 ? f.name.slice(0,27)+'…' : f.name)} <b>${fmtB(f.bytes)}</b></span>`).join('')
+                        + `</div>`;
+                }
+            });
+        }
+        if (tmpBtn) {
+            tmpBtn.onclick = async () => {
+                const age = parseInt(tmpAgeSel?.value || '60', 10);
+                const label = age === 0 ? t('WSZYSTKIE pliki') : tmpAgeSel.options[tmpAgeSel.selectedIndex].text;
+                if (!confirm(t('Czy na pewno wyczyścić /tmp?') + '\n' + label)) return;
+                tmpBtn.disabled = true;
+                tmpBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> ' + t('Czyszczenie...');
+                const res = await api('/storage/clean-tmp', { method: 'POST', body: { max_age_minutes: age } });
+                if (res.error) { toast(res.error, 'error'); }
+                else {
+                    const fmtB = b => b >= 1073741824 ? (b/1073741824).toFixed(1)+' GB' : b >= 1048576 ? (b/1048576).toFixed(0)+' MB' : (b/1024).toFixed(0)+' KB';
+                    toast(t('Usunięto') + ` ${res.removed} ` + t('elementów') + `, ${t('zwolniono')} ${fmtB(res.freed)}`, 'success');
+                }
+                setTimeout(load, 1500);
+            };
+        }
     }
 
     function startPoll() {

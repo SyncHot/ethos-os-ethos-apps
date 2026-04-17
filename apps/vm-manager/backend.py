@@ -1365,24 +1365,18 @@ def _init_ws_proxy(app):
     def _validate_token(token):
         import sys
         from datetime import datetime
-        app_mod = sys.modules.get('app')
+        # App runs as __main__ when started directly (python app.py)
+        app_mod = sys.modules.get('__main__')
         if not app_mod:
-            log.warning('WS proxy: app module not in sys.modules')
             return False
         tok_store = getattr(app_mod, 'tokens', None)
         if not tok_store:
-            log.warning('WS proxy: no tokens attr on app module')
             return False
         info = tok_store.get(token)
         if not info:
-            log.warning('WS proxy: token not found (len=%d, prefix=%s)', len(token), token[:10])
             return False
         expires = info.get('expires', datetime.min)
-        now = datetime.now()
-        if expires <= now:
-            log.warning('WS proxy: token expired %s vs now %s', expires, now)
-            return False
-        return True
+        return expires > datetime.now()
 
     def _relay(ws, target_port):
         """Relay gevent-websocket frames ↔ raw TCP bytes."""
@@ -1448,7 +1442,7 @@ def _init_ws_proxy(app):
                 kind, vm_id = m.group(1), m.group(2)
                 token = _parse_token(environ)
                 if not token or not _validate_token(token):
-                    log.warning('WS proxy: auth failed for %s/%s', kind, vm_id)
+                    log.info('WS proxy: auth failed for %s/%s', kind, vm_id)
                     ws.close()
                     start_response('401 Unauthorized', [])
                     return [b'']
@@ -1456,11 +1450,11 @@ def _init_ws_proxy(app):
                 port_key = 'vnc_port' if kind == 'vnc' else 'serial_port'
                 port = info.get(port_key) if info else None
                 if not port:
-                    log.warning('WS proxy: VM %s not found or no %s', vm_id, port_key)
+                    log.info('WS proxy: VM %s not found or no %s', vm_id, port_key)
                     ws.close()
                     start_response('404 Not Found', [])
                     return [b'']
-                log.warning('WS %s proxy: vm=%s → port %s', kind, vm_id, port)
+                log.info('WS %s proxy: vm=%s → port %s', kind, vm_id, port)
                 _relay(ws, port)
                 return [b'']
         return inner(environ, start_response)
