@@ -48,7 +48,16 @@ Routes:
   GET  /api/radio-music/most-played        - most played items by count
   GET  /api/radio-music/playback-state     - get saved playback state (cross-device resume)
   POST /api/radio-music/playback-state     - save playback state
+  GET  /api/radio-music/music/liked       - user's liked songs
+  POST /api/radio-music/music/liked       - add/remove liked song
+  GET  /api/radio-music/similar-artists   - similar artists via Deezer (?artist=, ?limit=)
+  GET  /api/radio-music/recommendations   - personalized recs from history/favorites/subs
   GET  /api/radio-music/lyrics             - fetch song lyrics (?title=, ?artist=)
+  GET  /api/radio-music/search/all         - unified search across radio+podcasts+local (?q=)
+  GET  /api/radio-music/playlists/<id>/export - export playlist as M3U8
+  POST /api/radio-music/playlists/import   - import M3U/M3U8 playlist
+  GET  /api/radio-music/podcasts/autodownload - get auto-download settings
+  POST /api/radio-music/podcasts/autodownload - toggle auto-download for a feed
 """
 
 import http.client
@@ -89,8 +98,62 @@ _ITUNES_API = 'https://itunes.apple.com/search'
 _MAX_HISTORY = 100
 
 _AUDIO_EXTS = {'.mp3', '.m4a', '.flac', '.ogg', '.opus', '.wav', '.wma', '.aac', '.webm', '.mp4', '.wv', '.ape'}
-_DOWNLOAD_JOBS = {}  # job_id -> {status, progress, path, title, error}
+_DOWNLOAD_JOBS = {}  # job_id -> {status, progress, path, title, error, finished_at}
 _DOWNLOAD_LOCK = threading.Lock()
+
+# Metadata cache: avoids re-running ffprobe for unchanged files
+_meta_cache = {}  # {path: {mtime: float, meta: dict}}
+_meta_cache_file = None
+_meta_cache_dirty = False
+
+
+def _meta_cache_path():
+    global _meta_cache_file
+    if not _meta_cache_file:
+        _meta_cache_file = os.path.join(data_path('radio_music'), 'meta_cache.json')
+        os.makedirs(os.path.dirname(_meta_cache_file), exist_ok=True)
+    return _meta_cache_file
+
+
+def _load_meta_cache():
+    global _meta_cache
+    try:
+        with open(_meta_cache_path(), 'r') as f:
+            _meta_cache = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        _meta_cache = {}
+
+
+def _save_meta_cache():
+    global _meta_cache_dirty
+    if not _meta_cache_dirty:
+        return
+    try:
+        with open(_meta_cache_path(), 'w') as f:
+            json.dump(_meta_cache, f)
+        _meta_cache_dirty = False
+    except OSError:
+        pass
+
+
+def _probe_audio_cached(fpath, mtime):
+    """Return cached ffprobe result if file unchanged, else probe and cache."""
+    global _meta_cache_dirty
+    cached = _meta_cache.get(fpath)
+    if cached and abs(cached.get('mtime', 0) - mtime) < 0.01:
+        return cached['meta']
+    meta = _probe_audio(fpath)
+    _meta_cache[fpath] = {'mtime': mtime, 'meta': meta}
+    _meta_cache_dirty = True
+    return meta
+
+
+def _safe_int(val, default, lo=1, hi=200):
+    """Parse an integer from a request arg, clamping to [lo, hi]."""
+    try:
+        return max(lo, min(int(val), hi))
+    except (ValueError, TypeError):
+        return default
 
 # ── Offline Archive ──────────────────────────────────────────
 _ARCHIVE_LOCK = threading.Lock()
@@ -308,10 +371,12 @@ def radio_search():
     q_str = request.args.get('q', '').strip()
     country = request.args.get('country', '').strip()
     tag = request.args.get('tag', '').strip()
-    limit = min(int(request.args.get('limit', 50)), 200)
+    limit = _safe_int(request.args.get('limit', 50), 50, hi=200)
+    offset = _safe_int(request.args.get('offset', 0), 0, lo=0, hi=10000)
 
     params = {
         'limit': limit * 3,  # fetch extra to aggregate duplicates
+        'offset': offset * 3,
         'hidebroken': 'true',
         'order': 'clickcount',
         'reverse': 'true',
@@ -326,7 +391,7 @@ def radio_search():
 
     raw = _radio_api('/json/stations/search', params)
     items = _aggregate_stations(raw)
-    return jsonify({'items': items[:limit]})
+    return jsonify({'items': items[:limit], 'hasMore': len(items) >= limit})
 
 
 @radio_music_bp.route('/radio/countries', methods=['GET'])
@@ -347,7 +412,7 @@ def radio_tags():
 
 @radio_music_bp.route('/radio/top', methods=['GET'])
 def radio_top():
-    limit = min(int(request.args.get('limit', 50)), 200)
+    limit = _safe_int(request.args.get('limit', 50), 50, hi=200)
     raw = _radio_api('/json/stations/topvote', {'limit': limit * 3, 'hidebroken': 'true'})
     items = _aggregate_stations(raw)
     return jsonify({'items': items[:limit]})
@@ -378,6 +443,33 @@ def radio_favorites_edit():
 
     _save_json(_user_file('favorites.json'), favs)
     return jsonify({'ok': True, 'items': favs})
+
+
+# ── Music: liked songs ───────────────────────────────────────
+
+@radio_music_bp.route('/music/liked', methods=['GET'])
+def music_liked():
+    return jsonify({'items': _load_json(_user_file('liked_songs.json'), [])})
+
+
+@radio_music_bp.route('/music/liked', methods=['POST'])
+def music_liked_edit():
+    body = request.get_json(force=True, silent=True) or {}
+    action = body.get('action', 'add')
+    track = body.get('track')
+    if not track or not track.get('url'):
+        return jsonify({'error': 'Brak danych utworu.'}), 400
+
+    liked = _load_json(_user_file('liked_songs.json'), [])
+
+    if action == 'remove':
+        liked = [s for s in liked if s.get('url') != track['url']]
+    else:
+        if not any(s.get('url') == track['url'] for s in liked):
+            liked.insert(0, track)
+
+    _save_json(_user_file('liked_songs.json'), liked)
+    return jsonify({'ok': True, 'items': liked})
 
 
 # ── Radio: stream URL resolver ───────────────────────────────
@@ -443,7 +535,7 @@ def podcasts_top():
     """Top podcasts by genre and country via iTunes RSS."""
     country = request.args.get('country', 'pl').strip().lower()
     genre_key = request.args.get('genre', '').strip().lower()
-    limit = min(int(request.args.get('limit', 30)), 100)
+    limit = _safe_int(request.args.get('limit', 30), 30, hi=100)
     genre_id = _PODCAST_GENRES.get(genre_key, 0)
 
     rss_url = f'https://itunes.apple.com/{country}/rss/toppodcasts/limit={limit}'
@@ -655,6 +747,40 @@ def podcasts_subscribe():
     return jsonify({'ok': True, 'items': subs})
 
 
+# ── Podcast auto-download ────────────────────────────────────
+
+def _autodownload_file():
+    return _user_file('autodownload.json')
+
+
+@radio_music_bp.route('/podcasts/autodownload', methods=['GET'])
+def podcasts_autodownload_get():
+    """Return auto-download settings: {feeds: {feed_url: {enabled, max_episodes, downloaded}}}"""
+    return jsonify(_load_json(_autodownload_file(), {'feeds': {}}))
+
+
+@radio_music_bp.route('/podcasts/autodownload', methods=['POST'])
+def podcasts_autodownload_set():
+    """Toggle auto-download for a feed_url. Body: {feed_url, enabled?, max_episodes?}"""
+    body = request.get_json(force=True, silent=True) or {}
+    feed_url = body.get('feed_url', '').strip()
+    if not feed_url:
+        return jsonify({'error': 'feed_url required'}), 400
+
+    cfg = _load_json(_autodownload_file(), {'feeds': {}})
+    feeds = cfg.setdefault('feeds', {})
+
+    if 'enabled' in body:
+        entry = feeds.setdefault(feed_url, {'enabled': False, 'max_episodes': 3, 'downloaded': []})
+        entry['enabled'] = bool(body['enabled'])
+    if 'max_episodes' in body:
+        entry = feeds.setdefault(feed_url, {'enabled': False, 'max_episodes': 3, 'downloaded': []})
+        entry['max_episodes'] = max(1, min(50, int(body['max_episodes'])))
+
+    _save_json(_autodownload_file(), cfg)
+    return jsonify({'ok': True, 'feeds': feeds})
+
+
 # ── Play history ─────────────────────────────────────────────
 
 def _fix_history_types(items):
@@ -716,7 +842,7 @@ def history_add():
 @radio_music_bp.route('/most-played', methods=['GET'])
 def most_played():
     """Return history items sorted by play_count descending."""
-    limit = min(int(request.args.get('limit', 30)), 100)
+    limit = _safe_int(request.args.get('limit', 30), 30, hi=100)
     hfile = _user_file('history.json')
     hist = _load_json(hfile, [])
     if _fix_history_types(hist):
@@ -747,6 +873,140 @@ def save_playback_state():
     pfile = _user_file('playback_state.json')
     _save_json(pfile, data)
     return jsonify({'ok': True})
+
+
+# ── Deezer-based recommendations (free, no API key) ─────────
+
+_DEEZER_API = 'https://api.deezer.com'
+
+
+def _deezer_get(path, params=None):
+    """GET request to Deezer API, returns parsed JSON or empty dict."""
+    url = _DEEZER_API + path
+    if params:
+        url += '?' + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'EthOS-RadioMusic/1.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except Exception as e:
+        log.debug('Deezer API error for %s: %s', path, e)
+        return {}
+
+
+@radio_music_bp.route('/similar-artists', methods=['GET'])
+def similar_artists():
+    """Find similar artists via Deezer API (free, no key).
+    Returns similar artists with their top tracks."""
+    artist = request.args.get('artist', '').strip()
+    limit = _safe_int(request.args.get('limit', 8), 8, hi=25)
+    if not artist:
+        return jsonify({'items': []})
+
+    # 1. Find artist on Deezer
+    search = _deezer_get('/search/artist', {'q': artist, 'limit': 1})
+    results = search.get('data', [])
+    if not results:
+        return jsonify({'items': []})
+
+    artist_id = results[0].get('id')
+    artist_name = results[0].get('name', artist)
+    artist_picture = results[0].get('picture_medium', '')
+
+    # 2. Get related artists
+    related = _deezer_get(f'/artist/{artist_id}/related', {'limit': limit})
+    items = []
+    for a in related.get('data', []):
+        items.append({
+            'id': a.get('id'),
+            'name': a.get('name', ''),
+            'picture': a.get('picture_medium', ''),
+            'fans': a.get('nb_fan', 0),
+        })
+
+    return jsonify({
+        'source': {'id': artist_id, 'name': artist_name, 'picture': artist_picture},
+        'items': items[:limit],
+    })
+
+
+@radio_music_bp.route('/recommendations', methods=['GET'])
+def recommendations():
+    """Build personalized recommendations from user's history, favorites and subscriptions."""
+    hfile = _user_file('history.json')
+    hist = _load_json(hfile, [])
+    favs = _load_json(_user_file('favorites.json'), [])
+    subs = _load_json(_user_file('subscriptions.json'), [])
+
+    # ── Extract top tags from favorites (radio stations have 'tags' field) ──
+    tag_counts = {}
+    for fav in favs:
+        for tag in (fav.get('tags') or '').split(','):
+            tag = tag.strip().lower()
+            if tag and len(tag) > 1:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    top_tags = sorted(tag_counts, key=tag_counts.get, reverse=True)[:5]
+
+    # ── Extract top artists from history ──
+    artist_counts = {}
+    for h in hist:
+        art = (h.get('meta') or h.get('channel') or '').strip()
+        if art and h.get('type') in ('music', 'local'):
+            artist_counts[art] = artist_counts.get(art, 0) + h.get('play_count', 1)
+    top_artists = sorted(artist_counts, key=artist_counts.get, reverse=True)[:5]
+
+    # ── Extract podcast genres from subscriptions ──
+    pod_genres = set()
+    for sub in subs:
+        g = (sub.get('genre') or sub.get('category') or '').strip().lower()
+        if g:
+            pod_genres.add(g)
+
+    # ── Build tag-based radio recommendations (parallel) ──
+    tag_radios = {}
+    country = request.args.get('country', '').strip().upper() or 'PL'
+
+    def _fetch_tag_radio(tag):
+        data = _radio_api('/json/stations/search', {
+            'tag': tag, 'limit': 24, 'hidebroken': 'true',
+            'order': 'clickcount', 'reverse': 'true',
+            'countrycode': country,
+        })
+        items = _aggregate_stations(data)
+        # Exclude stations already in favorites
+        fav_uuids = {f.get('uuid') for f in favs}
+        items = [s for s in items if s.get('uuid') not in fav_uuids]
+        tag_radios[tag] = items[:6]
+
+    threads = [gevent.spawn(_fetch_tag_radio, tag) for tag in top_tags[:3]]
+    gevent.joinall(threads, timeout=12)
+
+    # ── Build artist-based music recommendations ──
+    artist_recs = []
+    if top_artists:
+        # Pick top 2 artists, find similar via Deezer
+        for art_name in top_artists[:2]:
+            search = _deezer_get('/search/artist', {'q': art_name, 'limit': 1})
+            results = search.get('data', [])
+            if not results:
+                continue
+            artist_id = results[0].get('id')
+            related = _deezer_get(f'/artist/{artist_id}/related', {'limit': 4})
+            for a in related.get('data', []):
+                artist_recs.append({
+                    'name': a.get('name', ''),
+                    'picture': a.get('picture_medium', ''),
+                    'because': art_name,
+                })
+
+    return jsonify({
+        'top_tags': top_tags,
+        'tag_radios': tag_radios,
+        'top_artists': top_artists,
+        'artist_recs': artist_recs,
+        'pod_genres': list(pod_genres),
+        'has_data': bool(top_tags or top_artists or pod_genres),
+    })
 
 
 @radio_music_bp.route('/lyrics', methods=['GET'])
@@ -786,6 +1046,7 @@ def lyrics_search():
             if display:
                 return {
                     'ok': True, 'lyrics': display,
+                    'syncedLyrics': synced,
                     'title': best.get('trackName', track),
                     'artist': best.get('artistName', art),
                 }
@@ -946,6 +1207,8 @@ def local_scan():
         folders = _get_audiobook_folders()
     else:
         folders = _get_music_folders()
+    if not _meta_cache:
+        _load_meta_cache()
     items = []
     for base in folders:
         if not os.path.isdir(base):
@@ -961,7 +1224,7 @@ def local_scan():
                 except OSError:
                     continue
                 rel = os.path.relpath(fpath, base)
-                meta = _probe_audio(fpath)
+                meta = _probe_audio_cached(fpath, stat.st_mtime)
                 display_name = meta.get('title') or os.path.splitext(fname)[0]
                 items.append({
                     'name': display_name,
@@ -980,6 +1243,7 @@ def local_scan():
                     'modified': stat.st_mtime,
                     'type': 'local',
                 })
+    _save_meta_cache()
     items.sort(key=lambda x: x['modified'], reverse=True)
     return jsonify({'items': items, 'folders': folders})
 
@@ -1196,7 +1460,7 @@ def _add_to_playlist_by_name(track_info, username, playlist_name):
         pl = next((p for p in pls if p.get('name') == playlist_name), None)
         if not pl:
             pl = {
-                'id': str(int(time.time() * 1000)),
+                'id': str(int(time.time() * 1000)) + '_' + os.urandom(3).hex(),
                 'name': playlist_name,
                 'tracks': [],
                 'created_at': time.time(),
@@ -1244,7 +1508,7 @@ def music_download():
     else:
         dest = _music_download_dir()
     os.makedirs(dest, exist_ok=True)
-    job_id = str(int(time.time() * 1000))
+    job_id = str(int(time.time() * 1000)) + '_' + os.urandom(3).hex()
     with _DOWNLOAD_LOCK:
         _DOWNLOAD_JOBS[job_id] = {
             'status': 'downloading', 'progress': 0,
@@ -1294,10 +1558,12 @@ def music_download():
                     _DOWNLOAD_JOBS[job_id]['status'] = 'done'
                     _DOWNLOAD_JOBS[job_id]['progress'] = 100
                     _DOWNLOAD_JOBS[job_id]['path'] = out_file or dest
+                    _DOWNLOAD_JOBS[job_id]['finished_at'] = time.time()
                     success = True
                 else:
                     _DOWNLOAD_JOBS[job_id]['status'] = 'error'
                     _DOWNLOAD_JOBS[job_id]['error'] = (r.stderr or 'Nieznany błąd')[:200]
+                    _DOWNLOAD_JOBS[job_id]['finished_at'] = time.time()
                     success = False
             if success:
                 _add_to_playlist_by_name(track_meta, username, target_playlist)
@@ -1305,6 +1571,7 @@ def music_download():
             with _DOWNLOAD_LOCK:
                 _DOWNLOAD_JOBS[job_id]['status'] = 'error'
                 _DOWNLOAD_JOBS[job_id]['error'] = str(e)[:200]
+                _DOWNLOAD_JOBS[job_id]['finished_at'] = time.time()
 
     gevent.spawn(_do_download)
     return jsonify({'ok': True, 'job_id': job_id})
@@ -1326,7 +1593,7 @@ def music_download_playlist():
     dest = os.path.join(_music_download_dir(), playlist_name.replace('/', '_'))
     os.makedirs(dest, exist_ok=True)
 
-    job_id = str(int(time.time() * 1000))
+    job_id = str(int(time.time() * 1000)) + '_' + os.urandom(3).hex()
     with _DOWNLOAD_LOCK:
         _DOWNLOAD_JOBS[job_id] = {
             'status': 'downloading', 'progress': 0,
@@ -1367,6 +1634,7 @@ def music_download_playlist():
         with _DOWNLOAD_LOCK:
             _DOWNLOAD_JOBS[job_id]['status'] = 'done' if not errors else 'done_partial'
             _DOWNLOAD_JOBS[job_id]['progress'] = 100
+            _DOWNLOAD_JOBS[job_id]['finished_at'] = time.time()
             if errors:
                 _DOWNLOAD_JOBS[job_id]['error'] = f'Błędy: {", ".join(errors[:5])}'
         _cleanup_intermediates(dest)
@@ -1379,10 +1647,13 @@ def music_download_playlist():
 def music_downloads_status():
     """Return status of active/recent download jobs."""
     with _DOWNLOAD_LOCK:
-        # Clean up old completed jobs (>5 min)
+        # Clean up completed jobs older than 5 minutes
         now = time.time()
         to_remove = [jid for jid, j in _DOWNLOAD_JOBS.items()
-                     if j['status'] in ('done', 'done_partial', 'error')]
+                     if j['status'] in ('done', 'done_partial', 'error')
+                     and now - j.get('finished_at', now) > 300]
+        for jid in to_remove:
+            del _DOWNLOAD_JOBS[jid]
         jobs = dict(_DOWNLOAD_JOBS)
     return jsonify({'jobs': jobs})
 
@@ -1406,7 +1677,7 @@ def playlists_create():
         return jsonify({'error': 'Brak nazwy playlisty.'}), 400
 
     pls = _load_json(_playlists_file(), [])
-    pl_id = str(int(time.time() * 1000))
+    pl_id = str(int(time.time() * 1000)) + '_' + os.urandom(3).hex()
     pl = {
         'id': pl_id,
         'name': name,
@@ -1490,6 +1761,159 @@ def playlists_remove_track(pl_id, track_idx):
     return jsonify({'ok': True, 'playlist': pl})
 
 
+@radio_music_bp.route('/playlists/<pl_id>/export', methods=['GET'])
+def playlists_export(pl_id):
+    """Export playlist as M3U8."""
+    pls = _load_json(_playlists_file(), [])
+    pl = next((p for p in pls if p['id'] == pl_id), None)
+    if not pl:
+        return jsonify({'error': 'Playlista nie znaleziona'}), 404
+    lines = ['#EXTM3U', '# Playlist: ' + pl.get('name', 'Untitled')]
+    for tr in pl.get('tracks', []):
+        dur = int(tr.get('duration', 0) or 0) if tr.get('duration') else -1
+        title = tr.get('name') or tr.get('title') or ''
+        artist = tr.get('meta') or tr.get('channel') or ''
+        label = (artist + ' - ' + title) if artist else title
+        lines.append('#EXTINF:%d,%s' % (dur, label))
+        url = tr.get('url') or tr.get('path') or ''
+        lines.append(url)
+    body = '\n'.join(lines) + '\n'
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', pl.get('name', 'playlist'))[:80]
+    return Response(body, mimetype='audio/x-mpegurl', headers={
+        'Content-Disposition': 'attachment; filename="%s.m3u8"' % safe_name,
+    })
+
+
+@radio_music_bp.route('/playlists/import', methods=['POST'])
+def playlists_import():
+    """Import an M3U/M3U8 file as a new playlist."""
+    if 'file' not in request.files:
+        return jsonify({'error': 'Brak pliku'}), 400
+    f = request.files['file']
+    text = f.read().decode('utf-8', errors='replace')
+    lines = text.splitlines()
+    name = os.path.splitext(f.filename or 'Import')[0]
+    tracks = []
+    pending_info = {}
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith('#EXTINF:'):
+            parts = line.split(',', 1)
+            pending_info = {'title': parts[1].strip() if len(parts) > 1 else ''}
+        elif line.startswith('#'):
+            continue
+        else:
+            track = {
+                'name': pending_info.get('title') or os.path.basename(line),
+                'url': line,
+                'type': 'local' if line.startswith('/') else 'music',
+                'added_at': time.time(),
+            }
+            if line.startswith('/'):
+                track['path'] = line
+            tracks.append(track)
+            pending_info = {}
+    pls = _load_json(_playlists_file(), [])
+    pl_id = str(int(time.time() * 1000)) + '_' + os.urandom(3).hex()
+    pl = {
+        'id': pl_id, 'name': name, 'tracks': tracks,
+        'created_at': time.time(), 'updated_at': time.time(),
+    }
+    pls.insert(0, pl)
+    _save_json(_playlists_file(), pls)
+    return jsonify({'ok': True, 'playlist': pl, 'items': pls})
+
+
+# ── Unified Search ───────────────────────────────────────────
+
+@radio_music_bp.route('/search/all', methods=['GET'])
+def search_all():
+    """Search across radio, podcasts, and local library in parallel."""
+    q_str = request.args.get('q', '').strip()
+    if not q_str:
+        return jsonify({'error': 'Brak zapytania'}), 400
+    limit = _safe_int(request.args.get('limit', 10), 10, hi=30)
+    results = {'radio': [], 'podcasts': [], 'local': []}
+
+    def _search_radio():
+        try:
+            raw = _radio_api('/json/stations/search', {
+                'name': q_str, 'limit': limit * 2, 'hidebroken': 'true',
+                'order': 'clickcount', 'reverse': 'true',
+            })
+            results['radio'] = _aggregate_stations(raw)[:limit]
+        except Exception:
+            pass
+
+    def _search_podcasts():
+        try:
+            enc = urllib.parse.quote(q_str)
+            url = '%s?term=%s&media=podcast&limit=%d' % (_ITUNES_API, enc, limit)
+            req = urllib.request.Request(url, headers={'User-Agent': 'EthOS/1.0'})
+            resp = urllib.request.urlopen(req, timeout=8)
+            data = json.loads(resp.read())
+            items = []
+            for r in data.get('results', []):
+                items.append({
+                    'name': r.get('collectionName', ''),
+                    'artist': r.get('artistName', ''),
+                    'artwork': r.get('artworkUrl100', ''),
+                    'feed_url': r.get('feedUrl', ''),
+                    'genre': r.get('primaryGenreName', ''),
+                })
+            results['podcasts'] = items[:limit]
+        except Exception:
+            pass
+
+    def _search_local():
+        try:
+            q_low = q_str.lower()
+            if not _meta_cache:
+                _load_meta_cache()
+            folders = _get_music_folders()
+            matched = []
+            for base in folders:
+                if not os.path.isdir(base):
+                    continue
+                for root, _dirs, files in os.walk(base):
+                    for fname in files:
+                        ext = os.path.splitext(fname)[1].lower()
+                        if ext not in _AUDIO_EXTS:
+                            continue
+                        fpath = os.path.join(root, fname)
+                        try:
+                            stat = os.stat(fpath)
+                        except OSError:
+                            continue
+                        meta = _probe_audio_cached(fpath, stat.st_mtime)
+                        display = meta.get('title') or os.path.splitext(fname)[0]
+                        if q_low in display.lower() or q_low in (meta.get('artist') or '').lower() \
+                                or q_low in (meta.get('album') or '').lower() or q_low in fname.lower():
+                            matched.append({
+                                'name': display, 'artist': meta.get('artist', ''),
+                                'album': meta.get('album', ''), 'path': fpath,
+                                'has_art': meta.get('has_art', False),
+                                'duration': meta.get('duration', 0),
+                                'folder': base, 'filename': fname, 'type': 'local',
+                                'modified': stat.st_mtime,
+                            })
+                            if len(matched) >= limit:
+                                break
+                    if len(matched) >= limit:
+                        break
+                if len(matched) >= limit:
+                    break
+            results['local'] = matched
+        except Exception:
+            pass
+
+    jobs = [gevent.spawn(_search_radio), gevent.spawn(_search_podcasts), gevent.spawn(_search_local)]
+    gevent.joinall(jobs, timeout=12)
+    return jsonify(results)
+
+
 # ── Music: YouTube / multi-source (via yt-dlp) ──────────────
 
 _YTDLP_BIN = None
@@ -1549,7 +1973,7 @@ def music_install_deps():
 def music_search():
     """Search for music via yt-dlp (YouTube by default)."""
     q_str = request.args.get('q', '').strip()
-    limit = min(int(request.args.get('limit', 20)), 50)
+    limit = _safe_int(request.args.get('limit', 20), 20, hi=50)
     if not q_str:
         return jsonify({'items': []})
 
@@ -2032,28 +2456,26 @@ def archive_batch():
     urls = [u for u in urls if isinstance(u, str)][:200]
     with _ARCHIVE_LOCK:
         db = _load_archive()
-    results = {}
-    changed = False
-    for url in urls:
-        k = _archive_key(url)
-        entry = db.get(k, {})
-        status = entry.get('status', 'none')
-        # If marked done but file was deleted from disk, reset to allow re-download
-        if status == 'done':
-            nas_path = entry.get('nas_path', '')
-            if not nas_path or not os.path.isfile(nas_path):
-                status = 'none'
-                db.pop(k, None)
-                changed = True
-        results[url] = {
-            'key': k,
-            'status': status,
-            'progress': entry.get('progress', 0),
-            'size_bytes': entry.get('size_bytes', 0),
-            'title': entry.get('title', ''),
-        }
-    if changed:
-        with _ARCHIVE_LOCK:
+        results = {}
+        changed = False
+        for url in urls:
+            k = _archive_key(url)
+            entry = db.get(k, {})
+            status = entry.get('status', 'none')
+            if status == 'done':
+                nas_path = entry.get('nas_path', '')
+                if not nas_path or not os.path.isfile(nas_path):
+                    status = 'none'
+                    db.pop(k, None)
+                    changed = True
+            results[url] = {
+                'key': k,
+                'status': status,
+                'progress': entry.get('progress', 0),
+                'size_bytes': entry.get('size_bytes', 0),
+                'title': entry.get('title', ''),
+            }
+        if changed:
             _save_archive(db)
     return jsonify({'results': results})
 

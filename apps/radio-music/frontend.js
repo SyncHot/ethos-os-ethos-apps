@@ -7,6 +7,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
     let bodyEl, activeSection = 'most-played', _audio = null, _playing = null;
     let _favorites = [], _subscriptions = [], _countries = [], _tags = [];
+    let _likedSongs = [];     // user's liked music tracks (heart in NP overlay)
     let _recentStations = [];  // for prev/next navigation
     let _musicQueue = [];      // music track queue (music + audiobook types only)
     let _musicQueueIdx = -1;   // index of currently playing track in queue
@@ -29,6 +30,18 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     let _nasSpinTimer = null;  // detect slow NAS wake (>3s)
     let _queueContent = null;  // DOM node of the queue panel (null when not visible)
     let _renderNpQueueFn = null; // ref to _renderNpQueue inside the overlay closure
+    let _npSyncFav = null;       // ref to sync NP favorite button state
+    let _npSyncDownload = null;  // ref to sync NP download button state
+    let _npReloadSimilar = null;  // ref to reload similar artists on track change
+    let _activePolls = [];       // download poll intervals to clear on close
+    let _sleepTimer = null;      // sleep timer timeout ID
+    let _sleepEnd = 0;           // timestamp when sleep timer fires (0 = off)
+    let _sleepMode = '';         // 'time' or 'track'
+    let _playbackRate = 1;       // current playback speed (0.5–2)
+    let _crossfadeDuration = 1500; // crossfade ms, user-configurable 0–12000
+    let _syncedLyrics = null;    // parsed LRC lines: [{time: ms, text: ''}, ...]
+    let _lyrSyncInterval = null; // lyrics auto-scroll timer
+    let _epProgress = {};        // podcast episode progress: {url: {pos: sec, dur: sec, done: bool}}
 
     // ── Local radio logo cache (UUID → /img/radio-logos/filename) ──
     let _logoManifest = null;
@@ -44,6 +57,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     let _advanceLock = false;   // debounce double-advance from Cast + local onended
     let _castQueueActive = false; // true when Cast queue manages playlist advancement
     let _isBuffering = false;   // true while track is loading — blocks rapid Next/Prev
+    let _bufferingSafetyTimer = null; // auto-release buffering after timeout
     // LAN origin for Chromecast URLs (fetched once from /cast-info; Chromecast cannot use localhost)
     let _castLanOrigin = location.origin;
 
@@ -78,11 +92,14 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     // Sidebar group definitions — order is user-customisable via DnD (saved in localStorage)
     const _SIDEBAR_GROUPS = [
         { id: 'discover', label: 'Odkrywaj', items: [
+            { key: 'search', icon: 'fas fa-search', label: 'Szukaj wszędzie' },
             { key: 'discovery', icon: 'fas fa-compass', label: 'Odkrywaj' },
         ]},
         { id: 'music', label: 'Muzyka', items: [
             { key: 'music', icon: 'fab fa-youtube', label: 'Szukaj' },
             { key: 'local', icon: 'fas fa-folder-open', label: 'Lokalna muzyka' },
+            { key: 'artists', icon: 'fas fa-user-circle', label: 'Artyści' },
+            { key: 'recently-added', icon: 'fas fa-clock', label: 'Ostatnio dodane' },
             { key: 'local-audiobooks', icon: 'fas fa-book-reader', label: 'Lok. audiobooki' },
             { key: 'playlists', icon: 'fas fa-list', label: 'Playlisty' },
             { key: 'queue', icon: 'fas fa-list-ol', label: 'Kolejka' },
@@ -102,6 +119,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             { key: 'most-played', icon: 'fas fa-fire', label: 'Najczęściej grane' },
             { key: 'audiobooks', icon: 'fas fa-book-open', label: 'Audiobooki' },
             { key: 'history', icon: 'fas fa-history', label: 'Historia' },
+            { key: 'settings', icon: 'fas fa-cog', label: 'Ustawienia' },
         ]},
     ];
 
@@ -335,6 +353,18 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
     }
 
+    function _skeletonGrid(count) {
+        let html = '<div class="rm-skel-grid">';
+        for (let i = 0; i < (count || 6); i++) html += '<div class="rm-skel-card"></div>';
+        return html + '</div>';
+    }
+
+    function _skeletonTracks(count) {
+        let html = '';
+        for (let i = 0; i < (count || 5); i++) html += '<div class="rm-skel-track"></div>';
+        return html;
+    }
+
     // Build playlist cover art: 2×2 mosaic from first 4 track thumbnails, or fallback icon
     function _playlistCoverHtml(pl, size) {
         const imgs = (pl.tracks || []).map(t => t.image || t.thumbnail || t.favicon || '').filter(Boolean);
@@ -395,109 +425,149 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     }
 
     function getCSS() { return [
+/* ── CSS Variables ─────────────────────────────────────── */
+'.rm-wrap{--rm-accent:#1DB954;--rm-accent-hover:#1ed760;--rm-accent-active:#0f9240;--rm-accent-rgb:29,185,84;--rm-bg:#121212;--rm-bg-sidebar:#000;--rm-bg-surface:#282828;--rm-bg-elevated:#181818;--rm-bg-card:#282828;--rm-text:#fff;--rm-text-secondary:rgba(255,255,255,.65);--rm-text-muted:rgba(255,255,255,.35);--rm-text-dim:rgba(255,255,255,.2);--rm-border:rgba(255,255,255,.08);--rm-error:#ef4444;--rm-warning:#f59e0b;--rm-overlay:rgba(0,0,0,.85)}',
+'[data-theme="light"] .rm-wrap{--rm-bg:#f5f5f5;--rm-bg-sidebar:#e8e8e8;--rm-bg-surface:#fff;--rm-bg-elevated:#f0f0f0;--rm-bg-card:#fff;--rm-text:#1a1a1a;--rm-text-secondary:rgba(0,0,0,.65);--rm-text-muted:rgba(0,0,0,.4);--rm-text-dim:rgba(0,0,0,.2);--rm-border:rgba(0,0,0,.1);--rm-overlay:rgba(255,255,255,.9)}',
 /* ── Spotify-inspired layout ─────────────────────────── */
-'.rm-wrap{display:flex;height:100%;overflow:hidden;font-size:13px;background:#121212;color:#fff;border-radius:0}',
-'.rm-sidebar{width:220px;min-width:220px;background:#000;display:flex;flex-direction:column;overflow-y:auto;padding:8px 0;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.1) transparent}',
-'.rm-sidebar-item{padding:10px 20px;cursor:pointer;display:flex;align-items:center;gap:10px;color:rgba(255,255,255,.65);font-size:13px;transition:all .15s;border-radius:0;border-left:3px solid transparent}',
-'.rm-sidebar-item:hover{color:#fff;background:rgba(255,255,255,.05)}',
-'.rm-sidebar-item.active{color:#1DB954;border-left-color:#1DB954;background:rgba(29,185,84,.08);font-weight:600}',
+'.rm-wrap{display:flex;height:100%;overflow:hidden;font-size:13px;background:var(--rm-bg);color:var(--rm-text);border-radius:0}',
+'.rm-sidebar{width:220px;min-width:220px;background:var(--rm-bg-sidebar);display:flex;flex-direction:column;overflow-y:auto;padding:8px 0;scrollbar-width:thin;scrollbar-color:var(--rm-text-dim) transparent}',
+'.rm-sidebar-item{padding:10px 20px;cursor:pointer;display:flex;align-items:center;gap:10px;color:var(--rm-text-secondary);font-size:13px;transition:all .15s;border-radius:0;border-left:3px solid transparent}',
+'.rm-sidebar-item:hover{color:var(--rm-text);background:rgba(255,255,255,.05)}',
+'.rm-sidebar-item.active{color:var(--rm-accent);border-left-color:var(--rm-accent);background:rgba(var(--rm-accent-rgb),.08);font-weight:600}',
 '.rm-sidebar-item i{width:18px;text-align:center;font-size:14px}',
-'.rm-sidebar-label{padding:20px 20px 6px;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:rgba(255,255,255,.35);font-weight:700;display:flex;align-items:center;justify-content:space-between;user-select:none}',
+'.rm-sidebar-label{padding:20px 20px 6px;font-size:10px;text-transform:uppercase;letter-spacing:1.5px;color:var(--rm-text-muted);font-weight:700;display:flex;align-items:center;justify-content:space-between;user-select:none}',
 '.rm-sidebar-group{transition:opacity .15s}',
 '.rm-sidebar-group.rm-dnd-dragging{opacity:.4}',
-'.rm-sidebar-group.rm-dnd-over{box-shadow:inset 0 2px 0 #1DB954}',
-'.rm-sidebar-edit-btn{background:none;border:none;color:rgba(255,255,255,.3);font-size:11px;cursor:pointer;padding:2px 8px 2px 4px;border-radius:4px;transition:color .15s;white-space:nowrap}',
-'.rm-sidebar-edit-btn:hover{color:#1DB954}',
+'.rm-sidebar-group.rm-dnd-over{box-shadow:inset 0 2px 0 var(--rm-accent)}',
+'.rm-sidebar-edit-btn{background:none;border:none;color:var(--rm-text-muted);font-size:11px;cursor:pointer;padding:2px 8px 2px 4px;border-radius:4px;transition:color .15s;white-space:nowrap}',
+'.rm-sidebar-edit-btn:hover{color:var(--rm-accent)}',
 '.rm-sidebar-drag-handle{display:none;color:rgba(255,255,255,.25);font-size:12px;padding:0 8px;cursor:grab}',
 '.rm-sidebar-edit-mode .rm-sidebar-drag-handle{display:block}',
 '.rm-sidebar-edit-mode .rm-sidebar-group{cursor:default}',
-'.rm-sidebar-edit-mode .rm-sidebar-label{color:rgba(255,255,255,.6)}',
-'.rm-sidebar-done-btn{display:none;margin:8px 12px;padding:8px 16px;background:#1DB954;color:#000;border:none;border-radius:20px;font-size:12px;font-weight:700;cursor:pointer;width:calc(100% - 24px)}',
-'.rm-sidebar-done-btn:hover{background:#1ed760}',
+'.rm-sidebar-edit-mode .rm-sidebar-label{color:var(--rm-text-secondary)}',
+'.rm-sidebar-done-btn{display:none;margin:8px 12px;padding:8px 16px;background:var(--rm-accent);color:#000;border:none;border-radius:20px;font-size:12px;font-weight:700;cursor:pointer;width:calc(100% - 24px)}',
+'.rm-sidebar-done-btn:hover{background:var(--rm-accent-hover)}',
 '.rm-sidebar-edit-mode .rm-sidebar-done-btn{display:block}',
-/* Discovery section */
+/* Discovery section — immersive design */
 '.rm-disc-country{display:flex;align-items:center;gap:10px;padding:16px 20px 8px;background:rgba(255,255,255,.03);border-bottom:1px solid rgba(255,255,255,.06);flex-wrap:wrap}',
 '.rm-disc-country-label{font-size:12px;color:rgba(255,255,255,.5)}',
-'.rm-disc-country-select{padding:6px 12px;border:1px solid rgba(255,255,255,.1);border-radius:16px;background:rgba(255,255,255,.06);color:#fff;font-size:12px;outline:none;cursor:pointer}',
-'.rm-disc-section{margin-bottom:24px}',
-'.rm-disc-title{font-size:14px;font-weight:700;color:#fff;padding:16px 20px 8px;display:flex;align-items:center;gap:8px}',
-'.rm-disc-title i{color:#1DB954}',
-'.rm-disc-carousel{display:flex;gap:12px;overflow-x:auto;padding:0 20px 12px;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch;scrollbar-width:none}',
+'.rm-disc-country-select{padding:6px 12px;border:1px solid rgba(255,255,255,.1);border-radius:16px;background:rgba(255,255,255,.06);color:var(--rm-text);font-size:12px;outline:none;cursor:pointer}',
+/* Hero banner */
+'.rm-disc-hero{position:relative;padding:40px 28px 32px;margin:-20px -20px 24px;overflow:hidden;border-radius:0 0 20px 20px}',
+'.rm-disc-hero-bg{position:absolute;inset:0;background:linear-gradient(135deg,rgba(var(--rm-accent-rgb),.45) 0%,rgba(80,30,120,.55) 50%,rgba(20,20,40,.85) 100%);z-index:0}',
+'.rm-disc-hero-bg::after{content:"";position:absolute;inset:0;background:radial-gradient(ellipse at 30% 20%,rgba(var(--rm-accent-rgb),.3),transparent 60%)}',
+'.rm-disc-hero-content{position:relative;z-index:1}',
+'.rm-disc-hero h2{font-size:26px;font-weight:800;color:#fff;margin:0 0 6px;letter-spacing:-.5px}',
+'.rm-disc-hero p{font-size:14px;color:rgba(255,255,255,.7);margin:0 0 20px}',
+'.rm-disc-hero-chips{display:flex;gap:8px;flex-wrap:wrap}',
+'.rm-disc-hero-chip{padding:8px 18px;border-radius:24px;background:rgba(255,255,255,.12);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.15);color:#fff;font-size:12px;font-weight:600;cursor:pointer;transition:all .2s;display:flex;align-items:center;gap:6px}',
+'.rm-disc-hero-chip:hover{background:rgba(var(--rm-accent-rgb),.4);border-color:var(--rm-accent);transform:scale(1.04)}',
+'.rm-disc-hero-chip i{font-size:11px;color:var(--rm-accent)}',
+/* Section headers */
+'.rm-disc-section{margin-bottom:32px;animation:rm-disc-fadein .4s ease both}',
+'@keyframes rm-disc-fadein{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}',
+'.rm-disc-section:nth-child(2){animation-delay:.05s}',
+'.rm-disc-section:nth-child(3){animation-delay:.1s}',
+'.rm-disc-section:nth-child(4){animation-delay:.15s}',
+'.rm-disc-section:nth-child(5){animation-delay:.2s}',
+'.rm-disc-title{font-size:16px;font-weight:700;color:var(--rm-text);padding:0 0 12px;display:flex;align-items:center;gap:10px}',
+'.rm-disc-title i{color:var(--rm-accent);font-size:14px}',
+'.rm-disc-title .rm-disc-seeall{margin-left:auto;font-size:11px;font-weight:500;color:var(--rm-accent);cursor:pointer;opacity:.7;transition:opacity .15s}',
+'.rm-disc-title .rm-disc-seeall:hover{opacity:1}',
+/* Carousel */
+'.rm-disc-carousel{display:flex;gap:14px;overflow-x:auto;padding:0 0 16px;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch;scrollbar-width:none}',
 '.rm-disc-carousel::-webkit-scrollbar{display:none}',
-'.rm-disc-card{flex-shrink:0;width:160px;background:rgba(255,255,255,.05);border-radius:10px;overflow:hidden;cursor:pointer;transition:background .15s,transform .15s;scroll-snap-align:start;touch-action:pan-x}',
-'.rm-disc-card:hover{background:rgba(255,255,255,.1);transform:translateY(-2px)}',
-'.rm-disc-card-art{width:160px;height:100px;overflow:hidden;background:#282828;position:relative}',
-'.rm-disc-card-art img{width:100%;height:100%;object-fit:cover}',
-'.rm-disc-card-art i{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:32px;color:rgba(255,255,255,.2)}',
-'.rm-disc-card-body{padding:10px}',
-'.rm-disc-card-title{font-size:12px;font-weight:600;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-'.rm-disc-card-meta{font-size:11px;color:rgba(255,255,255,.4);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:3px}',
-'.rm-disc-badge{position:absolute;top:6px;left:6px;font-size:9px;font-weight:700;padding:2px 6px;border-radius:8px;backdrop-filter:blur(4px)}',
-'.rm-disc-badge-radio{background:rgba(29,185,84,.85);color:#000}',
-'.rm-disc-badge-pod{background:rgba(100,100,255,.85);color:#fff}',
-'.rm-disc-badge-music{background:rgba(255,60,60,.85);color:#fff}',
-'.rm-disc-empty{padding:20px;text-align:center;color:rgba(255,255,255,.3);font-size:13px}',
-'.rm-main{flex:1;display:flex;flex-direction:column;overflow:hidden;background:#121212}',
-'.rm-toolbar{display:flex;align-items:center;gap:10px;padding:12px 20px;background:#181818;border-bottom:1px solid rgba(255,255,255,.06);flex-wrap:wrap}',
-'.rm-search{flex:1;min-width:180px;padding:10px 16px;border:none;border-radius:24px;background:rgba(255,255,255,.08);color:#fff;font-size:13px;outline:none;transition:background .2s}',
-'.rm-search:focus{background:rgba(255,255,255,.14);box-shadow:0 0 0 2px rgba(29,185,84,.3)}',
+/* Cards — larger, glassmorphic */
+'.rm-disc-card{flex-shrink:0;width:175px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.06);border-radius:14px;overflow:hidden;cursor:pointer;transition:all .2s ease;scroll-snap-align:start;touch-action:pan-x}',
+'.rm-disc-card:hover{background:rgba(255,255,255,.12);transform:translateY(-4px);box-shadow:0 8px 32px rgba(0,0,0,.3)}',
+'.rm-disc-card:active{transform:scale(.97)}',
+'.rm-disc-card-art{width:175px;height:175px;overflow:hidden;background:var(--rm-bg-surface);position:relative}',
+'.rm-disc-card-art img{width:100%;height:100%;object-fit:cover;transition:transform .3s ease}',
+'.rm-disc-card:hover .rm-disc-card-art img{transform:scale(1.06)}',
+'.rm-disc-card-art i{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:36px;color:rgba(255,255,255,.2)}',
+'.rm-disc-card-art .rm-disc-play-overlay{position:absolute;inset:0;background:rgba(0,0,0,.4);display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .2s}',
+'.rm-disc-card:hover .rm-disc-play-overlay{opacity:1}',
+'.rm-disc-play-overlay i{font-size:32px;color:#fff;filter:drop-shadow(0 2px 8px rgba(0,0,0,.5))}',
+'.rm-disc-card-body{padding:12px 14px}',
+'.rm-disc-card-title{font-size:13px;font-weight:600;color:var(--rm-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+'.rm-disc-card-meta{font-size:11px;color:rgba(255,255,255,.4);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:4px}',
+'.rm-disc-badge{position:absolute;top:8px;left:8px;font-size:9px;font-weight:700;padding:3px 8px;border-radius:10px;backdrop-filter:blur(6px);letter-spacing:.5px}',
+'.rm-disc-badge-radio{background:rgba(var(--rm-accent-rgb),.85);color:#000}',
+'.rm-disc-badge-pod{background:rgba(100,100,255,.85);color:var(--rm-text)}',
+'.rm-disc-badge-music{background:rgba(255,60,60,.85);color:var(--rm-text)}',
+'.rm-disc-badge-rec{background:rgba(255,180,50,.9);color:#000}',
+'.rm-disc-empty{padding:20px;text-align:center;color:var(--rm-text-muted);font-size:13px}',
+/* Recommendation section */
+'.rm-disc-rec-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}',
+'.rm-disc-rec-item{display:flex;align-items:center;gap:12px;padding:10px 14px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.04);border-radius:12px;cursor:pointer;transition:all .2s}',
+'.rm-disc-rec-item:hover{background:rgba(255,255,255,.1);transform:translateX(4px)}',
+'.rm-disc-rec-art{width:52px;height:52px;border-radius:8px;overflow:hidden;flex-shrink:0;background:var(--rm-bg-surface)}',
+'.rm-disc-rec-art img{width:100%;height:100%;object-fit:cover}',
+'.rm-disc-rec-art i{width:100%;height:100%;display:flex;align-items:center;justify-content:center;font-size:18px;color:rgba(255,255,255,.3)}',
+'.rm-disc-rec-info{flex:1;min-width:0}',
+'.rm-disc-rec-title{font-size:13px;font-weight:600;color:var(--rm-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+'.rm-disc-rec-meta{font-size:11px;color:rgba(255,255,255,.4);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+'.rm-main{flex:1;display:flex;flex-direction:column;overflow:hidden;background:var(--rm-bg)}',
+'.rm-toolbar{display:flex;align-items:center;gap:10px;padding:12px 20px;background:var(--rm-bg-elevated);border-bottom:1px solid rgba(255,255,255,.06);flex-wrap:wrap}',
+'.rm-search{flex:1;min-width:180px;padding:10px 16px;border:none;border-radius:24px;background:rgba(255,255,255,.08);color:var(--rm-text);font-size:13px;outline:none;transition:background .2s}',
+'.rm-search:focus{background:rgba(255,255,255,.14);box-shadow:0 0 0 2px rgba(var(--rm-accent-rgb),.3)}',
 '.rm-search::placeholder{color:rgba(255,255,255,.4)}',
-'.rm-select{padding:8px 12px;border:1px solid rgba(255,255,255,.1);border-radius:20px;background:rgba(255,255,255,.06);color:#fff;font-size:12px;outline:none;cursor:pointer;min-width:100px}',
-'.rm-select:focus{border-color:#1DB954}',
-'.rm-select option{background:#282828;color:#fff}',
-'.rm-content{flex:1;overflow-y:auto;padding:20px;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.1) transparent}',
+'.rm-select{padding:8px 12px;border:1px solid rgba(255,255,255,.1);border-radius:20px;background:rgba(255,255,255,.06);color:var(--rm-text);font-size:12px;outline:none;cursor:pointer;min-width:100px}',
+'.rm-select:focus{border-color:var(--rm-accent)}',
+'.rm-select option{background:var(--rm-bg-surface);color:var(--rm-text)}',
+'.rm-content{flex:1;overflow-y:auto;padding:20px;scrollbar-width:thin;scrollbar-color:var(--rm-text-dim) transparent}',
 
 /* ── station / podcast cards ─────────────────────────── */
 '.rm-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:10px}',
 '.rm-card{display:flex;align-items:center;gap:12px;padding:10px 12px;background:rgba(255,255,255,.04);border:none;border-radius:8px;cursor:pointer;transition:all .2s}',
 '.rm-card:hover{background:rgba(255,255,255,.1);transform:translateY(-1px)}',
-'.rm-card.rm-playing{background:rgba(29,185,84,.12);box-shadow:inset 3px 0 0 #1DB954}',
+'.rm-card.rm-playing{background:rgba(var(--rm-accent-rgb),.12);box-shadow:inset 3px 0 0 var(--rm-accent)}',
 '.rm-card.rm-buffering{opacity:.7}',
-'.rm-card.rm-buffering .rm-card-icon::after{content:"";position:absolute;inset:0;border-radius:10px;border:2px solid transparent;border-top-color:#1DB954;animation:rm-spin .8s linear infinite}',
+'.rm-card.rm-buffering .rm-card-icon::after{content:"";position:absolute;inset:0;border-radius:10px;border:2px solid transparent;border-top-color:var(--rm-accent);animation:rm-spin .8s linear infinite}',
 '@keyframes rm-spin{to{transform:rotate(360deg)}}',
-'.rm-card-icon{width:48px;height:48px;border-radius:8px;background:#282828;display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0;position:relative}',
+'.rm-card-icon{width:48px;height:48px;border-radius:8px;background:var(--rm-bg-surface);display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0;position:relative}',
 '.rm-card-icon img{width:100%;height:100%;object-fit:cover;border-radius:8px}',
 '.rm-card-icon i{font-size:20px;color:rgba(255,255,255,.4)}',
-'.rm-letter-icon{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:20px;border-radius:8px}',
+'.rm-letter-icon{width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:var(--rm-text);font-weight:700;font-size:20px;border-radius:8px}',
 '.rm-card-info{flex:1;min-width:0}',
-'.rm-card-name{font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px}',
+'.rm-card-name{font-weight:600;color:var(--rm-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px}',
 '.rm-card-meta{font-size:11px;color:rgba(255,255,255,.5);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
 '.rm-card-actions{display:flex;gap:4px;flex-shrink:0}',
 '.rm-card-btn{background:none;border:none;color:rgba(255,255,255,.4);cursor:pointer;padding:6px;font-size:14px;border-radius:50%;transition:all .12s}',
-'.rm-card-btn:hover{color:#1DB954;background:rgba(29,185,84,.1)}',
-'.rm-card-btn.rm-fav-active{color:#1DB954}',
+'.rm-card-btn:hover{color:var(--rm-accent);background:rgba(var(--rm-accent-rgb),.1)}',
+'.rm-card-btn.rm-fav-active{color:var(--rm-accent)}',
 '.rm-card-codec{font-size:9px;padding:1px 5px;border-radius:4px;background:rgba(255,255,255,.06);color:rgba(255,255,255,.4);font-weight:600;letter-spacing:.5px}',
 
 /* ── chips ─────────────────────────── */
 '.rm-chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}',
 '.rm-chip{padding:6px 14px;border-radius:20px;background:rgba(255,255,255,.06);border:none;color:rgba(255,255,255,.8);font-size:12px;cursor:pointer;transition:all .15s;white-space:nowrap}',
 '.rm-chip:hover{background:rgba(255,255,255,.12)}',
-'.rm-chip.active{background:#1DB954;color:#fff}',
+'.rm-chip.active{background:var(--rm-accent);color:var(--rm-text)}',
 
 /* ── Player bar (Spotify-style) ────────────────────── */
-'.rm-player{display:flex;align-items:center;gap:14px;padding:10px 20px;background:#181818;border-top:1px solid rgba(255,255,255,.06);min-height:68px}',
-'.rm-player.rm-buffering .rm-player-art::after{content:"";position:absolute;inset:-2px;border-radius:8px;border:2px solid transparent;border-top-color:#1DB954;animation:rm-spin .8s linear infinite}',
-'.rm-player-art{width:50px;height:50px;border-radius:6px;background:#282828;display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0;box-shadow:0 2px 8px rgba(0,0,0,.5);position:relative;cursor:pointer}',
+'.rm-player{display:flex;align-items:center;gap:14px;padding:10px 20px;background:var(--rm-bg-elevated);border-top:1px solid rgba(255,255,255,.06);min-height:68px}',
+'.rm-player.rm-buffering .rm-player-art::after{content:"";position:absolute;inset:-2px;border-radius:8px;border:2px solid transparent;border-top-color:var(--rm-accent);animation:rm-spin .8s linear infinite}',
+'.rm-player-art{width:50px;height:50px;border-radius:6px;background:var(--rm-bg-surface);display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0;box-shadow:0 2px 8px rgba(0,0,0,.5);position:relative;cursor:pointer}',
 '.rm-player-art img{width:100%;height:100%;object-fit:cover}',
 '.rm-player-art .rm-letter-icon{font-size:18px}',
 '.rm-player-art i{font-size:18px;color:rgba(255,255,255,.4)}',
 '.rm-player-info{flex:1;min-width:0;cursor:pointer}',
-'.rm-player-name{font-weight:600;font-size:13px;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+'.rm-player-name{font-weight:600;font-size:13px;color:var(--rm-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
 '.rm-player-meta{font-size:11px;color:rgba(255,255,255,.5);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}',
 '.rm-player-controls{display:flex;align-items:center;gap:4px}',
 '.rm-player-btn{background:none;border:none;color:rgba(255,255,255,.8);font-size:16px;cursor:pointer;padding:8px;border-radius:50%;transition:all .12s;line-height:1}',
-'.rm-player-btn:hover{color:#fff;transform:scale(1.08)}',
-'.rm-player-btn.rm-mode-active{color:#1DB954}',
-'.rm-player-btn.rm-btn-play{font-size:20px;width:40px;height:40px;display:flex;align-items:center;justify-content:center;background:#1DB954;color:#000;border-radius:50%;box-shadow:0 2px 8px rgba(29,185,84,.3);position:relative;overflow:visible}',
-'.rm-player-btn.rm-btn-play:hover{background:#1ed760;transform:scale(1.06)}',
+'.rm-player-btn:hover{color:var(--rm-text);transform:scale(1.08)}',
+'.rm-player-btn.rm-mode-active{color:var(--rm-accent)}',
+'.rm-player-btn.rm-btn-play{font-size:20px;width:40px;height:40px;display:flex;align-items:center;justify-content:center;background:var(--rm-accent);color:#000;border-radius:50%;box-shadow:0 2px 8px rgba(var(--rm-accent-rgb),.3);position:relative;overflow:visible}',
+'.rm-player-btn.rm-btn-play:hover{background:var(--rm-accent-hover);transform:scale(1.06)}',
 /* Loading state: Spotify-style progress ring around play button — signals NAS is loading */
-'.rm-player-btn.rm-btn-play.rm-loading::after{content:"";position:absolute;inset:-4px;border-radius:50%;border:2px solid transparent;border-top-color:#1DB954;border-right-color:rgba(29,185,84,.4);animation:rm-spin .7s linear infinite;pointer-events:none}',
+'.rm-player-btn.rm-btn-play.rm-loading::after{content:"";position:absolute;inset:-4px;border-radius:50%;border:2px solid transparent;border-top-color:var(--rm-accent);border-right-color:rgba(var(--rm-accent-rgb),.4);animation:rm-spin .7s linear infinite;pointer-events:none}',
 '.rm-cast-btn{font-size:15px;transition:color .2s;display:none}',
-'.rm-cast-btn.rm-casting{color:#1DB954;animation:rm-cast-pulse 2s ease-in-out infinite}',
+'.rm-cast-btn.rm-casting{color:var(--rm-accent);animation:rm-cast-pulse 2s ease-in-out infinite}',
 '@keyframes rm-cast-pulse{0%,100%{opacity:1}50%{opacity:.5}}',
-'.rm-autoplay-prompt{display:flex;align-items:center;justify-content:center;gap:10px;padding:12px 20px;background:linear-gradient(135deg,#1DB954,#0f9240);color:#000;font-weight:700;font-size:14px;cursor:pointer;border:none;width:100%;border-top:none;animation:rm-autoplay-pulse 1.5s ease-in-out infinite}',
+'.rm-autoplay-prompt{display:flex;align-items:center;justify-content:center;gap:10px;padding:12px 20px;background:linear-gradient(135deg,var(--rm-accent),var(--rm-accent-active));color:#000;font-weight:700;font-size:14px;cursor:pointer;border:none;width:100%;border-top:none;animation:rm-autoplay-pulse 1.5s ease-in-out infinite}',
 '@keyframes rm-autoplay-pulse{0%,100%{opacity:1}50%{opacity:.8}}',
-'.rm-autoplay-prompt:hover{background:linear-gradient(135deg,#1ed760,#1DB954)}',
+'.rm-autoplay-prompt:hover{background:linear-gradient(135deg,var(--rm-accent-hover),var(--rm-accent))}',
 '.rm-autoplay-prompt i{font-size:20px}',
 '.rm-nas-spinup{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;background:rgba(15,23,42,.88);z-index:20;border-radius:8px;pointer-events:none}',
 '.rm-nas-spinup-icon{font-size:32px;animation:rm-nas-spin 2s linear infinite}',
@@ -506,9 +576,9 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
 '.rm-vol-wrap{display:flex;align-items:center;gap:6px}',
 '.rm-vol-wrap i{font-size:13px;color:rgba(255,255,255,.5)}',
-'.rm-vol-slider{width:80px;accent-color:#1DB954;height:4px}',
+'.rm-vol-slider{width:80px;accent-color:var(--rm-accent);height:4px}',
 '.rm-player-eq{display:flex;align-items:flex-end;gap:2px;height:18px;margin-left:4px}',
-'.rm-player-eq span{width:3px;background:#1DB954;border-radius:1px;animation:rm-eq .6s ease-in-out infinite alternate}',
+'.rm-player-eq span{width:3px;background:var(--rm-accent);border-radius:1px;animation:rm-eq .6s ease-in-out infinite alternate}',
 '.rm-player-eq span:nth-child(1){animation-delay:0s;height:6px}',
 '.rm-player-eq span:nth-child(2){animation-delay:.15s;height:12px}',
 '.rm-player-eq span:nth-child(3){animation-delay:.3s;height:8px}',
@@ -520,22 +590,22 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 '.rm-ep-list{display:flex;flex-direction:column;gap:8px}',
 '.rm-ep-item{display:flex;align-items:center;gap:12px;padding:12px;background:rgba(255,255,255,.04);border:none;border-radius:8px;cursor:pointer;transition:background .15s}',
 '.rm-ep-item:hover{background:rgba(255,255,255,.08)}',
-'.rm-ep-item.rm-playing{background:rgba(29,185,84,.1)}',
-'.rm-ep-play{font-size:16px;color:#1DB954;width:32px;text-align:center;flex-shrink:0}',
+'.rm-ep-item.rm-playing{background:rgba(var(--rm-accent-rgb),.1)}',
+'.rm-ep-play{font-size:16px;color:var(--rm-accent);width:32px;text-align:center;flex-shrink:0}',
 '.rm-ep-info{flex:1;min-width:0}',
-'.rm-ep-title{font-weight:600;color:#fff;margin-bottom:2px}',
+'.rm-ep-title{font-weight:600;color:var(--rm-text);margin-bottom:2px}',
 '.rm-ep-meta{font-size:11px;color:rgba(255,255,255,.5)}',
 
 /* podcast detail header */
 '.rm-pod-header{display:flex;gap:20px;margin-bottom:24px;align-items:flex-start}',
 '.rm-pod-art{width:140px;height:140px;border-radius:8px;object-fit:cover;flex-shrink:0;box-shadow:0 4px 20px rgba(0,0,0,.5)}',
 '.rm-pod-details{flex:1;min-width:0}',
-'.rm-pod-title{font-size:20px;font-weight:700;color:#fff;margin-bottom:4px}',
+'.rm-pod-title{font-size:20px;font-weight:700;color:var(--rm-text);margin-bottom:4px}',
 '.rm-pod-author{font-size:13px;color:rgba(255,255,255,.5);margin-bottom:6px}',
-'.rm-pod-desc{font-size:12px;color:rgba(255,255,255,.6);line-height:1.5;max-height:60px;overflow:hidden}',
-'.rm-pod-sub-btn{margin-top:8px;padding:6px 16px;border-radius:20px;border:1px solid #1DB954;background:transparent;color:#1DB954;font-size:12px;font-weight:600;cursor:pointer;transition:all .15s}',
-'.rm-pod-sub-btn:hover{background:#1DB954;color:#000}',
-'.rm-pod-sub-btn.subscribed{background:#1DB954;color:#000}',
+'.rm-pod-desc{font-size:12px;color:var(--rm-text-secondary);line-height:1.5;max-height:60px;overflow:hidden}',
+'.rm-pod-sub-btn{margin-top:8px;padding:6px 16px;border-radius:20px;border:1px solid var(--rm-accent);background:transparent;color:var(--rm-accent);font-size:12px;font-weight:600;cursor:pointer;transition:all .15s}',
+'.rm-pod-sub-btn:hover{background:var(--rm-accent);color:#000}',
+'.rm-pod-sub-btn.subscribed{background:var(--rm-accent);color:#000}',
 
 /* empty state */
 '.rm-empty{text-align:center;padding:60px 20px;color:rgba(255,255,255,.4)}',
@@ -545,30 +615,30 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 /* ── music tracks ─────────────────────────── */
 '.rm-track{display:flex;align-items:center;gap:12px;padding:8px 12px;background:rgba(255,255,255,.03);border:none;border-radius:6px;cursor:pointer;transition:all .15s}',
 '.rm-track:hover{background:rgba(255,255,255,.08)}',
-'.rm-track.rm-playing{background:rgba(29,185,84,.1)}',
-'.rm-track-thumb{width:48px;height:48px;border-radius:6px;object-fit:cover;flex-shrink:0;background:#282828}',
+'.rm-track.rm-playing{background:rgba(var(--rm-accent-rgb),.1)}',
+'.rm-track-thumb{width:48px;height:48px;border-radius:6px;object-fit:cover;flex-shrink:0;background:var(--rm-bg-surface)}',
 '.rm-track-info{flex:1;min-width:0}',
-'.rm-track-title{font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px}',
+'.rm-track-title{font-weight:600;color:var(--rm-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px}',
 '.rm-track-meta{font-size:11px;color:rgba(255,255,255,.4);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
 '.rm-track-dur{font-size:11px;color:rgba(255,255,255,.4);flex-shrink:0;font-variant-numeric:tabular-nums}',
 '.rm-track-actions{display:flex;gap:2px;flex-shrink:0}',
 '.rm-track-btn{background:none;border:none;color:rgba(255,255,255,.4);cursor:pointer;padding:6px;font-size:13px;border-radius:50%;transition:all .12s}',
-'.rm-track-btn:hover{color:#1DB954;background:rgba(29,185,84,.1)}',
+'.rm-track-btn:hover{color:var(--rm-accent);background:rgba(var(--rm-accent-rgb),.1)}',
 
 /* local music search */
 '.rm-local-search-wrap{padding:8px 12px 0}',
 '.rm-local-search-box{display:flex;align-items:center;gap:8px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);border-radius:8px;padding:7px 12px;margin-bottom:12px}',
-'.rm-local-search-box input{flex:1;background:none;border:none;outline:none;color:#fff;font-size:13px;min-width:0}',
-'.rm-local-search-box input::placeholder{color:rgba(255,255,255,.3)}',
+'.rm-local-search-box input{flex:1;background:none;border:none;outline:none;color:var(--rm-text);font-size:13px;min-width:0}',
+'.rm-local-search-box input::placeholder{color:var(--rm-text-muted)}',
 
 /* seekbar */
-'.rm-seekbar{display:none;align-items:center;gap:8px;padding:0 20px;height:20px;flex-shrink:0;background:#181818}',
+'.rm-seekbar{display:none;align-items:center;gap:8px;padding:0 20px;height:20px;flex-shrink:0;background:var(--rm-bg-elevated)}',
 '.rm-seekbar.visible{display:flex}',
 '.rm-seek-time{font-size:10px;color:rgba(255,255,255,.4);font-variant-numeric:tabular-nums;min-width:36px}',
 '.rm-seek-time.right{text-align:right}',
 '.rm-seek-track{flex:1;height:4px;background:rgba(255,255,255,.1);border-radius:2px;position:relative;cursor:pointer}',
-'.rm-seek-fill{height:100%;background:#1DB954;border-radius:2px;position:absolute;left:0;top:0;pointer-events:none;transition:width .1s}',
-'.rm-seek-thumb{width:12px;height:12px;border-radius:50%;background:#fff;position:absolute;top:50%;transform:translate(-50%,-50%);cursor:pointer;opacity:0;transition:opacity .15s}',
+'.rm-seek-fill{height:100%;background:var(--rm-accent);border-radius:2px;position:absolute;left:0;top:0;pointer-events:none;transition:width .1s}',
+'.rm-seek-thumb{width:12px;height:12px;border-radius:50%;background:var(--rm-text);position:absolute;top:50%;transform:translate(-50%,-50%);cursor:pointer;opacity:0;transition:opacity .15s}',
 '.rm-seekbar:hover .rm-seek-thumb{opacity:1}',
 
 /* music queue panel */
@@ -577,57 +647,57 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 '.rm-queue-list{display:flex;flex-direction:column;gap:2px}',
 '.rm-queue-item{display:flex;align-items:center;gap:10px;padding:6px 10px;border-radius:6px;cursor:pointer;transition:background .12s;font-size:12px}',
 '.rm-queue-item:hover{background:rgba(255,255,255,.06)}',
-'.rm-queue-item.rm-playing{color:#1DB954;font-weight:600}',
-'.rm-queue-item-idx{width:20px;text-align:center;color:rgba(255,255,255,.35);flex-shrink:0}',
+'.rm-queue-item.rm-playing{color:var(--rm-accent);font-weight:600}',
+'.rm-queue-item-idx{width:20px;text-align:center;color:var(--rm-text-muted);flex-shrink:0}',
 '.rm-queue-item-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:rgba(255,255,255,.8)}',
-'.rm-queue-item.rm-playing .rm-queue-item-title{color:#1DB954}',
-'.rm-queue-item-dur{color:rgba(255,255,255,.35);flex-shrink:0}',
-'.rm-queue-item-rm{background:none;border:none;color:rgba(255,255,255,.3);cursor:pointer;padding:2px 4px;font-size:11px;transition:color .12s}',
-'.rm-queue-item-rm:hover{color:#ef4444}',
+'.rm-queue-item.rm-playing .rm-queue-item-title{color:var(--rm-accent)}',
+'.rm-queue-item-dur{color:var(--rm-text-muted);flex-shrink:0}',
+'.rm-queue-item-rm{background:none;border:none;color:var(--rm-text-muted);cursor:pointer;padding:2px 4px;font-size:11px;transition:color .12s}',
+'.rm-queue-item-rm:hover{color:var(--rm-error)}',
 
 /* playlists */
 '.rm-pl-header{display:flex;align-items:center;gap:12px;margin-bottom:16px;flex-wrap:wrap}',
-'.rm-pl-header h3{margin:0;font-size:18px;color:#fff;flex:1;font-weight:700}',
+'.rm-pl-header h3{margin:0;font-size:18px;color:var(--rm-text);flex:1;font-weight:700}',
 '.rm-pl-create{display:flex;gap:8px;align-items:center}',
-'.rm-pl-create input{padding:6px 12px;border:1px solid rgba(255,255,255,.1);border-radius:20px;background:rgba(255,255,255,.06);color:#fff;font-size:13px;outline:none}',
-'.rm-pl-create button{padding:6px 14px;border-radius:20px;background:#1DB954;color:#000;border:none;cursor:pointer;font-size:12px;font-weight:600;transition:filter .12s}',
+'.rm-pl-create input{padding:6px 12px;border:1px solid rgba(255,255,255,.1);border-radius:20px;background:rgba(255,255,255,.06);color:var(--rm-text);font-size:13px;outline:none}',
+'.rm-pl-create button{padding:6px 14px;border-radius:20px;background:var(--rm-accent);color:#000;border:none;cursor:pointer;font-size:12px;font-weight:600;transition:filter .12s}',
 '.rm-pl-create button:hover{filter:brightness(1.1)}',
 '.rm-pl-card{display:flex;align-items:center;gap:12px;padding:12px;background:rgba(255,255,255,.04);border:none;border-radius:8px;cursor:pointer;transition:all .2s}',
 '.rm-pl-card:hover{background:rgba(255,255,255,.08)}',
-'.rm-pl-icon{width:48px;height:48px;border-radius:8px;background:linear-gradient(135deg,#1DB954,#1a8f42);display:flex;align-items:center;justify-content:center;color:#000;font-size:18px;flex-shrink:0;overflow:hidden}',
+'.rm-pl-icon{width:48px;height:48px;border-radius:8px;background:linear-gradient(135deg,var(--rm-accent),var(--rm-accent-active));display:flex;align-items:center;justify-content:center;color:#000;font-size:18px;flex-shrink:0;overflow:hidden}',
 '.rm-pl-info{flex:1;min-width:0}',
-'.rm-pl-name{font-weight:600;color:#fff;font-size:14px}',
+'.rm-pl-name{font-weight:600;color:var(--rm-text);font-size:14px}',
 '.rm-pl-meta{font-size:11px;color:rgba(255,255,255,.4);margin-top:2px}',
 '.rm-pl-actions{display:flex;gap:4px}',
 '.rm-pl-btn{background:none;border:none;color:rgba(255,255,255,.4);cursor:pointer;padding:6px;font-size:13px;border-radius:50%;transition:all .12s}',
-'.rm-pl-btn:hover{color:#ef4444;background:rgba(239,68,68,.1)}',
+'.rm-pl-btn:hover{color:var(--rm-error);background:rgba(239,68,68,.1)}',
 
 /* add-to-playlist modal */
 '.rm-modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);display:flex;align-items:center;justify-content:center;z-index:9999;backdrop-filter:blur(4px)}',
-'.rm-modal{background:#282828;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:20px;min-width:280px;max-width:400px;max-height:60vh;overflow-y:auto}',
-'.rm-modal h4{margin:0 0 12px;font-size:15px;color:#fff}',
+'.rm-modal{background:var(--rm-bg-surface);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:20px;min-width:280px;max-width:400px;max-height:60vh;overflow-y:auto}',
+'.rm-modal h4{margin:0 0 12px;font-size:15px;color:var(--rm-text)}',
 '.rm-modal-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:6px;cursor:pointer;transition:background .12s;font-size:13px;color:rgba(255,255,255,.8)}',
 '.rm-modal-item:hover{background:rgba(255,255,255,.08)}',
-'.rm-modal-item i{color:#1DB954;width:16px;text-align:center}',
+'.rm-modal-item i{color:var(--rm-accent);width:16px;text-align:center}',
 '.rm-modal-close{margin-top:12px;padding:6px 16px;border-radius:20px;background:none;border:1px solid rgba(255,255,255,.15);color:rgba(255,255,255,.7);cursor:pointer;font-size:12px;width:100%;transition:all .12s}',
-'.rm-modal-close:hover{border-color:rgba(255,255,255,.3);color:#fff}',
+'.rm-modal-close:hover{border-color:var(--rm-text-muted);color:var(--rm-text)}',
 
 /* install banner */
 '.rm-install-banner{text-align:center;padding:40px 20px;max-width:400px;margin:0 auto}',
-'.rm-install-banner i{font-size:48px;color:#1DB954;margin-bottom:12px;display:block}',
+'.rm-install-banner i{font-size:48px;color:var(--rm-accent);margin-bottom:12px;display:block}',
 '.rm-install-banner p{font-size:14px;color:rgba(255,255,255,.5);margin-bottom:16px}',
-'.rm-install-btn{padding:10px 24px;border-radius:24px;background:#1DB954;color:#000;border:none;cursor:pointer;font-size:14px;font-weight:700;transition:all .15s}',
-'.rm-install-btn:hover{background:#1ed760;transform:scale(1.02)}',
+'.rm-install-btn{padding:10px 24px;border-radius:24px;background:var(--rm-accent);color:#000;border:none;cursor:pointer;font-size:14px;font-weight:700;transition:all .15s}',
+'.rm-install-btn:hover{background:var(--rm-accent-hover);transform:scale(1.02)}',
 '.rm-install-btn:disabled{opacity:.5;cursor:wait}',
 
 /* download button */
 '.rm-dl-btn{background:none;border:none;color:rgba(255,255,255,.4);cursor:pointer;padding:6px;font-size:14px;border-radius:50%;transition:all .12s;flex-shrink:0}',
-'.rm-dl-btn:hover{color:#1DB954;background:rgba(29,185,84,.1)}',
-'.rm-dl-btn.rm-downloading{color:#1DB954;animation:rm-pulse 1.2s infinite}',
-'.rm-dl-btn.rm-downloaded{color:#1DB954}',
+'.rm-dl-btn:hover{color:var(--rm-accent);background:rgba(var(--rm-accent-rgb),.1)}',
+'.rm-dl-btn.rm-downloading{color:var(--rm-accent);animation:rm-pulse 1.2s infinite}',
+'.rm-dl-btn.rm-downloaded{color:var(--rm-accent)}',
 '@keyframes rm-pulse{0%,100%{opacity:1}50%{opacity:.4}}',
-'.rm-dl-toast{position:fixed;bottom:80px;right:16px;background:#282828;border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:10px 16px;font-size:12px;color:#fff;box-shadow:0 4px 20px rgba(0,0,0,.5);z-index:9998;display:flex;align-items:center;gap:8px;max-width:300px}',
-'.rm-dl-toast i{color:#1DB954;font-size:14px}',
+'.rm-dl-toast{position:fixed;bottom:80px;right:16px;background:var(--rm-bg-surface);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:10px 16px;font-size:12px;color:var(--rm-text);box-shadow:0 4px 20px rgba(0,0,0,.5);z-index:9998;display:flex;align-items:center;gap:8px;max-width:300px}',
+'.rm-dl-toast i{color:var(--rm-accent);font-size:14px}',
 
 /* ── Offline Archive button (rm-arch-btn) ──────────────────── */
 /* Wrapper: relative + fixed size so SVG ring is always aligned */
@@ -641,91 +711,112 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 '.rm-arch-icon{font-size:13px;color:rgba(255,255,255,.4);transition:color .15s,transform .15s}',
 '.rm-arch-btn:hover .rm-arch-icon{color:rgba(255,255,255,.7)}',
 /* State: loading */
-'.rm-arch-btn.rm-arch-loading .rm-arch-icon{color:#1DB954;animation:rm-pulse 1.2s infinite}',
+'.rm-arch-btn.rm-arch-loading .rm-arch-icon{color:var(--rm-accent);animation:rm-pulse 1.2s infinite}',
 /* State: archived on NAS */
-'.rm-arch-btn.rm-arch-nas .rm-arch-icon{color:#1DB954}',
+'.rm-arch-btn.rm-arch-nas .rm-arch-icon{color:var(--rm-accent)}',
 /* State: archived on NAS + cached on phone (brightest) */
-'.rm-arch-btn.rm-arch-phone .rm-arch-icon{color:#1DB954;filter:drop-shadow(0 0 4px rgba(29,185,84,.7))}',
+'.rm-arch-btn.rm-arch-phone .rm-arch-icon{color:var(--rm-accent);filter:drop-shadow(0 0 4px rgba(var(--rm-accent-rgb),.7))}',
 /* Error state */
-'.rm-arch-btn.rm-arch-error .rm-arch-icon{color:#ef4444}',
+'.rm-arch-btn.rm-arch-error .rm-arch-icon{color:var(--rm-error)}',
 
 /* local music folder chips */
 '.rm-folder-chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}',
 '.rm-folder-chip{display:inline-flex;align-items:center;gap:4px;padding:5px 10px;border-radius:16px;background:rgba(255,255,255,.06);border:none;font-size:11px;color:rgba(255,255,255,.8);cursor:default}',
 '.rm-folder-chip .rm-chip-remove{cursor:pointer;opacity:.5;margin-left:2px;font-size:10px}',
-'.rm-folder-chip .rm-chip-remove:hover{opacity:1;color:#ef4444}',
+'.rm-folder-chip .rm-chip-remove:hover{opacity:1;color:var(--rm-error)}',
 '.rm-add-folder-btn{padding:5px 12px;border-radius:16px;background:none;border:1px dashed rgba(255,255,255,.15);color:rgba(255,255,255,.4);font-size:11px;cursor:pointer;display:inline-flex;align-items:center;gap:4px}',
-'.rm-add-folder-btn:hover{border-color:#1DB954;color:#1DB954}',
+'.rm-add-folder-btn:hover{border-color:var(--rm-accent);color:var(--rm-accent)}',
 
 /* ── Now Playing overlay ───────────────────────── */
-'.rm-np-overlay{position:absolute;inset:0;z-index:100;display:flex;flex-direction:column;overflow:hidden;background:#0a0a0a;transform:translateY(0);transition:transform 0.4s cubic-bezier(0.32,0.72,0,1);will-change:transform;padding-bottom:max(0px,env(safe-area-inset-bottom))}',
-'.rm-np-minimized{transform:translateY(100%)!important;pointer-events:none}',
+'.rm-np-overlay{position:absolute;inset:0;z-index:100;display:flex;flex-direction:column;overflow:hidden;background:var(--rm-bg);padding-bottom:max(0px,env(safe-area-inset-bottom))}',
+'.rm-np-minimized{transform:translateY(100%);pointer-events:none;opacity:0}',
 /* Background: smooth colour transition between tracks */
 '.rm-np-bg{position:absolute;inset:-40px;background-size:cover;background-position:center;filter:blur(40px) brightness(.25) saturate(1.4);z-index:0;transition:opacity 300ms ease}',
-'.rm-np-inner{position:relative;z-index:1;flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;gap:16px;overflow-y:auto}',
-'.rm-np-close{position:absolute;top:max(50px,calc(env(safe-area-inset-top,0px) + 12px));left:12px;background:rgba(255,255,255,.08);border:none;color:#fff;font-size:18px;cursor:pointer;padding:8px 12px;border-radius:50%;z-index:2;backdrop-filter:blur(8px);transition:background .15s}',
+'.rm-np-inner{position:relative;z-index:1;flex:1;display:flex;flex-direction:column;align-items:center;padding:max(56px,calc(env(safe-area-inset-top,0px) + 48px)) 24px 24px;gap:16px;overflow-y:auto;-webkit-overflow-scrolling:touch}',
+'.rm-np-inner::before{content:"";flex:1 1 0;min-height:0;pointer-events:none}',
+'.rm-np-inner::after{content:"";flex:2 1 0;min-height:0;pointer-events:none}',
+'.rm-np-close{position:absolute;top:max(50px,calc(env(safe-area-inset-top,0px) + 12px));left:12px;background:rgba(255,255,255,.08);border:none;color:var(--rm-text);font-size:18px;cursor:pointer;padding:8px 12px;border-radius:50%;z-index:2;backdrop-filter:blur(8px);transition:background .15s}',
 '.rm-np-close:hover{background:rgba(255,255,255,.15)}',
 /* Fixed aspect-ratio art box — never causes layout shift */
-'.rm-np-art{width:260px;height:260px;aspect-ratio:1/1;border-radius:8px;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,.6);flex-shrink:0;background:#282828;display:flex;align-items:center;justify-content:center;position:relative}',
+'.rm-np-art{width:min(260px,55vw);height:min(260px,55vw);aspect-ratio:1/1;border-radius:8px;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,.6);flex-shrink:0;background:var(--rm-bg-surface);display:flex;align-items:center;justify-content:center;position:relative}',
+'@media(max-height:600px){.rm-np-art{width:min(180px,45vw);height:min(180px,45vw)}}',
 /* Art image cross-fade via opacity */
 '.rm-np-art img{width:100%;height:100%;object-fit:cover;transition:opacity 200ms ease;position:absolute;inset:0}',
 '.rm-np-art img.rm-art-loading{opacity:0}',
 '.rm-np-art img.rm-art-loaded{opacity:1}',
 '.rm-np-art .rm-letter-icon{font-size:64px;width:100%;height:100%}',
-'.rm-np-art i{font-size:64px;color:rgba(255,255,255,.3)}',
+'.rm-np-art i{font-size:64px;color:var(--rm-text-muted)}',
 /* Skeleton shimmer — shown while artwork fetches from NAS */
-'.rm-np-art.rm-skeleton::before{content:"";position:absolute;inset:0;background:linear-gradient(90deg,#282828 25%,#333 50%,#282828 75%);background-size:200% 100%;animation:rm-skeleton-sweep 1.2s infinite}',
+'.rm-np-art.rm-skeleton::before{content:"";position:absolute;inset:0;background:linear-gradient(90deg,var(--rm-bg-surface) 25%,var(--rm-border) 50%,var(--rm-bg-surface) 75%);background-size:200% 100%;animation:rm-skeleton-sweep 1.2s infinite}',
 '@keyframes rm-skeleton-sweep{0%{background-position:200% 0}100%{background-position:-200% 0}}',
+/* ── Loading Skeletons ─────────────────────────────── */
+'.rm-skel-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;padding:8px 0}',
+'.rm-skel-card{height:64px;border-radius:10px;background:var(--rm-bg-surface);position:relative;overflow:hidden}',
+'.rm-skel-card::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 25%,var(--rm-border) 50%,transparent 75%);background-size:200% 100%;animation:rm-skeleton-sweep 1.2s infinite}',
+'.rm-skel-track{height:52px;border-radius:8px;background:var(--rm-bg-surface);position:relative;overflow:hidden;margin-bottom:4px}',
+'.rm-skel-track::after{content:"";position:absolute;inset:0;background:linear-gradient(90deg,transparent 25%,var(--rm-border) 50%,transparent 75%);background-size:200% 100%;animation:rm-skeleton-sweep 1.2s infinite}',
 '.rm-np-info{text-align:center;max-width:320px;width:100%}',
 /* Title + meta fade on track swap */
-'.rm-np-title{font-size:22px;font-weight:700;color:#fff;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:opacity 150ms ease}',
+'.rm-np-title{font-size:22px;font-weight:700;color:var(--rm-text);margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:opacity 150ms ease}',
 '.rm-np-meta{font-size:13px;color:rgba(255,255,255,.5);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:opacity 150ms ease}',
 '.rm-np-title.rm-fading,.rm-np-meta.rm-fading{opacity:0}',
 '.rm-np-seek{display:flex;align-items:center;gap:10px;width:100%;max-width:320px}',
 '.rm-np-seek .rm-seek-time{color:rgba(255,255,255,.4);font-size:11px;min-width:38px}',
 '.rm-np-seek .rm-seek-track{flex:1;height:4px;background:rgba(255,255,255,.12);border-radius:2px;position:relative;cursor:pointer}',
-'.rm-np-seek .rm-seek-fill{height:100%;background:#1DB954;border-radius:2px;position:absolute;left:0;top:0}',
-'.rm-np-seek .rm-seek-thumb{width:14px;height:14px;border-radius:50%;background:#fff;position:absolute;top:50%;transform:translate(-50%,-50%);cursor:pointer}',
-'.rm-np-controls{display:flex;align-items:center;gap:20px}',
-'.rm-np-btn{background:none;border:none;color:rgba(255,255,255,.7);font-size:22px;cursor:pointer;padding:10px;border-radius:50%;transition:all .12s}',
-'.rm-np-btn.rm-mode-active{color:#1DB954}',
-'.rm-np-btn:hover{color:#fff;transform:scale(1.1)}',
-'.rm-np-btn.rm-np-play{width:64px;height:64px;font-size:26px;background:#1DB954;color:#000;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 20px rgba(29,185,84,.3);position:relative;overflow:visible}',
-'.rm-np-btn.rm-np-play:hover{background:#1ed760;transform:scale(1.06)}',
-'.rm-np-btn.rm-np-play.rm-loading::after{content:"";position:absolute;inset:-5px;border-radius:50%;border:3px solid transparent;border-top-color:#1DB954;border-right-color:rgba(29,185,84,.4);animation:rm-spin .7s linear infinite;pointer-events:none}',
+'.rm-np-seek .rm-seek-fill{height:100%;background:var(--rm-accent);border-radius:2px;position:absolute;left:0;top:0}',
+'.rm-np-seek .rm-seek-thumb{width:14px;height:14px;border-radius:50%;background:var(--rm-text);position:absolute;top:50%;transform:translate(-50%,-50%);cursor:pointer}',
+'.rm-np-controls{display:flex;align-items:center;gap:20px;touch-action:manipulation}',
+'.rm-np-btn{background:none;border:none;color:rgba(255,255,255,.7);font-size:22px;cursor:pointer;padding:10px;border-radius:50%;transition:all .12s;touch-action:manipulation;-webkit-tap-highlight-color:transparent}',
+'.rm-np-btn.rm-mode-active{color:var(--rm-accent)}',
+'.rm-np-btn:hover{color:var(--rm-text);transform:scale(1.1)}',
+'.rm-np-btn.rm-np-play{width:64px;height:64px;font-size:26px;background:var(--rm-accent);color:#000;border-radius:50%;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 20px rgba(var(--rm-accent-rgb),.3);position:relative;overflow:visible}',
+'.rm-np-btn.rm-np-play:hover{background:var(--rm-accent-hover);transform:scale(1.06)}',
+'.rm-np-btn.rm-np-play.rm-loading::after{content:"";position:absolute;inset:-5px;border-radius:50%;border:3px solid transparent;border-top-color:var(--rm-accent);border-right-color:rgba(var(--rm-accent-rgb),.4);animation:rm-spin .7s linear infinite;pointer-events:none}',
 '.rm-btn-disabled{opacity:.35!important;pointer-events:none!important;cursor:default!important}',
-'.rm-np-actions{display:flex;gap:10px;margin-top:4px;flex-wrap:wrap;justify-content:center}',
-'.rm-np-action{background:rgba(255,255,255,.06);border:none;color:rgba(255,255,255,.5);font-size:13px;cursor:pointer;padding:8px 16px;border-radius:20px;transition:all .12s;display:flex;align-items:center;gap:6px}',
-'.rm-np-action:hover{background:rgba(255,255,255,.12);color:#fff}',
-'.rm-np-action.rm-lyrics-active{background:rgba(29,185,84,.15);color:#1DB954}',
-'.rm-np-count{font-size:11px;color:rgba(255,255,255,.3);margin-top:2px}',
+'.rm-np-actions{display:flex;gap:10px;margin-top:4px;flex-wrap:wrap;justify-content:center;touch-action:manipulation}',
+'.rm-np-action{background:rgba(255,255,255,.06);border:none;color:rgba(255,255,255,.5);font-size:13px;cursor:pointer;padding:8px 16px;border-radius:20px;transition:all .12s;display:flex;align-items:center;gap:6px;touch-action:manipulation;-webkit-tap-highlight-color:transparent}',
+'.rm-np-action:hover{background:rgba(255,255,255,.12);color:var(--rm-text)}',
+'.rm-np-action.rm-lyrics-active{background:rgba(var(--rm-accent-rgb),.15);color:var(--rm-accent)}',
+'.rm-np-count{font-size:11px;color:var(--rm-text-muted);margin-top:2px}',
 '.rm-np-vis{display:block;width:100%;max-width:260px;height:48px;border-radius:6px;opacity:.85}',
 
 /* ── Lyrics panel ── */
 '.rm-lyrics-panel{display:none;width:100%;max-height:40vh;overflow-y:auto;padding:16px 8px;text-align:center;font-size:15px;line-height:1.8;color:rgba(255,255,255,.75);white-space:pre-line;-webkit-overflow-scrolling:touch;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.15) transparent}',
 '.rm-lyrics-panel.rm-lyrics-visible{display:block}',
-'.rm-lyrics-panel .rm-lyrics-loading{color:rgba(255,255,255,.3);font-style:italic}',
-'.rm-lyrics-panel .rm-lyrics-empty{color:rgba(255,255,255,.3);font-style:italic}',
+'.rm-lyrics-panel .rm-lyrics-loading{color:var(--rm-text-muted);font-style:italic}',
+'.rm-lyrics-panel .rm-lyrics-empty{color:var(--rm-text-muted);font-style:italic}',
 /* now-playing queue panel */
 '.rm-np-queue{display:none;width:100%;max-height:40vh;overflow-y:auto;padding:8px 0;-webkit-overflow-scrolling:touch;scrollbar-width:thin;scrollbar-color:rgba(255,255,255,.15) transparent}',
 '.rm-np-queue.rm-np-queue-visible{display:block}',
 '.rm-np-queue-header{display:flex;align-items:center;justify-content:space-between;padding:0 8px 8px;font-size:13px;color:rgba(255,255,255,.5);font-weight:600}',
 '.rm-np-q-item{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:8px;cursor:pointer;transition:background .12s;min-height:44px}',
 '.rm-np-q-item:active{background:rgba(255,255,255,.08)}',
-'.rm-np-q-item.rm-q-current{background:rgba(29,185,84,.12)}',
-'.rm-np-q-item-idx{width:22px;text-align:center;color:rgba(255,255,255,.3);font-size:12px;flex-shrink:0}',
-'.rm-np-q-item.rm-q-current .rm-np-q-item-idx{color:#1DB954}',
-'.rm-np-q-item-art{width:36px;height:36px;border-radius:4px;object-fit:cover;flex-shrink:0;background:#282828}',
+'.rm-np-q-item.rm-q-current{background:rgba(var(--rm-accent-rgb),.12)}',
+'.rm-np-q-item-idx{width:22px;text-align:center;color:var(--rm-text-muted);font-size:12px;flex-shrink:0}',
+'.rm-np-q-item.rm-q-current .rm-np-q-item-idx{color:var(--rm-accent)}',
+'.rm-np-q-item-art{width:36px;height:36px;border-radius:4px;object-fit:cover;flex-shrink:0;background:var(--rm-bg-surface)}',
 '.rm-np-q-item-info{flex:1;min-width:0;overflow:hidden}',
 '.rm-np-q-item-title{font-size:13px;color:rgba(255,255,255,.85);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-'.rm-np-q-item.rm-q-current .rm-np-q-item-title{color:#1DB954;font-weight:600}',
-'.rm-np-q-item-meta{font-size:11px;color:rgba(255,255,255,.35);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+'.rm-np-q-item.rm-q-current .rm-np-q-item-title{color:var(--rm-accent);font-weight:600}',
+'.rm-np-q-item-meta{font-size:11px;color:var(--rm-text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+
+/* ── Similar artists panel (NP) ── */
+'.rm-np-similar{width:100%;padding:12px 0;-webkit-overflow-scrolling:touch}',
+'.rm-np-similar-header{display:flex;align-items:center;gap:8px;padding:0 8px 10px;font-size:13px;color:rgba(255,255,255,.5);font-weight:600}',
+'.rm-np-similar-scroll{display:flex;gap:12px;overflow-x:auto;padding:0 8px 8px;-webkit-overflow-scrolling:touch;scrollbar-width:none}',
+'.rm-np-similar-scroll::-webkit-scrollbar{display:none}',
+'.rm-np-similar-card{flex:0 0 110px;display:flex;flex-direction:column;align-items:center;gap:6px;cursor:pointer;padding:8px 4px;border-radius:12px;transition:background .12s}',
+'.rm-np-similar-card:active{background:rgba(255,255,255,.08)}',
+'.rm-np-similar-card img{width:80px;height:80px;border-radius:50%;object-fit:cover;background:rgba(255,255,255,.06);border:2px solid rgba(255,255,255,.08)}',
+'.rm-np-similar-card .rm-nps-name{font-size:12px;color:rgba(255,255,255,.8);text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100px}',
+'.rm-np-similar-card .rm-nps-fans{font-size:10px;color:var(--rm-text-muted)}',
+'.rm-np-similar-loading{text-align:center;padding:16px;color:var(--rm-text-muted);font-size:13px}',
 
 /* ── Lock screen ── */
 '.rm-lock-overlay{position:fixed;top:0;left:0;right:0;bottom:0;z-index:99999;background:#000;display:flex;flex-direction:column;align-items:center;justify-content:center;touch-action:none;user-select:none;-webkit-user-select:none}',
 '.rm-lock-art{width:180px;height:180px;border-radius:16px;overflow:hidden;background:rgba(255,255,255,.06);display:flex;align-items:center;justify-content:center;font-size:64px;color:rgba(255,255,255,.15);margin-bottom:24px}',
 '.rm-lock-art img{width:100%;height:100%;object-fit:cover}',
-'.rm-lock-title{font-size:18px;font-weight:700;color:#fff;text-align:center;max-width:80vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+'.rm-lock-title{font-size:18px;font-weight:700;color:var(--rm-text);text-align:center;max-width:80vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
 '.rm-lock-meta{font-size:13px;color:rgba(255,255,255,.4);margin-top:4px;text-align:center}',
 '.rm-lock-icon{font-size:40px;color:rgba(255,255,255,.1);margin-bottom:40px}',
 '.rm-lock-hint{position:absolute;bottom:60px;left:0;right:0;text-align:center;color:rgba(255,255,255,.2);font-size:13px;animation:rm-lock-pulse 2s ease-in-out infinite}',
@@ -733,61 +824,102 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 '@keyframes rm-lock-pulse{0%,100%{opacity:.2}50%{opacity:.5}}',
 
 /* ── Horizontal scroll section (Most Played, etc.) ── */
-'.rm-section-title{font-size:18px;font-weight:700;color:#fff;margin:20px 0 12px;display:flex;align-items:center;gap:10px}',
-'.rm-section-title i{color:#1DB954;font-size:16px}',
+'.rm-section-title{font-size:18px;font-weight:700;color:var(--rm-text);margin:20px 0 12px;display:flex;align-items:center;gap:10px}',
+'.rm-section-title i{color:var(--rm-accent);font-size:16px}',
 '.rm-hscroll{display:flex;overflow-x:auto;gap:14px;padding-bottom:8px;scroll-snap-type:x mandatory;-webkit-overflow-scrolling:touch;scrollbar-width:none}',
 '.rm-hscroll::-webkit-scrollbar{display:none}',
 '.rm-hcard{scroll-snap-align:start;min-width:150px;max-width:170px;flex-shrink:0;cursor:pointer;transition:all .15s;padding:10px;background:rgba(255,255,255,.04);border-radius:8px}',
 '.rm-hcard:hover{background:rgba(255,255,255,.08);transform:translateY(-3px)}',
-'.rm-hcard-art{width:130px;height:130px;border-radius:6px;overflow:hidden;background:#282828;margin-bottom:8px;position:relative;box-shadow:0 4px 16px rgba(0,0,0,.3)}',
+'.rm-hcard-art{width:130px;height:130px;border-radius:6px;overflow:hidden;background:var(--rm-bg-surface);margin-bottom:8px;position:relative;box-shadow:0 4px 16px rgba(0,0,0,.3)}',
 '.rm-hcard-art img{width:100%;height:100%;object-fit:cover}',
 '.rm-hcard-art .rm-letter-icon{width:100%;height:100%;font-size:40px}',
-'.rm-hcard-art i{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:32px;color:rgba(255,255,255,.3)}',
-'.rm-hcard-badge{position:absolute;top:6px;right:6px;background:rgba(0,0,0,.7);color:#1DB954;font-size:10px;padding:2px 6px;border-radius:10px;backdrop-filter:blur(4px);font-weight:600}',
-'.rm-hcard-title{font-size:13px;font-weight:600;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+'.rm-hcard-art i{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:32px;color:var(--rm-text-muted)}',
+'.rm-hcard-badge{position:absolute;top:6px;right:6px;background:rgba(0,0,0,.7);color:var(--rm-accent);font-size:10px;padding:2px 6px;border-radius:10px;backdrop-filter:blur(4px);font-weight:600}',
+'.rm-hcard-title{font-size:13px;font-weight:600;color:var(--rm-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
 '.rm-hcard-meta{font-size:11px;color:rgba(255,255,255,.4);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}',
 
 /* mobile bottom tab bar */
-'.rm-mobile-nav{display:none;background:#000;border-top:1px solid rgba(255,255,255,.08);padding:0 0 44px;gap:0;position:relative;z-index:45}',
+'.rm-mobile-nav{display:none;background:#000;border-top:1px solid var(--rm-border);padding:0 0 44px;gap:0;position:relative;z-index:45}',
 '.rm-mobile-nav .rm-mnav-btn{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;flex:1;padding:10px 4px 8px;border:none;border-radius:0;background:none;color:rgba(255,255,255,.45);font-size:11px;white-space:nowrap;cursor:pointer;transition:color .15s;min-width:0;line-height:1}',
-'.rm-mobile-nav .rm-mnav-btn.active{color:#1DB954;font-weight:600}',
+'.rm-mobile-nav .rm-mnav-btn.active{color:var(--rm-accent);font-weight:600}',
 '.rm-mobile-nav .rm-mnav-btn i{font-size:24px;display:block;margin-bottom:2px}',
-'.rm-more-sheet{display:none;position:absolute;bottom:100%;left:0;right:0;background:#1a1a1a;border-top:1px solid rgba(255,255,255,.1);border-radius:16px 16px 0 0;padding:16px 12px 12px;z-index:50;box-shadow:0 -8px 30px rgba(0,0,0,.6)}',
+'.rm-more-sheet{display:none;position:absolute;bottom:100%;left:0;right:0;background:var(--rm-bg-elevated);border-top:1px solid rgba(255,255,255,.1);border-radius:16px 16px 0 0;padding:16px 12px 12px;z-index:50;box-shadow:0 -8px 30px rgba(0,0,0,.6)}',
 '.rm-more-sheet.open{display:block}',
 '.rm-more-sheet-handle{width:36px;height:4px;background:rgba(255,255,255,.2);border-radius:2px;margin:0 auto 14px}',
 '.rm-more-sheet-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}',
 '.rm-more-btn{display:flex;flex-direction:column;align-items:center;gap:6px;padding:16px 4px;border:none;border-radius:12px;background:rgba(255,255,255,.05);color:rgba(255,255,255,.7);font-size:11px;cursor:pointer;transition:all .15s;line-height:1.2}',
-'.rm-more-btn:active{background:rgba(29,185,84,.15);color:#1DB954;transform:scale(.95)}',
+'.rm-more-btn:active{background:rgba(var(--rm-accent-rgb),.15);color:var(--rm-accent);transform:scale(.95)}',
 '.rm-more-btn i{font-size:22px;color:rgba(255,255,255,.5);transition:color .15s}',
-'.rm-more-btn:active i{color:#1DB954}',
+'.rm-more-btn:active i{color:var(--rm-accent)}',
 
 /* per-track action bottom sheet */
 '.rm-tsheet-overlay{position:fixed;inset:0;z-index:9998;background:rgba(0,0,0,.5);backdrop-filter:blur(4px)}',
-'.rm-tsheet{position:fixed;bottom:0;left:0;right:0;z-index:9999;background:#1a1a1a;border-radius:20px 20px 0 0;padding:12px 0 env(safe-area-inset-bottom,0);box-shadow:0 -8px 40px rgba(0,0,0,.7);transform:translateY(100%);transition:transform .25s cubic-bezier(.25,1,.5,1)}',
+'.rm-tsheet{position:fixed;bottom:0;left:0;right:0;z-index:9999;background:var(--rm-bg-elevated);border-radius:20px 20px 0 0;padding:12px 0 env(safe-area-inset-bottom,0);box-shadow:0 -8px 40px rgba(0,0,0,.7);transform:translateY(100%);transition:transform .25s cubic-bezier(.25,1,.5,1)}',
 '.rm-tsheet.open{transform:translateY(0)}',
 '.rm-tsheet-handle{width:40px;height:4px;background:rgba(255,255,255,.2);border-radius:2px;margin:0 auto 8px}',
-'.rm-tsheet-title{padding:4px 16px 12px;font-size:13px;font-weight:600;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-bottom:1px solid rgba(255,255,255,.07);margin-bottom:4px}',
+'.rm-tsheet-title{padding:4px 16px 12px;font-size:13px;font-weight:600;color:var(--rm-text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-bottom:1px solid rgba(255,255,255,.07);margin-bottom:4px}',
 '.rm-tsheet-row{display:flex;align-items:center;gap:14px;padding:14px 20px;cursor:pointer;transition:background .12s}',
 '.rm-tsheet-row:hover{background:rgba(255,255,255,.06)}',
-'.rm-tsheet-row:active{background:rgba(29,185,84,.12)}',
+'.rm-tsheet-row:active{background:rgba(var(--rm-accent-rgb),.12)}',
 '.rm-tsheet-row i{width:20px;text-align:center;font-size:16px;color:rgba(255,255,255,.55)}',
 '.rm-tsheet-row span{font-size:14px;color:rgba(255,255,255,.85)}',
-'.rm-tsheet-row.danger i,.rm-tsheet-row.danger span{color:#ef4444}',
+'.rm-tsheet-row.danger i,.rm-tsheet-row.danger span{color:var(--rm-error)}',
 '.rm-tsheet-row.disabled{opacity:.4;pointer-events:none}',
-'.rm-tsheet-progress{font-size:11px;color:#1DB954;margin-left:auto;font-weight:600}',
+'.rm-tsheet-progress{font-size:11px;color:var(--rm-accent);margin-left:auto;font-weight:600}',
 
 /* "..." button on tracks */
-'.rm-track-more{background:none;border:none;color:rgba(255,255,255,.3);font-size:16px;padding:8px;cursor:pointer;flex-shrink:0;border-radius:8px;transition:color .12s;line-height:1}',
+'.rm-track-more{background:none;border:none;color:var(--rm-text-muted);font-size:16px;padding:8px;cursor:pointer;flex-shrink:0;border-radius:8px;transition:color .12s;line-height:1}',
 '.rm-track-more:hover{color:rgba(255,255,255,.7);background:rgba(255,255,255,.06)}',
-'.rm-track-more.rm-downloading{color:#1DB954;animation:rm-pulse 1s infinite}',
+'.rm-track-more.rm-downloading{color:var(--rm-accent);animation:rm-pulse 1s infinite}',
 
 /* playlist edit mode */
 '.rm-pl-edit-mode .rm-track{cursor:grab}',
 '.rm-pl-edit-mode .rm-track:active{cursor:grabbing}',
-'.rm-track.rm-dnd-over{box-shadow:inset 0 2px 0 #1DB954}',
+'.rm-track.rm-dnd-over{box-shadow:inset 0 2px 0 var(--rm-accent)}',
 '.rm-track.rm-dnd-dragging{opacity:.4}',
-'.rm-pl-edit-btn{background:none;border:1px solid rgba(255,255,255,.2);color:rgba(255,255,255,.6);font-size:12px;padding:6px 14px;border-radius:20px;cursor:pointer;transition:all .15s}',
-'.rm-pl-edit-btn.active{background:#1DB954;color:#000;border-color:#1DB954}',
+'.rm-pl-edit-btn{background:none;border:1px solid rgba(255,255,255,.2);color:var(--rm-text-secondary);font-size:12px;padding:6px 14px;border-radius:20px;cursor:pointer;transition:all .15s}',
+'.rm-pl-edit-btn.active{background:var(--rm-accent);color:#000;border-color:var(--rm-accent)}',
+
+/* sleep timer dropdown */
+'.rm-sleep-dropdown{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);background:var(--rm-bg-surface);border-radius:12px;padding:6px 0;min-width:180px;box-shadow:0 8px 32px rgba(0,0,0,.6);z-index:10;display:none}',
+'.rm-sleep-dropdown.open{display:block}',
+'.rm-sleep-option{padding:10px 16px;font-size:13px;color:rgba(255,255,255,.8);cursor:pointer;transition:background .1s;display:flex;align-items:center;justify-content:space-between}',
+'.rm-sleep-option:hover{background:rgba(255,255,255,.08)}',
+'.rm-sleep-option.active{color:var(--rm-accent);font-weight:600}',
+'.rm-sleep-option .rm-sleep-check{font-size:11px}',
+'.rm-np-action.rm-sleep-active{background:rgba(var(--rm-accent-rgb),.15);color:var(--rm-accent)}',
+'.rm-sleep-remaining{font-size:10px;color:var(--rm-accent);margin-left:4px}',
+
+/* playback speed button */
+'.rm-speed-btn{background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.15);color:var(--rm-text-secondary);font-size:12px;font-weight:700;cursor:pointer;padding:4px 10px;border-radius:12px;transition:all .12s;min-width:38px;text-align:center}',
+'.rm-speed-btn:hover{background:rgba(255,255,255,.12);color:var(--rm-text)}',
+'.rm-speed-btn.rm-speed-changed{color:var(--rm-accent);border-color:rgba(var(--rm-accent-rgb),.4)}',
+
+/* section transition */
+'.rm-content{transition:opacity .15s ease}',
+'.rm-content.rm-fade-out{opacity:0}',
+
+/* synced lyrics */
+'.rm-lyrics-line{padding:4px 0;transition:all .25s ease;opacity:.35;transform:scale(.95)}',
+'.rm-lyrics-line.rm-lyr-active{opacity:1;color:var(--rm-text);font-weight:600;font-size:17px;transform:scale(1)}',
+'.rm-lyrics-line.rm-lyr-near{opacity:.6}',
+
+/* queue drag & drop */
+'.rm-np-q-item-drag{width:20px;text-align:center;color:rgba(255,255,255,.2);font-size:14px;cursor:grab;flex-shrink:0;touch-action:none}',
+'.rm-np-q-item-drag:active{cursor:grabbing}',
+'.rm-np-q-item.rm-q-dragging{opacity:.4;background:rgba(var(--rm-accent-rgb),.08)}',
+'.rm-np-q-item.rm-q-drag-over{box-shadow:inset 0 -2px 0 var(--rm-accent)}',
+
+/* podcast episode progress */
+'.rm-ep-progress{width:100%;height:3px;background:rgba(255,255,255,.08);border-radius:2px;margin-top:4px;overflow:hidden}',
+'.rm-ep-progress-bar{height:100%;background:var(--rm-accent);border-radius:2px;transition:width .3s}',
+'.rm-ep-done{color:var(--rm-accent);font-size:11px;margin-left:auto;flex-shrink:0}',
+
+/* crossfade setting */
+'.rm-crossfade-wrap{display:flex;align-items:center;gap:12px;padding:12px 0}',
+'.rm-crossfade-slider{flex:1;height:4px;-webkit-appearance:none;appearance:none;background:rgba(255,255,255,.15);border-radius:2px;outline:none}',
+'.rm-crossfade-slider::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:var(--rm-accent);cursor:pointer}',
+'.rm-crossfade-val{color:rgba(255,255,255,.5);font-size:12px;min-width:28px;text-align:right}',
 
 /* exit fullscreen toggle (mobile only) */
 '.rm-exit-fs{display:none;position:absolute;top:8px;right:8px;z-index:200;width:40px;height:40px;border-radius:50%;background:rgba(0,0,0,.55);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.12);color:rgba(255,255,255,.7);font-size:15px;cursor:pointer;align-items:center;justify-content:center;transition:all .2s}',
@@ -1017,6 +1149,9 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             _renderSidebar();
             loadSection('most-played');
 
+            // Pre-load liked songs so NP heart works immediately
+            api('/radio-music/music/liked').then(d => { _likedSongs = d.items || []; }).catch(() => {});
+
             // Initialize Google Cast SDK (wrapped so failures don't break the app)
             try { _initCast(); } catch(e) { _cl('error', 'Cast init failed', { error: e.message }); }
 
@@ -1032,9 +1167,15 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
             // Restore previous playback state (paused, showing last track)
             _restoreAndShowLastTrack(body);
+            _loadCrossfadeSetting();
+            _loadEpProgress();
+            _loadEqSettings();
 
-            // Android back button: minimize NP overlay instead of navigating away
+            // Android back button: prevent exiting the app
+            // Push sentinel history entry so the first back press fires popstate instead of navigating away
+            if (!history.state?.rmApp) history.pushState({ rmApp: true }, '');
             window.addEventListener('popstate', _onPopState, true);
+            window.addEventListener('keydown', _onKeyDown);
 
             // Register Periodic Background Sync to refresh station/music catalog every 24h
             if ('serviceWorker' in navigator && 'periodicSync' in ServiceWorkerRegistration.prototype) {
@@ -1051,6 +1192,14 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             stopPlayback();
             _hideLockScreen();
             window.removeEventListener('popstate', _onPopState, true);
+            window.removeEventListener('keydown', _onKeyDown);
+            document.removeEventListener('visibilitychange', _onVisWakeLock);
+            document.removeEventListener('visibilitychange', _onVisFocusLoss);
+            if (_onDeviceChange && navigator.mediaDevices) {
+                navigator.mediaDevices.removeEventListener('devicechange', _onDeviceChange);
+            }
+            _activePolls.forEach(p => clearInterval(p));
+            _activePolls = [];
             document.body.classList.remove('app-fullscreen-active');
             if (_bc) { _bc.close(); _bc = null; }
         },
@@ -1078,7 +1227,13 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         bodyEl.querySelectorAll('.rm-sidebar-item').forEach(e => e.classList.toggle('active', e.dataset.section === section));
         _syncMobileNav(section);
         activeSection = section;
-        loadSection(section);
+        const content = bodyEl.querySelector('#rm-content');
+        if (content) {
+            content.classList.add('rm-fade-out');
+            setTimeout(() => { loadSection(section); content.classList.remove('rm-fade-out'); }, 150);
+        } else {
+            loadSection(section);
+        }
     }
 
     function _renderSidebar() {
@@ -1242,6 +1397,10 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             case 'audiobooks': loadAudiobooks(toolbar, content); break;
             case 'discovery': loadDiscovery(toolbar, content); break;
             case 'pod-queue': loadPodQueue(content); break;
+            case 'settings': loadSettings(content); break;
+            case 'recently-added': loadRecentlyAdded(content); break;
+            case 'artists': loadArtists(content); break;
+            case 'search': loadUnifiedSearch(toolbar, content); break;
         }
     }
 
@@ -1311,6 +1470,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         content.innerHTML = '<div class="rm-empty"><i class="fas fa-spinner fa-spin"></i></div>';
         if (!country && !tag) {
             const data = await api('/radio-music/radio/top?limit=50');
+            if (!content?.isConnected) return;
             if (data.items && data.items.length) renderStations(data.items, content);
             else content.innerHTML = '<div class="rm-empty"><i class="fas fa-broadcast-tower"></i><p>' + t('Brak stacji') + '</p></div>';
         } else {
@@ -1318,26 +1478,71 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             if (country) url += '&country=' + country;
             if (tag) url += '&tag=' + encodeURIComponent(tag);
             const data = await api(url);
+            if (!content?.isConnected) return;
             if (data.items && data.items.length) renderStations(data.items, content);
             else content.innerHTML = '<div class="rm-empty"><i class="fas fa-broadcast-tower"></i><p>' + t('Brak stacji') + '</p></div>';
         }
     }
 
     async function searchRadio(q, country, tag, content) {
-        content.innerHTML = '<div class="rm-empty"><i class="fas fa-spinner fa-spin"></i></div>';
+        content.innerHTML = _skeletonGrid(6);
         let url = '/radio-music/radio/search?q=' + encodeURIComponent(q);
         if (country) url += '&country=' + country;
         if (tag) url += '&tag=' + encodeURIComponent(tag);
         const data = await api(url);
-        if (data.items && data.items.length) renderStations(data.items, content);
-        else content.innerHTML = '<div class="rm-empty"><i class="fas fa-search"></i><p>' + t('Brak wyników') + '</p></div>';
+        if (data.items && data.items.length) {
+            renderStations(data.items, content);
+            if (data.hasMore) _setupInfiniteScroll(content, url, data.items.length, 50);
+        } else {
+            content.innerHTML = '<div class="rm-empty"><i class="fas fa-search"></i><p>' + t('Brak wyników') + '</p></div>';
+        }
     }
 
-    function renderStations(stations, container) {
+    function _setupInfiniteScroll(container, baseUrl, loaded, limit) {
+        const sentinel = document.createElement('div');
+        sentinel.className = 'rm-load-more';
+        sentinel.style.cssText = 'text-align:center;padding:16px;color:var(--rm-text-muted);font-size:12px';
+        sentinel.textContent = t('Przewiń, aby załadować więcej...');
+        container.appendChild(sentinel);
+        let offset = loaded;
+        let loading = false;
+        const observer = new IntersectionObserver(async (entries) => {
+            if (!entries[0].isIntersecting || loading) return;
+            loading = true;
+            sentinel.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+            const url = baseUrl + '&offset=' + offset + '&limit=' + limit;
+            const data = await api(url);
+            const items = data.items || [];
+            if (items.length) {
+                sentinel.remove();
+                renderStations(items, container, true);
+                offset += items.length;
+                if (data.hasMore) {
+                    container.appendChild(sentinel);
+                    sentinel.textContent = t('Przewiń, aby załadować więcej...');
+                }
+            } else {
+                sentinel.textContent = t('To wszystkie wyniki');
+                observer.disconnect();
+            }
+            loading = false;
+        }, { rootMargin: '200px' });
+        observer.observe(sentinel);
+    }
+
+    function renderStations(stations, container, append) {
         // Track visible stations for prev/next navigation
-        _recentStations = stations;
-        container.innerHTML = '<div class="rm-grid" id="rm-stations-grid"></div>';
-        const grid = container.querySelector('#rm-stations-grid');
+        if (!append) _recentStations = stations;
+        else _recentStations = _recentStations.concat(stations);
+        let grid;
+        if (append) {
+            grid = container.querySelector('#rm-stations-grid');
+            if (!grid) { append = false; }
+        }
+        if (!append) {
+            container.innerHTML = '<div class="rm-grid" id="rm-stations-grid"></div>';
+            grid = container.querySelector('#rm-stations-grid');
+        }
         stations.forEach(s => {
             const isFav = _favorites.some(f => f.uuid === s.uuid);
             const isPlaying = _playing && _playing.uuid === s.uuid;
@@ -1375,7 +1580,8 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         const data = await api('/radio-music/radio/favorites');
         _favorites = data.items || [];
         if (!_favorites.length) {
-            content.innerHTML = '<div class="rm-empty"><i class="fas fa-heart"></i><p>' + t('Brak ulubionych stacji') + '</p></div>';
+            content.innerHTML = '<div class="rm-empty"><i class="fas fa-heart"></i><p>' + t('Brak ulubionych stacji') + '</p><button class="rm-chip" style="margin-top:12px" id="rm-fav-browse">' + t('Przeglądaj stacje') + '</button></div>';
+            content.querySelector('#rm-fav-browse')?.addEventListener('click', () => _navTo('most-played'));
             return;
         }
         renderStations(_favorites, content);
@@ -1391,11 +1597,21 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         loadSection(activeSection);
     }
 
+    async function toggleLikedSong(track) {
+        const isLiked = _likedSongs.some(s => s.url === track.url);
+        const t = { name: track.name, url: track.url, meta: track.meta || '', image: track.image || track.thumbnail || '', type: 'music' };
+        const data = await api('/radio-music/music/liked', {
+            method: 'POST',
+            body: { action: isLiked ? 'remove' : 'add', track: t }
+        });
+        _likedSongs = data.items || [];
+    }
+
     /* ── Countries ─────────────────────────────────── */
 
     async function loadCountries(toolbar, content) {
         toolbar.innerHTML = `<input class="rm-search" id="rm-country-search" placeholder="${t('Szukaj krajów...')}">`;
-        content.innerHTML = '<div class="rm-empty"><i class="fas fa-spinner fa-spin"></i></div>';
+        content.innerHTML = _skeletonGrid(6);
 
         if (!_countries.length) {
             const data = await api('/radio-music/radio/countries');
@@ -1436,7 +1652,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     /* ── Tags / Genres ─────────────────────────────── */
 
     async function loadTags(content) {
-        content.innerHTML = '<div class="rm-empty"><i class="fas fa-spinner fa-spin"></i></div>';
+        content.innerHTML = _skeletonGrid(6);
         if (!_tags.length) {
             const data = await api('/radio-music/radio/tags');
             _tags = data.items || [];
@@ -1598,7 +1814,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
     async function openPodcast(podcast) {
         const content = bodyEl.querySelector('#rm-content');
-        content.innerHTML = '<div class="rm-empty"><i class="fas fa-spinner fa-spin"></i></div>';
+        content.innerHTML = _skeletonTracks(5);
 
         if (!podcast.feed_url) {
             content.innerHTML = '<div class="rm-empty"><p>' + t('Podcast nie ma feedu RSS') + '</p></div>';
@@ -1628,11 +1844,15 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         html += '<div class="rm-ep-list">';
         eps.forEach(ep => {
             if (!ep.audio_url) return;
+            const pct = _getEpProgressPct(ep.audio_url);
+            const prog = _epProgress[ep.audio_url];
+            const doneIcon = prog && prog.done ? '<i class="fas fa-check-circle" style="color:var(--rm-accent);margin-right:6px"></i>' : '';
             html += `<div class="rm-ep-item" data-url="${escH(ep.audio_url)}">
                 <div class="rm-ep-play"><i class="fas fa-play-circle"></i></div>
                 <div class="rm-ep-info">
-                    <div class="rm-ep-title">${escH(ep.title)}</div>
+                    <div class="rm-ep-title">${doneIcon}${escH(ep.title)}</div>
                     <div class="rm-ep-meta">${escH([ep.pub_date, ep.duration_fmt].filter(Boolean).join(' · '))}</div>
+                    ${pct > 0 ? '<div class="rm-ep-progress"><div class="rm-ep-progress-bar" style="width:' + pct + '%"></div></div>' : ''}
                 </div>
             </div>`;
         });
@@ -1651,27 +1871,25 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             openPodcast(podcast);
         };
 
-        // Episode play / queue
+        // Episode play / queue — build full episode queue for prev/next navigation
+        const allEpItems = [];
         content.querySelectorAll('.rm-ep-item').forEach(el => {
+            const url = el.dataset.url;
+            const title = el.querySelector('.rm-ep-title').textContent;
+            allEpItems.push({
+                name: title,
+                url: url,
+                type: 'podcast',
+                _podcast: true,
+                meta: pod.title || podcast.name,
+                image: pod.image || podcast.artwork || '',
+            });
+        });
+        content.querySelectorAll('.rm-ep-item').forEach((el, i) => {
             el.onclick = () => {
-                const url = el.dataset.url;
-                const title = el.querySelector('.rm-ep-title').textContent;
-                const epItem = {
-                    name: title,
-                    url: url,
-                    type: 'podcast',
-                    meta: pod.title || podcast.name,
-                    image: pod.image || podcast.artwork || '',
-                };
-                // Add to pod queue and play; if clicking the same index, just play
-                const existIdx = _podQueue.findIndex(e => e.url === url);
-                if (existIdx >= 0) {
-                    _podQueueIdx = existIdx;
-                } else {
-                    _podQueue.push(epItem);
-                    _podQueueIdx = _podQueue.length - 1;
-                }
-                playAudio(epItem);
+                _podQueue = allEpItems.slice();
+                _podQueueIdx = i;
+                playAudio(_podQueue[i]);
             };
         });
     }
@@ -1679,8 +1897,13 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     /* ── Subscriptions ─────────────────────────────── */
 
     async function loadSubscriptions(content) {
-        const data = await api('/radio-music/podcasts/subscriptions');
-        _subscriptions = data.items || [];
+        const [subData, adData] = await Promise.all([
+            api('/radio-music/podcasts/subscriptions'),
+            api('/radio-music/podcasts/autodownload')
+        ]);
+        _subscriptions = subData.items || [];
+        const adFeeds = (adData.feeds || {});
+
         if (!_subscriptions.length) {
             content.innerHTML = '<div class="rm-empty"><i class="fas fa-rss"></i><p>' + t('Brak subskrypcji') + '</p></div>';
             return;
@@ -1688,6 +1911,9 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         content.innerHTML = '<div class="rm-grid"></div>';
         const grid = content.querySelector('.rm-grid');
         _subscriptions.forEach(p => {
+            const feedUrl = p.feed_url || '';
+            const adEntry = adFeeds[feedUrl];
+            const adEnabled = adEntry && adEntry.enabled;
             const card = document.createElement('div');
             card.className = 'rm-card';
             card.innerHTML = `
@@ -1695,8 +1921,22 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 <div class="rm-card-info">
                     <div class="rm-card-name">${escH(p.name || p.title)}</div>
                     <div class="rm-card-meta">${escH(p.artist || p.author || '')}</div>
-                </div>`;
-            card.onclick = () => openPodcast(p);
+                </div>
+                <button class="rm-pl-btn rm-sub-autod" title="${t('Auto-pobieranie')}" data-feed="${escH(feedUrl)}"
+                    style="color:${adEnabled ? 'var(--rm-accent)' : 'var(--rm-text-muted)'}">
+                    <i class="fas fa-cloud-download-alt"></i>
+                </button>`;
+            card.querySelector('.rm-sub-autod').onclick = async (e) => {
+                e.stopPropagation();
+                const btn = e.currentTarget;
+                const nowEnabled = btn.style.color.includes('accent');
+                const res = await api('/radio-music/podcasts/autodownload', { method: 'POST', body: { feed_url: feedUrl, enabled: !nowEnabled }});
+                if (res.ok) {
+                    btn.style.color = !nowEnabled ? 'var(--rm-accent)' : 'var(--rm-text-muted)';
+                    toast((!nowEnabled ? t('Auto-pobieranie włączone') : t('Auto-pobieranie wyłączone')), 'success');
+                }
+            };
+            card.onclick = (e) => { if (!e.target.closest('.rm-sub-autod')) openPodcast(p); };
             grid.appendChild(card);
         });
     }
@@ -1896,17 +2136,18 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         const _poll = setInterval(async () => {
             const st = await api('/radio-music/music/downloads');
             const job = (st.jobs || {})[jobId];
-            if (!job) { clearInterval(_poll); return; }
+            if (!job) { clearInterval(_poll); _activePolls = _activePolls.filter(p => p !== _poll); return; }
             if (job.status === 'done') {
-                clearInterval(_poll);
+                clearInterval(_poll); _activePolls = _activePolls.filter(p => p !== _poll);
                 toast(t('Pobrano: ') + (track.title || track.name) + ' → Various Artists', 'success');
                 if (btnEl) { btnEl.classList.remove('rm-downloading'); btnEl.classList.add('rm-downloaded'); btnEl.innerHTML = '<i class="fas fa-check"></i>'; }
             } else if (job.status === 'error') {
-                clearInterval(_poll);
+                clearInterval(_poll); _activePolls = _activePolls.filter(p => p !== _poll);
                 toast(t('Błąd pobierania: ') + (job.error || ''), 'error');
                 if (btnEl) { btnEl.classList.remove('rm-downloading'); btnEl.innerHTML = '<i class="fas fa-download"></i>'; }
             }
         }, 2000);
+        _activePolls.push(_poll);
     }
 
     async function _downloadPlaylist(name, tracks) {
@@ -1920,25 +2161,26 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         const _poll = setInterval(async () => {
             const st = await api('/radio-music/music/downloads');
             const job = (st.jobs || {})[jobId];
-            if (!job) { clearInterval(_poll); return; }
+            if (!job) { clearInterval(_poll); _activePolls = _activePolls.filter(p => p !== _poll); return; }
             if (job.status === 'done' || job.status === 'done_partial') {
-                clearInterval(_poll);
+                clearInterval(_poll); _activePolls = _activePolls.filter(p => p !== _poll);
                 const msg = job.status === 'done'
                     ? t('Playlista pobrana: ') + name
                     : t('Playlista pobrana częściowo: ') + name + (job.error ? ' — ' + job.error : '');
                 toast(msg, job.status === 'done' ? 'success' : 'warning');
             } else if (job.status === 'error') {
-                clearInterval(_poll);
+                clearInterval(_poll); _activePolls = _activePolls.filter(p => p !== _poll);
                 toast(t('Błąd pobierania: ') + (job.error || ''), 'error');
             }
         }, 3000);
+        _activePolls.push(_poll);
     }
 
     /* ── Local Music ───────────────────────────────── */
 
     async function loadLocal(toolbar, content) {
         toolbar.innerHTML = '';
-        content.innerHTML = '<div class="rm-empty"><i class="fas fa-spinner fa-spin"></i></div>';
+        content.innerHTML = _skeletonTracks(5);
 
         // Load folders config
         const foldersData = await api('/radio-music/local/folders');
@@ -2031,7 +2273,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             el.className = 'rm-track rm-local-track';
             el.innerHTML = (artUrl
                 ? '<img class="rm-track-thumb" src="' + escH(artUrl) + '" loading="lazy" onerror="this.outerHTML=\'<div class=\\\'rm-track-thumb\\\' style=\\\'display:flex;align-items:center;justify-content:center;background:#1a1a2e\\\'><i class=\\\'fas fa-music\\\' style=\\\'color:var(--text-muted)\\\'></i></div>\'">'
-                : '<div class="rm-track-thumb" style="display:flex;align-items:center;justify-content:center;background:#1a1a2e"><i class="fas fa-music" style="color:var(--text-muted)"></i></div>')
+                : '<div class="rm-track-thumb" style="display:flex;align-items:center;justify-content:center;background:var(--rm-bg-surface)"><i class="fas fa-music" style="color:var(--text-muted)"></i></div>')
                 + '<div class="rm-track-info"><div class="rm-track-title">' + escH(file.name) + '</div>'
                 + '<div class="rm-track-meta">' + escH(file._meta) + '</div></div>'
                 + (durStr ? '<span class="rm-track-dur">' + durStr + '</span>' : '')
@@ -2262,7 +2504,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 html += '<div class="rm-track rm-lab-track' + (isLocalPlaying ? ' rm-playing' : '') + '" data-group="' + escH(folder) + '" data-idx="' + i + '" data-url="' + escH(file.path) + '">'
                     + (artUrl
                         ? '<img class="rm-track-thumb" src="' + escH(artUrl) + '" loading="lazy" onerror="this.outerHTML=\'<div class=\\\'rm-track-thumb\\\' style=\\\'display:flex;align-items:center;justify-content:center;background:#1a1a2e\\\'><i class=\\\'fas fa-book\\\' style=\\\'color:var(--text-muted)\\\'></i></div>\'">'
-                        : '<div class="rm-track-thumb" style="display:flex;align-items:center;justify-content:center;background:#1a1a2e"><i class="fas fa-book" style="color:var(--text-muted)"></i></div>')
+                        : '<div class="rm-track-thumb" style="display:flex;align-items:center;justify-content:center;background:var(--rm-bg-surface)"><i class="fas fa-book" style="color:var(--text-muted)"></i></div>')
                     + '<div class="rm-track-info"><div class="rm-track-title">' + escH(file.name) + '</div>'
                     + '<div class="rm-track-meta">' + escH(metaParts.join(' · ')) + '</div></div>'
                     + (durStr ? '<span class="rm-track-dur">' + durStr + '</span>' : '')
@@ -2321,12 +2563,15 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
     async function loadPlaylists(toolbar, content) {
         toolbar.innerHTML = '';
-        content.innerHTML = '<div class="rm-empty"><i class="fas fa-spinner fa-spin"></i></div>';
+        content.innerHTML = _skeletonTracks(5);
         await _loadPlaylists();
 
         let html = '<div class="rm-pl-header"><h3>' + t('Moje playlisty') + '</h3>'
             + '<div class="rm-pl-create"><input id="rm-pl-name" placeholder="' + t('Nazwa playlisty...') + '">'
-            + '<button id="rm-pl-create-btn"><i class="fas fa-plus"></i> ' + t('Utwórz') + '</button></div></div>';
+            + '<button id="rm-pl-create-btn"><i class="fas fa-plus"></i> ' + t('Utwórz') + '</button>'
+            + '<button id="rm-pl-import-btn" title="' + t('Importuj M3U') + '"><i class="fas fa-file-import"></i></button>'
+            + '<input type="file" id="rm-pl-import-file" accept=".m3u,.m3u8" style="display:none">'
+            + '</div></div>';
 
         if (!_playlists.length) {
             html += '<div class="rm-empty"><i class="fas fa-list"></i><p>' + t('Brak playlist. Utwórz pierwszą!') + '</p></div>';
@@ -2342,6 +2587,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                     </div>
                     <div class="rm-pl-actions">
                         <button class="rm-pl-btn rm-pl-play" title="${t('Odtwórz')}"><i class="fas fa-play"></i></button>
+                        <button class="rm-pl-btn rm-pl-export" title="${t('Eksportuj M3U')}"><i class="fas fa-file-export"></i></button>
                         <button class="rm-pl-btn rm-pl-del" title="${t('Usuń')}"><i class="fas fa-trash"></i></button>
                     </div>
                 </div>`;
@@ -2361,11 +2607,26 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             if (e.key === 'Enter') content.querySelector('#rm-pl-create-btn').click();
         };
 
+        // Import M3U
+        content.querySelector('#rm-pl-import-btn').onclick = () => content.querySelector('#rm-pl-import-file').click();
+        content.querySelector('#rm-pl-import-file').onchange = async (e) => {
+            const file = e.target.files[0];
+            if (!file) return;
+            const form = new FormData();
+            form.append('file', file);
+            const res = await fetch('/api/radio-music/playlists/import', {
+                method: 'POST', body: form,
+                headers: { 'Authorization': 'Bearer ' + (NAS.token || '') }
+            }).then(r => r.json());
+            if (res.ok) { toast(t('Zaimportowano: ') + (res.playlist?.name || ''), 'success'); loadPlaylists(toolbar, content); }
+            else toast(res.error || t('Błąd importu'), 'error');
+        };
+
         // Click handlers
         content.querySelectorAll('.rm-pl-card').forEach(card => {
             const plId = card.dataset.plid;
             card.onclick = (e) => {
-                if (e.target.closest('.rm-pl-play') || e.target.closest('.rm-pl-del')) return;
+                if (e.target.closest('.rm-pl-play') || e.target.closest('.rm-pl-del') || e.target.closest('.rm-pl-export')) return;
                 openPlaylist(plId, content);
             };
             const playBtn = card.querySelector('.rm-pl-play');
@@ -2378,6 +2639,11 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                     _playTrackFromPlaylist(pl.tracks[0]);
                     toast(t('Odtwarzam: ') + pl.name, 'success');
                 }
+            };
+            const exportBtn = card.querySelector('.rm-pl-export');
+            if (exportBtn) exportBtn.onclick = (e) => {
+                e.stopPropagation();
+                window.open('/api/radio-music/playlists/' + plId + '/export?token=' + (NAS.token || ''), '_blank');
             };
             const delBtn = card.querySelector('.rm-pl-del');
             if (delBtn) delBtn.onclick = async (e) => {
@@ -2531,6 +2797,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
         const rows = [
             { icon: 'fa-play-circle', label: t('Odtwórz'), action: 'play' },
+            { icon: 'fa-step-forward', label: t('Odtwórz jako następny'), action: 'play-next' },
             { icon: 'fa-list-ol', label: t('Dodaj do kolejki'), action: 'queue' },
             { icon: 'fa-list', label: t('Dodaj do playlisty'), action: 'playlist' },
         ];
@@ -2571,6 +2838,11 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 if (action === 'play') {
                     if (track.type === 'radio') playStation(track);
                     else playAudio(track);
+                } else if (action === 'play-next') {
+                    const insertIdx = Math.min(_musicQueueIdx + 1, _musicQueue.length);
+                    _musicQueue.splice(insertIdx, 0, track);
+                    toast(t('Następny w kolejce: ') + (track.name || track.title || ''), 'success');
+                    if (_renderNpQueueFn) _renderNpQueueFn();
                 } else if (action === 'queue') {
                     _musicQueue.push(track);
                     toast(t('Dodano do kolejki'), 'success');
@@ -2602,12 +2874,12 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         const render = () => {
             let html = '<h4>' + t('Dodaj do playlisty') + '</h4>';
             // "Create new" row
-            html += `<div class="rm-modal-item rm-modal-new-pl" data-action="new"><i class="fas fa-plus-circle" style="color:#1DB954"></i> <span>${t('Utwórz nową playlistę')}</span></div>`;
+            html += `<div class="rm-modal-item rm-modal-new-pl" data-action="new"><i class="fas fa-plus-circle" style="color:var(--rm-accent)"></i> <span>${t('Utwórz nową playlistę')}</span></div>`;
             // Inline create form (hidden by default)
             html += `<div class="rm-modal-create-form" style="display:none;padding:8px 0 4px">
-                <input class="rm-modal-new-input" placeholder="${t('Nazwa playlisty...')}" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);color:#fff;font-size:13px;outline:none">
+                <input class="rm-modal-new-input" placeholder="${t('Nazwa playlisty...')}" style="width:100%;box-sizing:border-box;padding:8px 10px;border-radius:8px;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);color:var(--rm-text);font-size:13px;outline:none">
                 <div style="display:flex;gap:8px;margin-top:8px">
-                    <button class="rm-modal-create-confirm" style="flex:1;padding:7px;border-radius:20px;background:#1DB954;color:#000;border:none;cursor:pointer;font-size:12px;font-weight:700">${t('Utwórz i dodaj')}</button>
+                    <button class="rm-modal-create-confirm" style="flex:1;padding:7px;border-radius:20px;background:var(--rm-accent);color:var(--rm-bg);border:none;cursor:pointer;font-size:12px;font-weight:700">${t('Utwórz i dodaj')}</button>
                     <button class="rm-modal-create-cancel" style="flex:1;padding:7px;border-radius:20px;background:none;border:1px solid rgba(255,255,255,.15);color:rgba(255,255,255,.7);cursor:pointer;font-size:12px">${t('Anuluj')}</button>
                 </div>
             </div>`;
@@ -2719,7 +2991,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     /* ── Most Played ──────────────────────────────── */
 
     async function loadMostPlayed(content) {
-        content.innerHTML = '<div class="rm-empty"><i class="fas fa-spinner fa-spin"></i></div>';
+        content.innerHTML = _skeletonTracks(5);
         const data = await api('/radio-music/most-played?limit=60');
         const allItems = data.items || [];
         // Music/local only for "Najczęściej grane"
@@ -2884,7 +3156,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         const data = await api('/radio-music/history');
         const items = data.items || [];
         if (!items.length) {
-            content.innerHTML = '<div class="rm-empty"><i class="fas fa-history"></i><p>' + t('Brak historii odtwarzania') + '</p></div>';
+            content.innerHTML = '<div class="rm-empty"><i class="fas fa-history"></i><p>' + t('Brak historii odtwarzania') + '</p><p style="font-size:12px;margin-top:4px">' + t('Zacznij słuchać — historia pojawi się tutaj') + '</p></div>';
             return;
         }
         content.innerHTML = '<div class="rm-grid"></div>';
@@ -2904,7 +3176,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         });
     }
 
-    /* ── Discovery (Geo-personalized) ─────────────────── */
+    /* ── Discovery (Personalized) ─────────────────── */
 
     async function loadDiscovery(toolbar, content) {
         const COUNTRY_MAP = [
@@ -2916,112 +3188,286 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         ];
 
         let country = _detectCountry();
-        // Normalise — must be valid code from map; fallback to PL
         if (!COUNTRY_MAP.find(c => c.code === country)) country = 'PL';
+        const countryName = COUNTRY_MAP.find(c => c.code === country)?.name || country;
 
-        // Country selector
-        toolbar.innerHTML = `<div class="rm-disc-country">
-            <span class="rm-disc-country-label"><i class="fas fa-globe"></i> ${t('Kraj')}:</span>
-            <select class="rm-disc-country-select" id="rm-disc-country-sel">
-                ${COUNTRY_MAP.map(c => `<option value="${c.code}"${c.code===country?' selected':''}>${escH(c.name)}</option>`).join('')}
-            </select>
-        </div>`;
-        toolbar.querySelector('#rm-disc-country-sel').onchange = (e) => {
-            localStorage.setItem('rm_user_country', e.target.value);
-            loadDiscovery(toolbar, content);
-        };
+        toolbar.innerHTML = '';
+        content.innerHTML = '<div style="padding:40px;text-align:center;color:rgba(255,255,255,.4)"><i class="fas fa-compass fa-spin"></i> ' + t('Ładowanie odkryć…') + '</div>';
 
-        content.innerHTML = '<div class="rm-disc-loading" style="padding:40px;text-align:center;color:rgba(255,255,255,.4)"><i class="fas fa-compass fa-spin"></i> ' + t('Ładowanie odkryć…') + '</div>';
-
-        // Fetch all 3 data sources in parallel
-        const [radioData, podData] = await Promise.allSettled([
-            api('/radio-music/radio/search?country=' + country + '&limit=8&order=clickcount&reverse=true'),
+        // Fetch personalized data + generic fallbacks in parallel
+        const [recoData, radioData, podData] = await Promise.allSettled([
+            api('/radio-music/recommendations?country=' + country),
+            api('/radio-music/radio/search?country=' + country + '&limit=12&order=clickcount&reverse=true'),
             api('/radio-music/podcasts/top?country=' + country.toLowerCase() + '&limit=8'),
         ]);
+        if (!content?.isConnected) return;
 
-        const stations = (radioData.status === 'fulfilled' ? (radioData.value?.items || []) : []).slice(0, 6);
-        const pods = (podData.status === 'fulfilled' ? (podData.value?.items || []) : []).slice(0, 5);
-
-        // Music discovery: use regional genre search
-        const countryGenreMap = { PL:'polish music polskie', DE:'german music deutsch', FR:'french music chanson', ES:'spanish music pop espanol', IT:'italian music', BR:'brazilian music MPB', JP:'japanese pop music J-pop' };
-        const musicQ = countryGenreMap[country] || 'top hits ' + (new Date().getFullYear());
+        const reco = recoData.status === 'fulfilled' ? recoData.value : {};
+        const stations = (radioData.status === 'fulfilled' ? (radioData.value?.items || []) : []).slice(0, 8);
+        const pods = (podData.status === 'fulfilled' ? (podData.value?.items || []) : []).slice(0, 6);
+        const hasPersonal = reco.has_data;
 
         content.innerHTML = '';
 
-        // ── Top Radio ──
+        // ── Hero banner ──
+        const hero = document.createElement('div');
+        hero.className = 'rm-disc-hero';
+        const greetHour = new Date().getHours();
+        const greeting = greetHour < 6 ? t('Dobrej nocy') : greetHour < 12 ? t('Dzień dobry') : greetHour < 18 ? t('Cześć') : t('Dobry wieczór');
+        const subtitle = hasPersonal ? t('Oto co dla Ciebie mamy') : t('Odkryj muzykę i radio z') + ' ' + escH(countryName);
+        hero.innerHTML = `
+            <div class="rm-disc-hero-bg"></div>
+            <div class="rm-disc-hero-content">
+                <h2>${greeting} 🎵</h2>
+                <p>${subtitle}</p>
+                <div class="rm-disc-hero-chips" id="rm-disc-hero-chips"></div>
+            </div>`;
+        content.appendChild(hero);
+
+        // Hero chips: personalized tags or generic genres
+        const heroChips = hero.querySelector('#rm-disc-hero-chips');
+        const chipSources = (reco.top_tags || []).length
+            ? (reco.top_tags || []).slice(0, 6).map(tag => ({ label: tag.charAt(0).toUpperCase() + tag.slice(1), q: tag, icon: 'fa-heart', isTag: true }))
+            : [
+                { label: 'Pop', q: 'pop hits ' + (new Date().getFullYear()), icon: 'fa-star' },
+                { label: 'Rock', q: 'rock classics best', icon: 'fa-guitar' },
+                { label: 'Chill', q: 'lofi chill beats relax', icon: 'fa-cloud-moon' },
+                { label: 'Hip-Hop', q: 'hip hop rap new', icon: 'fa-microphone-alt' },
+                { label: 'Electronic', q: 'electronic dance EDM', icon: 'fa-bolt' },
+                { label: 'Jazz', q: 'jazz smooth saxophone', icon: 'fa-wine-glass-alt' },
+            ];
+        chipSources.forEach(g => {
+            const chip = document.createElement('span');
+            chip.className = 'rm-disc-hero-chip';
+            chip.innerHTML = `<i class="fas ${g.icon}"></i> ${escH(g.label)}`;
+            chip.onclick = async () => {
+                chip.innerHTML = '<i class="fas fa-spinner fa-spin"></i> ' + escH(g.label);
+                if (g.isTag) {
+                    // Play radio stations with this tag
+                    const d = await api('/radio-music/radio/search?tag=' + encodeURIComponent(g.q) + '&limit=30');
+                    const stns = d.items || [];
+                    if (stns.length) {
+                        playStation(stns[Math.floor(Math.random() * Math.min(stns.length, 10))]);
+                        _recentStations = stns;
+                        toast(g.label + ' — ' + t('Odtwarzam radio'), 'success');
+                    } else { toast(t('Brak wyników'), 'info'); }
+                } else {
+                    const d = await api('/radio-music/music/search?q=' + encodeURIComponent(g.q) + '&limit=20');
+                    const tracks = d.items || [];
+                    if (tracks.length) {
+                        _musicQueue = tracks; _musicQueueIdx = 0;
+                        playAudio(tracks[0]);
+                        toast(g.label + ' — ' + t('Odtwarzam') + ' ' + tracks.length + ' ' + t('utworów'), 'success');
+                    } else { toast(t('Brak wyników'), 'info'); }
+                }
+                chip.innerHTML = `<i class="fas ${g.icon}"></i> ${escH(g.label)}`;
+            };
+            heroChips.appendChild(chip);
+        });
+
+        // ── Helper: build a discovery card ──
+        function _discCard(opts) {
+            const card = document.createElement('div');
+            card.className = 'rm-disc-card';
+            const artHtml = opts.artSrc
+                ? `<img src="${escH(opts.artSrc)}" loading="lazy" onerror="this.outerHTML='<i class=\\'fas ${opts.fallbackIcon || 'fa-music'}\\'></i>'">`
+                : (opts.stationHtml || `<i class="fas ${opts.fallbackIcon || 'fa-music'}"></i>`);
+            card.innerHTML = `<div class="rm-disc-card-art">${artHtml}<div class="rm-disc-play-overlay"><i class="fas fa-play"></i></div>`
+                + (opts.badge ? `<span class="rm-disc-badge ${opts.badgeClass || ''}">${opts.badge}</span>` : '') + `</div>`
+                + `<div class="rm-disc-card-body"><div class="rm-disc-card-title">${escH(opts.title || '')}</div>`
+                + `<div class="rm-disc-card-meta">${escH(opts.meta || '')}</div></div>`;
+            if (opts.onclick) card.onclick = opts.onclick;
+            return card;
+        }
+
+        // ── PERSONALIZED SECTIONS ──
+
+        // 1. "Bo lubisz [tag]" — radio stations from user's favorite tags
+        const tagRadios = reco.tag_radios || {};
+        const tagNames = Object.keys(tagRadios).filter(t => tagRadios[t].length > 0);
+        tagNames.forEach(tag => {
+            const tagStations = tagRadios[tag];
+            const sec = document.createElement('div');
+            sec.className = 'rm-disc-section';
+            const tagLabel = tag.charAt(0).toUpperCase() + tag.slice(1);
+            sec.innerHTML = `<div class="rm-disc-title"><i class="fas fa-heart"></i> ${t('Bo lubisz')} ${escH(tagLabel)}</div>`;
+            const carousel = document.createElement('div');
+            carousel.className = 'rm-disc-carousel';
+            tagStations.forEach(s => {
+                carousel.appendChild(_discCard({
+                    stationHtml: _stationIconHtml(s),
+                    fallbackIcon: 'fa-broadcast-tower',
+                    badge: 'LIVE', badgeClass: 'rm-disc-badge-radio',
+                    title: s.name,
+                    meta: (s.tags || '').split(',')[0] || s.country || 'Radio',
+                    onclick: () => playStation(s)
+                }));
+            });
+            sec.appendChild(carousel);
+            content.appendChild(sec);
+        });
+
+        // 2. "Podobni do [artist]" — Deezer-based artist recommendations
+        const artistRecs = reco.artist_recs || [];
+        if (artistRecs.length) {
+            // Group by "because" artist
+            const grouped = {};
+            artistRecs.forEach(a => {
+                if (!grouped[a.because]) grouped[a.because] = [];
+                grouped[a.because].push(a);
+            });
+            Object.entries(grouped).forEach(([because, artists]) => {
+                const sec = document.createElement('div');
+                sec.className = 'rm-disc-section';
+                sec.innerHTML = `<div class="rm-disc-title"><i class="fas fa-wand-magic-sparkles"></i> ${t('Podobni do')} ${escH(because)}</div>`;
+                const carousel = document.createElement('div');
+                carousel.className = 'rm-disc-carousel';
+                artists.forEach(a => {
+                    carousel.appendChild(_discCard({
+                        artSrc: a.picture,
+                        fallbackIcon: 'fa-user-circle',
+                        badge: '✦', badgeClass: 'rm-disc-badge-rec',
+                        title: a.name,
+                        meta: t('Artysta'),
+                        onclick: async () => {
+                            toast(t('Szukam muzyki') + ': ' + a.name, 'info');
+                            const d = await api('/radio-music/music/search?q=' + encodeURIComponent(a.name) + '&limit=20');
+                            const tracks = d.items || [];
+                            if (tracks.length) {
+                                _musicQueue = tracks; _musicQueueIdx = 0;
+                                playAudio(tracks[0]);
+                            } else { toast(t('Brak wyników'), 'info'); }
+                        }
+                    }));
+                });
+                sec.appendChild(carousel);
+                content.appendChild(sec);
+            });
+        }
+
+        // 3. "Teraz grane — podobne" — if something is playing, show similar
+        if (_playing && (_playing.type === 'music' || _playing.type === 'local')) {
+            const artist = (_playing.meta || _playing.channel || '').trim();
+            if (artist) {
+                const simSec = document.createElement('div');
+                simSec.className = 'rm-disc-section';
+                simSec.innerHTML = `<div class="rm-disc-title"><i class="fas fa-headphones"></i> ${t('Podobni do')} ${escH(artist)}</div>`
+                    + `<div class="rm-disc-carousel" id="rm-disc-now-similar"><div class="rm-disc-empty"><i class="fas fa-spinner fa-spin"></i></div></div>`;
+                content.appendChild(simSec);
+
+                api('/radio-music/similar-artists?artist=' + encodeURIComponent(artist) + '&limit=6').then(d => {
+                    const carousel = simSec.querySelector('#rm-disc-now-similar');
+                    if (!carousel?.isConnected) return;
+                    const items = d.items || [];
+                    if (!items.length) { simSec.remove(); return; }
+                    carousel.innerHTML = '';
+                    items.forEach(a => {
+                        carousel.appendChild(_discCard({
+                            artSrc: a.picture,
+                            fallbackIcon: 'fa-user-circle',
+                            badge: '✦', badgeClass: 'rm-disc-badge-rec',
+                            title: a.name,
+                            meta: a.fans ? (a.fans > 1000 ? Math.round(a.fans/1000) + 'k ' + t('fanów') : a.fans + ' ' + t('fanów')) : t('Artysta'),
+                            onclick: async () => {
+                                toast(t('Szukam muzyki') + ': ' + a.name, 'info');
+                                const d2 = await api('/radio-music/music/search?q=' + encodeURIComponent(a.name) + '&limit=20');
+                                const tracks = d2.items || [];
+                                if (tracks.length) { _musicQueue = tracks; _musicQueueIdx = 0; playAudio(tracks[0]); }
+                                else { toast(t('Brak wyników'), 'info'); }
+                            }
+                        }));
+                    });
+                }).catch(() => simSec.remove());
+            }
+        }
+
+        // ── GENERIC SECTIONS (always shown, below personalized) ──
+
+        // 4. Top Radio
         if (stations.length) {
             const sec = document.createElement('div');
             sec.className = 'rm-disc-section';
-            sec.innerHTML = `<div class="rm-disc-title"><i class="fas fa-broadcast-tower"></i> ${t('Top Radio')} — ${COUNTRY_MAP.find(c=>c.code===country)?.name||country}</div>`;
+            sec.innerHTML = `<div class="rm-disc-title"><i class="fas fa-broadcast-tower"></i> ${t('Top Radio')} — ${escH(countryName)}<span class="rm-disc-seeall" id="rm-disc-radio-all">${t('Zobacz więcej')} →</span></div>`;
             const carousel = document.createElement('div');
             carousel.className = 'rm-disc-carousel';
             stations.forEach(s => {
-                const card = document.createElement('div');
-                card.className = 'rm-disc-card';
-                const artHtml = _stationIconHtml(s);
-                card.innerHTML = `<div class="rm-disc-card-art">${artHtml}<span class="rm-disc-badge rm-disc-badge-radio">LIVE</span></div>`
-                    + `<div class="rm-disc-card-body"><div class="rm-disc-card-title">${escH(s.name)}</div>`
-                    + `<div class="rm-disc-card-meta">${escH((s.tags||'').split(',')[0]||'')||'Radio'}</div></div>`;
-                card.onclick = () => playStation(s);
-                carousel.appendChild(card);
+                carousel.appendChild(_discCard({
+                    stationHtml: _stationIconHtml(s),
+                    fallbackIcon: 'fa-broadcast-tower',
+                    badge: 'LIVE', badgeClass: 'rm-disc-badge-radio',
+                    title: s.name,
+                    meta: (s.tags || '').split(',')[0] || 'Radio',
+                    onclick: () => playStation(s)
+                }));
             });
             sec.appendChild(carousel);
             content.appendChild(sec);
+            sec.querySelector('#rm-disc-radio-all')?.addEventListener('click', () => _navTo('radio'));
         }
 
-        // ── Top Podcasts ──
+        // 5. Top Podcasts — with actual openPodcast on click
         if (pods.length) {
             const sec = document.createElement('div');
             sec.className = 'rm-disc-section';
-            sec.innerHTML = `<div class="rm-disc-title"><i class="fas fa-podcast"></i> ${t('Top Podcasty')}</div>`;
+            sec.innerHTML = `<div class="rm-disc-title"><i class="fas fa-podcast"></i> ${t('Top Podcasty')}<span class="rm-disc-seeall" id="rm-disc-pod-all">${t('Zobacz więcej')} →</span></div>`;
             const carousel = document.createElement('div');
             carousel.className = 'rm-disc-carousel';
             pods.forEach(p => {
-                const card = document.createElement('div');
-                card.className = 'rm-disc-card';
-                const artHtml = p.artwork_url
-                    ? `<img src="${escH(p.artwork_url)}" loading="lazy" onerror="this.outerHTML='<i class=\\'fas fa-podcast\\'></i>'">`
-                    : '<i class="fas fa-podcast"></i>';
-                card.innerHTML = `<div class="rm-disc-card-art">${artHtml}<span class="rm-disc-badge rm-disc-badge-pod">POD</span></div>`
-                    + `<div class="rm-disc-card-body"><div class="rm-disc-card-title">${escH(p.name||p.title||'')}</div>`
-                    + `<div class="rm-disc-card-meta">${escH(p.artist_name||p.author||'')}</div></div>`;
-                card.onclick = () => { _navTo('podcasts'); };
-                carousel.appendChild(card);
+                carousel.appendChild(_discCard({
+                    artSrc: p.artwork || p.artwork_url,
+                    fallbackIcon: 'fa-podcast',
+                    badge: 'POD', badgeClass: 'rm-disc-badge-pod',
+                    title: p.name || p.title || '',
+                    meta: p.artist || p.artist_name || p.author || '',
+                    onclick: async () => {
+                        // Lookup feed URL via Apple ID, then open podcast
+                        if (p.feed_url) { openPodcast(p); return; }
+                        if (p.id) {
+                            toast(t('Ładowanie podcastu…'), 'info');
+                            const lookup = await api('/radio-music/podcasts/lookup?id=' + p.id);
+                            if (lookup.feed_url) {
+                                openPodcast({ ...p, feed_url: lookup.feed_url, artwork: lookup.artwork || p.artwork });
+                            } else { toast(t('Nie znaleziono feedu'), 'error'); }
+                        } else { _navTo('podcasts'); }
+                    }
+                }));
             });
             sec.appendChild(carousel);
             content.appendChild(sec);
+            sec.querySelector('#rm-disc-pod-all')?.addEventListener('click', () => _navTo('podcasts'));
         }
 
-        // ── Trending Music ── (lazy-loaded so no spinner delay)
+        // 6. Trending Music (lazy)
+        const countryGenreMap = { PL:'polish music polskie', DE:'german music deutsch', FR:'french music chanson', ES:'spanish music pop espanol', IT:'italian music', BR:'brazilian music MPB', JP:'japanese pop music J-pop', SE:'swedish pop', NL:'dutch music', CZ:'czech music', UA:'ukrainian music', AU:'australian music', CA:'canadian indie' };
+        const musicQ = countryGenreMap[country] || 'top hits ' + (new Date().getFullYear());
+
         const musicSec = document.createElement('div');
         musicSec.className = 'rm-disc-section';
-        musicSec.innerHTML = `<div class="rm-disc-title"><i class="fas fa-music"></i> ${t('Trending Music')}</div>`
+        musicSec.innerHTML = `<div class="rm-disc-title"><i class="fas fa-fire"></i> ${t('Trending Music')}<span class="rm-disc-seeall" id="rm-disc-music-all">${t('Szukaj muzyki')} →</span></div>`
             + `<div class="rm-disc-carousel" id="rm-disc-music-carousel"><div class="rm-disc-empty"><i class="fas fa-spinner fa-spin"></i></div></div>`;
         content.appendChild(musicSec);
+        musicSec.querySelector('#rm-disc-music-all')?.addEventListener('click', () => _navTo('music'));
 
-        // Fetch music async (don't block render)
-        api('/radio-music/music/search?q=' + encodeURIComponent(musicQ) + '&limit=8').then(d => {
+        api('/radio-music/music/search?q=' + encodeURIComponent(musicQ) + '&limit=10').then(d => {
             const carousel = musicSec.querySelector('#rm-disc-music-carousel');
-            if (!carousel) return;
-            const tracks = (d.items || []).slice(0, 6);
+            if (!carousel?.isConnected) return;
+            const tracks = (d.items || []).slice(0, 8);
             if (!tracks.length) { carousel.innerHTML = '<div class="rm-disc-empty">' + t('Brak wyników') + '</div>'; return; }
             carousel.innerHTML = '';
             tracks.forEach(tr => {
-                const card = document.createElement('div');
-                card.className = 'rm-disc-card';
-                const artHtml = tr.image
-                    ? `<img src="${escH(tr.image)}" loading="lazy" onerror="this.outerHTML='<i class=\\'fas fa-music\\'></i>'">`
-                    : '<i class="fas fa-music"></i>';
-                card.innerHTML = `<div class="rm-disc-card-art">${artHtml}<span class="rm-disc-badge rm-disc-badge-music">♪</span></div>`
-                    + `<div class="rm-disc-card-body"><div class="rm-disc-card-title">${escH(tr.name||tr.title||'')}</div>`
-                    + `<div class="rm-disc-card-meta">${escH(tr.artist||tr.meta||'')}</div></div>`;
-                card.onclick = () => playAudio(tr);
-                carousel.appendChild(card);
+                carousel.appendChild(_discCard({
+                    artSrc: tr.image || tr.thumbnail,
+                    fallbackIcon: 'fa-music',
+                    badge: '♪', badgeClass: 'rm-disc-badge-music',
+                    title: tr.name || tr.title || '',
+                    meta: tr.artist || tr.meta || '',
+                    onclick: () => playAudio(tr)
+                }));
             });
         }).catch(() => {});
 
-        if (!stations.length && !pods.length) {
-            content.innerHTML = '<div class="rm-disc-empty" style="padding:60px 20px"><i class="fas fa-compass" style="font-size:40px;margin-bottom:16px;display:block"></i>'
+        if (!stations.length && !pods.length && !hasPersonal) {
+            content.innerHTML += '<div class="rm-disc-empty" style="padding:60px 20px"><i class="fas fa-compass" style="font-size:40px;margin-bottom:16px;display:block"></i>'
                 + t('Brak danych dla wybranego kraju.') + '<br><br>'
                 + '<button class="rm-chip" onclick="this.closest(\'.rm-content\').innerHTML=\'\'">' + t('Spróbuj inny kraj') + '</button></div>';
         }
@@ -3062,6 +3508,443 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         clearBtn.innerHTML = '<i class="fas fa-trash"></i> ' + t('Wyczyść kolejkę');
         clearBtn.onclick = () => { _podQueue = []; _podQueueIdx = -1; loadPodQueue(content); };
         content.appendChild(clearBtn);
+    }
+
+    /* ── Recently Added (Local) ────────────────────── */
+
+    async function loadRecentlyAdded(content) {
+        content.innerHTML = _skeletonTracks(5);
+        const scanData = await api('/radio-music/local/scan');
+        const items = (scanData.items || []).slice(); // copy before sorting
+        if (!items.length) {
+            content.innerHTML = '<div class="rm-empty"><i class="fas fa-clock"></i><p>'
+                + t('Brak plików audio') + '</p><p style="font-size:12px;color:rgba(255,255,255,.4)">'
+                + t('Dodaj foldery w sekcji Lokalna muzyka') + '</p>'
+                + '<button class="rm-chip" style="margin-top:12px" id="rm-ra-go-local"><i class="fas fa-folder-open"></i> ' + t('Lokalna muzyka') + '</button></div>';
+            content.querySelector('#rm-ra-go-local')?.addEventListener('click', () => _navTo('local'));
+            return;
+        }
+        items.sort((a, b) => (b.modified || 0) - (a.modified || 0));
+        const recent = items.slice(0, 50);
+        let html = '<div class="rm-section-title"><i class="fas fa-clock"></i> ' + t('Ostatnio dodane') + '</div>';
+        recent.forEach(file => {
+            const artUrl = file.has_art ? '/api/radio-music/local/artwork?path=' + encodeURIComponent(file.path) + '&token=' + (NAS.token || '') : '';
+            const durStr = file.duration ? _fmtSecs(file.duration) : '';
+            const metaParts = [];
+            if (file.artist) metaParts.push(file.artist);
+            if (file.album) metaParts.push(file.album);
+            const meta = metaParts.join(' · ') || file.filename;
+            html += '<div class="rm-track rm-local-track" data-path="' + escH(file.path) + '">'
+                + (artUrl ? '<img class="rm-track-thumb" src="' + escH(artUrl) + '" onerror="this.style.display=\'none\'">' : '<div class="rm-track-thumb" style="background:rgba(255,255,255,.06);display:flex;align-items:center;justify-content:center"><i class="fas fa-music" style="color:rgba(255,255,255,.2)"></i></div>')
+                + '<div class="rm-track-info"><div class="rm-track-name">' + escH(file.name) + '</div>'
+                + '<div class="rm-track-meta">' + escH(meta) + (durStr ? ' · ' + durStr : '') + '</div></div>'
+                + '<button class="rm-track-btn rm-track-play"><i class="fas fa-play"></i></button>'
+                + '</div>';
+        });
+        content.innerHTML = html;
+        content.querySelectorAll('.rm-track.rm-local-track').forEach(el => {
+            const path = el.dataset.path;
+            const file = recent.find(f => f.path === path);
+            if (!file) return;
+            const playItem = {
+                name: file.name, path: file.path, type: 'local',
+                image: file.has_art ? '/api/radio-music/local/artwork?path=' + encodeURIComponent(file.path) + '&token=' + (NAS.token || '') : '',
+                meta: file.artist || file.filename, folder: file.folder
+            };
+            el.querySelector('.rm-track-play').onclick = (e) => { e.stopPropagation(); playAudio(playItem); };
+            el.onclick = () => playAudio(playItem);
+        });
+    }
+
+    /* ── Settings ───────────────────────────────────── */
+
+    function loadSettings(content) {
+        const cfSec = Math.round(_crossfadeDuration / 1000);
+        let html = `
+            <div class="rm-section-title"><i class="fas fa-cog"></i> ${t('Ustawienia')}</div>
+            <div style="max-width:480px;display:flex;flex-direction:column;gap:24px;padding:8px 0">
+                <div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                        <span style="font-size:14px;color:rgba(255,255,255,.85)">${t('Przenikanie (crossfade)')}</span>
+                        <span id="rm-cf-val" style="font-size:13px;color:var(--rm-accent);min-width:28px;text-align:right">${cfSec}s</span>
+                    </div>
+                    <input type="range" id="rm-cf-slider" class="rm-crossfade-slider" min="0" max="12" step="1" value="${cfSec}">
+                    <div style="display:flex;justify-content:space-between;font-size:11px;color:rgba(255,255,255,.35);margin-top:4px">
+                        <span>${t('Wył.')}</span><span>12s</span>
+                    </div>
+                </div>
+                <div>
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                        <span style="font-size:14px;color:rgba(255,255,255,.85)">${t('Prędkość odtwarzania')}</span>
+                        <span style="font-size:13px;color:rgba(255,255,255,.5)">${(_audio?.playbackRate || 1).toFixed(1)}x</span>
+                    </div>
+                    <div style="font-size:12px;color:rgba(255,255,255,.4)">${t('Zmień przyciskiem prędkości w panelu odtwarzacza')}</div>
+                </div>
+                <div>
+                    <button class="rm-chip" id="rm-clear-ep-progress" style="margin-top:8px"><i class="fas fa-trash"></i> ${t('Wyczyść postępy podcastów')}</button>
+                </div>
+            </div>`;
+        // Equalizer section
+        html += _renderEqSection();
+        content.innerHTML = html;
+        content.querySelector('#rm-cf-slider').oninput = (e) => {
+            const sec = parseInt(e.target.value, 10);
+            content.querySelector('#rm-cf-val').textContent = sec + 's';
+            _saveCrossfadeSetting(sec * 1000);
+        };
+        content.querySelector('#rm-clear-ep-progress').onclick = () => {
+            _epProgress = {};
+            _saveEpProgress();
+            toast(t('Postępy podcastów wyczyszczone'), 'success');
+        };
+        _wireEqHandlers(content);
+    }
+
+    /* ── Unified Search ────────────────────────────── */
+
+    async function loadUnifiedSearch(toolbar, content) {
+        toolbar.innerHTML = `<input class="rm-search" id="rm-usearch" placeholder="${t('Szukaj wszędzie...')}" autofocus>`;
+        content.innerHTML = '<div class="rm-empty"><i class="fas fa-search"></i><p>' + t('Wpisz, aby szukać w radiu, podcastach i lokalnej muzyce') + '</p></div>';
+        const inp = toolbar.querySelector('#rm-usearch');
+        let debounce;
+        inp.onkeyup = () => {
+            clearTimeout(debounce);
+            debounce = setTimeout(() => {
+                const q = inp.value.trim();
+                if (q.length >= 2) _doUnifiedSearch(q, content);
+            }, 400);
+        };
+    }
+
+    async function _doUnifiedSearch(q, content) {
+        content.innerHTML = _skeletonTracks(6);
+        const data = await api('/radio-music/search/all?q=' + encodeURIComponent(q) + '&limit=8');
+        if (data.error) { content.innerHTML = '<div class="rm-empty"><p>' + escH(data.error) + '</p></div>'; return; }
+        let html = '';
+        // Radio results
+        if (data.radio && data.radio.length) {
+            html += '<div class="rm-section-title"><i class="fas fa-broadcast-tower"></i> ' + t('Radio') + ' (' + data.radio.length + ')</div>';
+            html += '<div class="rm-grid rm-usearch-radio">';
+            data.radio.forEach(s => {
+                const isFav = _favorites.some(f => f.uuid === s.uuid);
+                html += `<div class="rm-card rm-usearch-item" data-type="radio" data-uuid="${escH(s.uuid||'')}">
+                    <div class="rm-card-icon">${_stationIconHtml(s)}</div>
+                    <div class="rm-card-info"><div class="rm-card-name">${escH(s.name)}</div>
+                    <div class="rm-card-meta">${escH([s.country, s.tags].filter(Boolean).join(' · '))}</div></div>
+                    <div class="rm-card-actions"><button class="rm-card-btn rm-fav-btn ${isFav?'rm-fav-active':''}" title="${t('Ulubione')}"><i class="fas fa-heart"></i></button></div>
+                </div>`;
+            });
+            html += '</div>';
+        }
+        // Podcast results
+        if (data.podcasts && data.podcasts.length) {
+            html += '<div class="rm-section-title"><i class="fas fa-podcast"></i> ' + t('Podcasty') + ' (' + data.podcasts.length + ')</div>';
+            html += '<div class="rm-grid rm-usearch-podcasts">';
+            data.podcasts.forEach(p => {
+                html += `<div class="rm-card rm-usearch-item" data-type="podcast" data-feed="${escH(p.feed_url||'')}">
+                    <div class="rm-card-icon">${p.artwork ? '<img src="' + escH(p.artwork) + '">' : '<i class="fas fa-podcast"></i>'}</div>
+                    <div class="rm-card-info"><div class="rm-card-name">${escH(p.name)}</div>
+                    <div class="rm-card-meta">${escH(p.artist||'')}</div></div>
+                </div>`;
+            });
+            html += '</div>';
+        }
+        // Local results
+        if (data.local && data.local.length) {
+            html += '<div class="rm-section-title"><i class="fas fa-folder-open"></i> ' + t('Lokalna muzyka') + ' (' + data.local.length + ')</div>';
+            data.local.forEach(f => {
+                const artUrl = f.has_art ? '/api/radio-music/local/artwork?path=' + encodeURIComponent(f.path) + '&token=' + (NAS.token || '') : '';
+                const meta = [f.artist, f.album].filter(Boolean).join(' · ') || f.filename;
+                html += `<div class="rm-track rm-usearch-item rm-local-track" data-type="local" data-path="${escH(f.path)}">
+                    ${artUrl ? '<img class="rm-track-thumb" src="' + escH(artUrl) + '" loading="lazy">' : '<div class="rm-track-thumb" style="background:rgba(255,255,255,.06);display:flex;align-items:center;justify-content:center"><i class="fas fa-music" style="color:rgba(255,255,255,.2)"></i></div>'}
+                    <div class="rm-track-info"><div class="rm-track-name">${escH(f.name)}</div>
+                    <div class="rm-track-meta">${escH(meta)}</div></div>
+                    <button class="rm-track-btn rm-track-play"><i class="fas fa-play"></i></button>
+                </div>`;
+            });
+        }
+        if (!html) {
+            html = '<div class="rm-empty"><i class="fas fa-search"></i><p>' + t('Brak wyników') + '</p></div>';
+        }
+        content.innerHTML = html;
+
+        // Wire up click handlers
+        content.querySelectorAll('.rm-usearch-item').forEach(el => {
+            const type = el.dataset.type;
+            if (type === 'radio') {
+                const s = data.radio.find(r => r.uuid === el.dataset.uuid);
+                if (s) {
+                    el.onclick = (e) => { if (!e.target.closest('.rm-fav-btn')) playStation(s); };
+                    const favBtn = el.querySelector('.rm-fav-btn');
+                    if (favBtn) favBtn.onclick = (e) => { e.stopPropagation(); toggleFavorite(s); };
+                }
+            } else if (type === 'podcast') {
+                const p = data.podcasts.find(r => r.feed_url === el.dataset.feed);
+                if (p) el.onclick = () => openPodcast(p);
+            } else if (type === 'local') {
+                const f = data.local.find(r => r.path === el.dataset.path);
+                if (f) {
+                    const item = {
+                        name: f.name, path: f.path, type: 'local',
+                        image: f.has_art ? '/api/radio-music/local/artwork?path=' + encodeURIComponent(f.path) + '&token=' + (NAS.token || '') : '',
+                        meta: f.artist || f.filename, folder: f.folder
+                    };
+                    el.onclick = () => playAudio(item);
+                    const playBtn = el.querySelector('.rm-track-play');
+                    if (playBtn) playBtn.onclick = (e) => { e.stopPropagation(); playAudio(item); };
+                }
+            }
+        });
+    }
+
+    /* ── Artist / Album Browser ────────────────────── */
+
+    async function loadArtists(content) {
+        content.innerHTML = _skeletonGrid(8);
+        const scanData = await api('/radio-music/local/scan');
+        const items = scanData.items || [];
+        if (!items.length) {
+            content.innerHTML = '<div class="rm-empty"><i class="fas fa-user-circle"></i><p>'
+                + t('Brak plików audio') + '</p><button class="rm-chip" style="margin-top:12px" id="rm-art-go-local"><i class="fas fa-folder-open"></i> '
+                + t('Dodaj foldery') + '</button></div>';
+            content.querySelector('#rm-art-go-local')?.addEventListener('click', () => _navTo('local'));
+            return;
+        }
+        // Group by artist
+        const artistMap = {};
+        items.forEach(f => {
+            const artist = (f.artist || '').trim() || t('Nieznany artysta');
+            if (!artistMap[artist]) artistMap[artist] = [];
+            artistMap[artist].push(f);
+        });
+        const artists = Object.keys(artistMap).sort((a, b) => a.localeCompare(b, undefined, {sensitivity: 'base'}));
+        let html = '<div class="rm-section-title"><i class="fas fa-user-circle"></i> ' + t('Artyści') + ' (' + artists.length + ')</div>';
+        html += '<div class="rm-grid">';
+        artists.forEach(artist => {
+            const tracks = artistMap[artist];
+            const albums = new Set(tracks.map(t => (t.album || '').trim()).filter(Boolean));
+            const artTrack = tracks.find(t => t.has_art);
+            const artUrl = artTrack ? '/api/radio-music/local/artwork?path=' + encodeURIComponent(artTrack.path) + '&token=' + (NAS.token || '') : '';
+            html += `<div class="rm-card rm-artist-card" data-artist="${escH(artist)}">
+                <div class="rm-card-icon">${artUrl ? '<img src="' + escH(artUrl) + '" loading="lazy">' : '<i class="fas fa-user-circle"></i>'}</div>
+                <div class="rm-card-info">
+                    <div class="rm-card-name">${escH(artist)}</div>
+                    <div class="rm-card-meta">${tracks.length} ${t('utworów')}${albums.size ? ' · ' + albums.size + ' ' + t('albumów') : ''}</div>
+                </div>
+            </div>`;
+        });
+        html += '</div>';
+        content.innerHTML = html;
+        content.querySelectorAll('.rm-artist-card').forEach(el => {
+            el.onclick = () => _openArtist(el.dataset.artist, artistMap[el.dataset.artist], content);
+        });
+    }
+
+    function _openArtist(artistName, tracks, content) {
+        // Group by album
+        const albumMap = {};
+        tracks.forEach(f => {
+            const album = (f.album || '').trim() || t('Bez albumu');
+            if (!albumMap[album]) albumMap[album] = [];
+            albumMap[album].push(f);
+        });
+        // Sort albums, then tracks within each album by track number
+        const albumNames = Object.keys(albumMap).sort((a, b) => a.localeCompare(b, undefined, {sensitivity: 'base'}));
+        let html = '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">'
+            + '<button class="rm-chip" id="rm-art-back"><i class="fas fa-arrow-left"></i> ' + t('Artyści') + '</button>'
+            + '<span style="font-size:18px;font-weight:700">' + escH(artistName) + '</span>'
+            + '<button class="rm-chip rm-artist-playall" style="margin-left:auto"><i class="fas fa-play"></i> ' + t('Odtwórz wszystko') + '</button>'
+            + '</div>';
+        albumNames.forEach(album => {
+            let albumTracks = albumMap[album];
+            albumTracks.sort((a, b) => {
+                const ta = parseInt(a.track) || 999;
+                const tb = parseInt(b.track) || 999;
+                return ta - tb;
+            });
+            const artTrack = albumTracks.find(t => t.has_art);
+            const artUrl = artTrack ? '/api/radio-music/local/artwork?path=' + encodeURIComponent(artTrack.path) + '&token=' + (NAS.token || '') : '';
+            const yearStr = albumTracks[0].year ? ' · ' + albumTracks[0].year : '';
+            html += '<div class="rm-section-title" style="display:flex;align-items:center;gap:8px">'
+                + (artUrl ? '<img src="' + escH(artUrl) + '" style="width:32px;height:32px;border-radius:4px;object-fit:cover" loading="lazy">' : '')
+                + '<span>' + escH(album) + yearStr + '</span></div>';
+            albumTracks.forEach((f, idx) => {
+                const durStr = f.duration ? _fmtSecs(f.duration) : '';
+                const trackNum = f.track ? '<span style="min-width:24px;color:var(--rm-text-muted);font-size:12px">' + escH(f.track) + '</span>' : '';
+                html += `<div class="rm-track rm-artist-track" data-path="${escH(f.path)}" data-album="${escH(album)}" data-idx="${idx}">
+                    ${trackNum}
+                    <div class="rm-track-info"><div class="rm-track-name">${escH(f.name)}</div>
+                    <div class="rm-track-meta">${durStr}</div></div>
+                    <button class="rm-track-btn rm-track-play"><i class="fas fa-play"></i></button>
+                </div>`;
+            });
+        });
+        content.innerHTML = html;
+        content.querySelector('#rm-art-back').onclick = () => loadArtists(content);
+
+        // Build full artist queue for playback
+        const allTracks = albumNames.flatMap(a => albumMap[a]);
+        const allQueue = allTracks.map(f => ({
+            name: f.name, path: f.path, type: 'local',
+            image: f.has_art ? '/api/radio-music/local/artwork?path=' + encodeURIComponent(f.path) + '&token=' + (NAS.token || '') : '',
+            meta: f.artist || f.filename, folder: f.folder
+        }));
+
+        content.querySelector('.rm-artist-playall').onclick = () => {
+            if (!allQueue.length) return;
+            _musicQueue = allQueue;
+            _musicQueueIdx = 0;
+            playAudio(allQueue[0]);
+            toast(t('Odtwarzam: ') + artistName, 'success');
+        };
+
+        content.querySelectorAll('.rm-artist-track').forEach(el => {
+            const path = el.dataset.path;
+            const globalIdx = allTracks.findIndex(f => f.path === path);
+            el.onclick = (e) => {
+                if (e.target.closest('.rm-track-play')) { e.stopPropagation(); }
+                _musicQueue = allQueue;
+                _musicQueueIdx = globalIdx >= 0 ? globalIdx : 0;
+                playAudio(allQueue[_musicQueueIdx]);
+            };
+            const playBtn = el.querySelector('.rm-track-play');
+            if (playBtn) playBtn.onclick = (e) => {
+                e.stopPropagation();
+                _musicQueue = allQueue;
+                _musicQueueIdx = globalIdx >= 0 ? globalIdx : 0;
+                playAudio(allQueue[_musicQueueIdx]);
+            };
+        });
+    }
+
+    /* ── 5-Band Equalizer ──────────────────────────── */
+
+    let _eqEnabled = false;
+    let _eqCtx = null;        // AudioContext
+    let _eqSource = null;     // MediaElementSourceNode
+    let _eqFilters = [];      // BiquadFilterNode[]
+    let _eqBands = [60, 230, 910, 3600, 14000];
+    let _eqGains = [0, 0, 0, 0, 0];
+    const _EQ_PRESETS = {
+        'Flat': [0, 0, 0, 0, 0],
+        'Bass Boost': [6, 4, 0, 0, 0],
+        'Treble Boost': [0, 0, 0, 4, 6],
+        'Rock': [4, 2, -1, 3, 4],
+        'Vocal': [-2, 0, 4, 3, 1],
+        'Dance': [5, 3, 0, 2, 4],
+        'Acoustic': [3, 1, 0, 2, 3],
+    };
+
+    function _initEq() {
+        if (_eqCtx) return;
+        try {
+            _eqCtx = new (window.AudioContext || window.webkitAudioContext)();
+        } catch(e) { return; }
+        _eqFilters = _eqBands.map((freq, i) => {
+            const f = _eqCtx.createBiquadFilter();
+            f.type = i === 0 ? 'lowshelf' : i === _eqBands.length - 1 ? 'highshelf' : 'peaking';
+            f.frequency.value = freq;
+            f.gain.value = _eqGains[i];
+            if (f.type === 'peaking') f.Q.value = 1.4;
+            return f;
+        });
+        // Chain filters
+        for (let i = 0; i < _eqFilters.length - 1; i++) {
+            _eqFilters[i].connect(_eqFilters[i + 1]);
+        }
+        _eqFilters[_eqFilters.length - 1].connect(_eqCtx.destination);
+    }
+
+    function _connectEq() {
+        if (!_eqCtx || !_audio || !_eqEnabled) return;
+        try {
+            if (_eqSource) { try { _eqSource.disconnect(); } catch(_) {} }
+            _eqSource = _eqCtx.createMediaElementSource(_audio);
+            _eqSource.connect(_eqFilters[0]);
+        } catch(e) {
+            // MediaElementSource can only be created once per element
+        }
+    }
+
+    function _disconnectEq() {
+        if (_eqSource) {
+            try { _eqSource.disconnect(); _eqSource.connect(_eqCtx.destination); } catch(_) {}
+        }
+    }
+
+    function _setEqGain(bandIdx, val) {
+        _eqGains[bandIdx] = val;
+        if (_eqFilters[bandIdx]) _eqFilters[bandIdx].gain.value = val;
+        localStorage.setItem('rm_eq_gains', JSON.stringify(_eqGains));
+    }
+
+    function _loadEqSettings() {
+        try {
+            const saved = JSON.parse(localStorage.getItem('rm_eq_gains') || 'null');
+            if (Array.isArray(saved) && saved.length === 5) _eqGains = saved;
+            _eqEnabled = localStorage.getItem('rm_eq_enabled') === '1';
+        } catch(_) {}
+    }
+
+    function _renderEqSection() {
+        const labels = ['60', '230', '910', '3.6k', '14k'];
+        let html = '<div class="rm-section-title"><i class="fas fa-sliders-h"></i> ' + t('Equalizer') + '</div>';
+        html += '<div style="max-width:480px;padding:8px 0">';
+        // Enable toggle
+        html += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">'
+            + '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px;color:var(--rm-text-secondary)">'
+            + '<input type="checkbox" id="rm-eq-toggle" ' + (_eqEnabled ? 'checked' : '') + ' style="accent-color:var(--rm-accent);width:18px;height:18px">'
+            + t('Włącz equalizer') + '</label></div>';
+        // Presets
+        html += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:16px">';
+        Object.keys(_EQ_PRESETS).forEach(name => {
+            html += '<button class="rm-chip rm-eq-preset" data-preset="' + name + '">' + name + '</button>';
+        });
+        html += '</div>';
+        // Sliders
+        html += '<div style="display:flex;gap:16px;justify-content:center;padding:8px 0">';
+        _eqBands.forEach((freq, i) => {
+            html += '<div style="display:flex;flex-direction:column;align-items:center;gap:4px">'
+                + '<span id="rm-eq-val-' + i + '" style="font-size:11px;color:var(--rm-accent);min-width:28px;text-align:center">' + (_eqGains[i] > 0 ? '+' : '') + _eqGains[i] + 'dB</span>'
+                + '<input type="range" class="rm-eq-slider" data-band="' + i + '" min="-12" max="12" step="1" value="' + _eqGains[i] + '" '
+                + 'style="writing-mode:vertical-lr;direction:rtl;height:120px;width:28px;accent-color:var(--rm-accent)">'
+                + '<span style="font-size:11px;color:var(--rm-text-muted)">' + labels[i] + '</span></div>';
+        });
+        html += '</div></div>';
+        return html;
+    }
+
+    function _wireEqHandlers(content) {
+        content.querySelector('#rm-eq-toggle').onchange = (e) => {
+            _eqEnabled = e.target.checked;
+            localStorage.setItem('rm_eq_enabled', _eqEnabled ? '1' : '0');
+            if (_eqEnabled) { _initEq(); _connectEq(); _eqFilters.forEach((f, i) => f.gain.value = _eqGains[i]); }
+            else { _disconnectEq(); }
+        };
+        content.querySelectorAll('.rm-eq-slider').forEach(slider => {
+            slider.oninput = (e) => {
+                const band = parseInt(e.target.dataset.band);
+                const val = parseInt(e.target.value);
+                _setEqGain(band, val);
+                const lbl = content.querySelector('#rm-eq-val-' + band);
+                if (lbl) lbl.textContent = (val > 0 ? '+' : '') + val + 'dB';
+            };
+        });
+        content.querySelectorAll('.rm-eq-preset').forEach(btn => {
+            btn.onclick = () => {
+                const gains = _EQ_PRESETS[btn.dataset.preset];
+                if (!gains) return;
+                gains.forEach((g, i) => {
+                    _setEqGain(i, g);
+                    const slider = content.querySelector('.rm-eq-slider[data-band="' + i + '"]');
+                    if (slider) slider.value = g;
+                    const lbl = content.querySelector('#rm-eq-val-' + i);
+                    if (lbl) lbl.textContent = (g > 0 ? '+' : '') + g + 'dB';
+                });
+                content.querySelectorAll('.rm-eq-preset').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+            };
+        });
     }
 
     /* ── Audiobooks for Kids ───────────────────────── */
@@ -3276,8 +4159,17 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         _clearSeek();
         _audio = new Audio();
         _audio.volume = _isCasting ? 0 : (bodyEl.querySelector('#rm-vol')?.value || 80) / 100;
+        if (_playbackRate !== 1) _audio.playbackRate = _playbackRate;
         _playing = item;
         _seekLocked = true; // unlock on onplay/oncanplay — prevents seekbar jumping to 0
+
+        // Connect EQ if enabled
+        if (_eqEnabled && _eqCtx) {
+            try {
+                _eqSource = _eqCtx.createMediaElementSource(_audio);
+                _eqSource.connect(_eqFilters[0]);
+            } catch(_) {}
+        }
 
         // Reset reconnect state and preload on each new playback
         clearTimeout(_radioRetryTimer); _radioRetryTimer = null; _radioRetries = 0;
@@ -3320,6 +4212,13 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         // ── Buffering state helpers ──
         function _setBuffering(on) {
             _isBuffering = on;
+            // Safety net: auto-release buffering after 20s to prevent permanently stuck controls
+            clearTimeout(_bufferingSafetyTimer);
+            if (on) {
+                _bufferingSafetyTimer = setTimeout(() => {
+                    if (_isBuffering) { _setBuffering(false); _cl('warning', 'Buffering safety timeout — auto-released after 20s'); }
+                }, 20000);
+            }
             const player = bodyEl.querySelector('#rm-player');
             if (player) player.classList.toggle('rm-buffering', on);
             // F-01: progress ring on play button signals NAS loading to user
@@ -3535,6 +4434,12 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             _showEq(false);
             _clearSeek();
 
+            // Sleep timer — end of track mode: stop playback
+            if (_onTrackEndedSleepCheck()) {
+                bodyEl.querySelector('#rm-play-pause').innerHTML = '<i class="fas fa-play"></i>';
+                return;
+            }
+
             // Repeat one — replay current track
             if (_repeatMode === 2) {
                 _endedHandled = false;
@@ -3554,6 +4459,10 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             if (now - _seekThrottleTs >= 250) {
                 _seekThrottleTs = now;
                 _updateSeekbar();
+                // Podcast episode progress tracking (throttled with seekbar)
+                if (_playing && _playing._podcast && _audio.duration > 0) {
+                    _updateEpProgress(_playing.url || _playing.stream_url, _audio.currentTime, _audio.duration);
+                }
                 // Update Media Session position state for iOS control center scrubbing
                 if ('mediaSession' in navigator && navigator.mediaSession.setPositionState && _audio
                         && isFinite(_audio.duration) && _audio.duration > 0) {
@@ -3586,7 +4495,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                                 const pctNow = _audio.currentTime / _audio.duration;
                                 if (pctNow >= 0.95) {
                                     _cl('info', 'Gapless crossfade triggered at ' + Math.round(pctNow * 100) + '%', { next: nextItem.name });
-                                    _crossfade(_audio, _preloadAudio, targetVol, 1500, () => {
+                                    _crossfade(_audio, _preloadAudio, targetVol, _crossfadeDuration, () => {
                                         // After crossfade, officially switch to next track
                                         _audio.onended?.(); // trigger queue advance
                                     });
@@ -3617,7 +4526,16 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 }, 1500);
             }
         };
-        _audio.onloadedmetadata = () => { _updateSeekbar(); _savePlaybackState(); };
+        _audio.onloadedmetadata = () => {
+            _updateSeekbar(); _savePlaybackState();
+            // Restore podcast episode position
+            if (item._podcast && _audio.duration > 0) {
+                const prog = _epProgress[item.url || item.stream_url];
+                if (prog && !prog.done && prog.pos > 5 && prog.pos < prog.dur - 5) {
+                    _audio.currentTime = prog.pos;
+                }
+            }
+        };
 
         // Periodic save of playback position
         if (_saveStateInterval) clearInterval(_saveStateInterval);
@@ -3716,6 +4634,19 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         if (now - _prevNextTs < 1500) return;
         _prevNextTs = now;
 
+        // Podcast queue has priority when a podcast is playing
+        if (_playing && _playing._podcast && _podQueue.length > 0) {
+            let nextIdx = _podQueueIdx + dir;
+            if (nextIdx >= 0 && nextIdx < _podQueue.length) {
+                _podQueueIdx = nextIdx;
+                playAudio(_podQueue[nextIdx]);
+            } else if (_repeatMode === 1 && _podQueue.length > 0) {
+                _podQueueIdx = dir > 0 ? 0 : _podQueue.length - 1;
+                playAudio(_podQueue[_podQueueIdx]);
+            }
+            return;
+        }
+
         // Queue has priority (music tracks, local files, or history list items)
         if (_musicQueue.length > 0 && _musicQueueIdx >= 0) {
             let nextIdx;
@@ -3768,22 +4699,24 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         if (_wakeLock) { _wakeLock.release(); _wakeLock = null; }
     }
 
-    // Re-acquire wake lock when page becomes visible again (system releases on screen-off)
-    document.addEventListener('visibilitychange', () => {
+    // Named handlers for cleanup in onClose
+    function _onVisWakeLock() {
         if (document.visibilityState === 'visible' && _audio && !_audio.paused) {
             _acquireWakeLock();
         }
-    });
+    }
+    document.addEventListener('visibilitychange', _onVisWakeLock);
 
     // E-11: Bluetooth / audio output device disconnect — auto-pause to avoid music
     // blaring from phone speaker when headphones are pulled out in public
+    let _onDeviceChange = null;
     if ('mediaDevices' in navigator && 'enumerateDevices' in navigator.mediaDevices) {
         let _lastOutputCount = 0;
         navigator.mediaDevices.enumerateDevices().then(devs => {
             _lastOutputCount = devs.filter(d => d.kind === 'audiooutput').length;
         }).catch(() => {});
 
-        navigator.mediaDevices.addEventListener('devicechange', async () => {
+        _onDeviceChange = async () => {
             if (!_audio || _audio.paused) return;
             try {
                 const devs = await navigator.mediaDevices.enumerateDevices();
@@ -3795,19 +4728,18 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 }
                 _lastOutputCount = outputs.length;
             } catch(e) { _cl('debug', 'devicechange check failed', { msg: e.message }); }
-        });
+        };
+        navigator.mediaDevices.addEventListener('devicechange', _onDeviceChange);
     }
 
     // E-12: Audio focus loss — another app/tab takes audio focus.
     // Web has no explicit AudioFocus API; we use two signals:
     // 1. MediaSession 'pause' action fired by Android system (already wired above via onpause)
     // 2. Page visibility hidden while playing (tab backgrounded by another media app)
-    document.addEventListener('visibilitychange', () => {
-        // When page hides we check again a moment later; if still paused it was system-initiated
+    function _onVisFocusLoss() {
         if (document.visibilityState === 'hidden') {
             const audioRef = _audio;
             if (!audioRef || audioRef.paused) return;
-            // Store the moment we hid; if audio is paused when we come back, show a resume prompt
             audioRef._hiddenAt = Date.now();
         } else if (document.visibilityState === 'visible' && _audio) {
             if (_audio.paused && _audio._hiddenAt) {
@@ -3818,7 +4750,8 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 _audio._hiddenAt = null;
             }
         }
-    });
+    }
+    document.addEventListener('visibilitychange', _onVisFocusLoss);
 
     // Toast for system-initiated pause events (BT disconnect, audio focus loss)
     function _showSystemInterruptToast(msg, withResumeBtn = false) {
@@ -3828,10 +4761,10 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         const toast = document.createElement('div');
         toast.id = 'rm-sys-toast';
         toast.style.cssText = 'position:fixed;bottom:80px;left:50%;transform:translateX(-50%);background:rgba(30,30,30,.95);color:#fff;padding:12px 20px;border-radius:24px;font-size:13px;z-index:9999;display:flex;align-items:center;gap:12px;box-shadow:0 4px 20px rgba(0,0,0,.5);backdrop-filter:blur(12px);max-width:90vw;text-align:center';
-        toast.innerHTML = '<i class="fas fa-pause-circle" style="color:#1DB954"></i><span>' + msg + '</span>';
+        toast.innerHTML = '<i class="fas fa-pause-circle" style="color:var(--rm-accent)"></i><span>' + msg + '</span>';
         if (withResumeBtn) {
             const btn = document.createElement('button');
-            btn.style.cssText = 'background:#1DB954;color:#000;border:none;border-radius:16px;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap';
+            btn.style.cssText = 'background:var(--rm-accent);color:var(--rm-bg);border:none;border-radius:16px;padding:6px 14px;font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap';
             btn.textContent = t('▶ Wznów');
             btn.onclick = () => { _audio?.play().catch(() => {}); toast.remove(); };
             toast.appendChild(btn);
@@ -3842,6 +4775,8 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
     function stopPlayback() {
         _savePlaybackState();
+        _clearSleepTimer();
+        _stopLyricsSync();
         if (_saveStateInterval) { clearInterval(_saveStateInterval); _saveStateInterval = null; }
         clearTimeout(_radioRetryTimer); _radioRetryTimer = null; _radioRetries = 0;
         if (_preloadAudio) { _preloadAudio.src = ''; _preloadAudio = null; }
@@ -3872,6 +4807,284 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     function _showEq(show) {
         const eq = bodyEl?.querySelector('#rm-player-eq');
         if (eq) eq.style.display = show ? 'flex' : 'none';
+    }
+
+    /* ── Sleep Timer ───────────────────────────────────── */
+    const _SLEEP_PRESETS = [
+        { label: '15 min', mins: 15 },
+        { label: '30 min', mins: 30 },
+        { label: '45 min', mins: 45 },
+        { label: '60 min', mins: 60 },
+        { label: '90 min', mins: 90 },
+    ];
+
+    function _setSleepTimer(mins) {
+        _clearSleepTimer();
+        if (!mins) return;
+        _sleepMode = 'time';
+        _sleepEnd = Date.now() + mins * 60000;
+        _sleepTimer = setTimeout(() => {
+            if (_audio) { _audio.pause(); }
+            toast(t('Wyłącznik czasowy — zatrzymano odtwarzanie'), 'info');
+            _clearSleepTimer();
+        }, mins * 60000);
+        _syncSleepUi();
+    }
+
+    function _setSleepEndOfTrack() {
+        _clearSleepTimer();
+        _sleepMode = 'track';
+        _sleepEnd = -1;
+        _syncSleepUi();
+    }
+
+    function _clearSleepTimer() {
+        if (_sleepTimer) { clearTimeout(_sleepTimer); _sleepTimer = null; }
+        _sleepEnd = 0;
+        _sleepMode = '';
+        _syncSleepUi();
+    }
+
+    function _onTrackEndedSleepCheck() {
+        if (_sleepMode === 'track') {
+            _clearSleepTimer();
+            toast(t('Wyłącznik czasowy — zatrzymano po utworze'), 'info');
+            return true;
+        }
+        return false;
+    }
+
+    function _syncSleepUi() {
+        const btn = bodyEl?.querySelector('#rm-np-sleep');
+        if (!btn) return;
+        if (_sleepEnd || _sleepMode) {
+            btn.classList.add('rm-sleep-active');
+            if (_sleepMode === 'track') {
+                btn.innerHTML = '<i class="fas fa-moon"></i> ' + t('Po utworze');
+            } else if (_sleepEnd > 0) {
+                const mins = Math.ceil((_sleepEnd - Date.now()) / 60000);
+                btn.innerHTML = '<i class="fas fa-moon"></i> ' + mins + ' min';
+            }
+        } else {
+            btn.classList.remove('rm-sleep-active');
+            btn.innerHTML = '<i class="fas fa-moon"></i> ' + t('Timer');
+        }
+    }
+
+    function _showSleepDropdown(anchorBtn) {
+        let dd = bodyEl?.querySelector('.rm-sleep-dropdown');
+        if (dd && dd.classList.contains('open')) { dd.classList.remove('open'); return; }
+        if (!dd) {
+            dd = document.createElement('div');
+            dd.className = 'rm-sleep-dropdown';
+            anchorBtn.style.position = 'relative';
+            anchorBtn.appendChild(dd);
+        }
+        let html = '';
+        _SLEEP_PRESETS.forEach(p => {
+            const active = _sleepMode === 'time' && _sleepEnd > 0 && Math.abs(Math.ceil((_sleepEnd - Date.now()) / 60000) - p.mins) < 2;
+            html += `<div class="rm-sleep-option${active ? ' active' : ''}" data-mins="${p.mins}">${p.label}${active ? ' <span class="rm-sleep-check">✓</span>' : ''}</div>`;
+        });
+        const trackActive = _sleepMode === 'track';
+        html += `<div class="rm-sleep-option${trackActive ? ' active' : ''}" data-action="track">${t('Po bieżącym utworze')}${trackActive ? ' <span class="rm-sleep-check">✓</span>' : ''}</div>`;
+        if (_sleepEnd || _sleepMode) {
+            html += `<div class="rm-sleep-option" data-action="off" style="color:var(--rm-error)">${t('Wyłącz timer')}</div>`;
+        }
+        dd.innerHTML = html;
+        dd.classList.add('open');
+        dd.querySelectorAll('.rm-sleep-option').forEach(opt => {
+            opt.onclick = (e) => {
+                e.stopPropagation();
+                dd.classList.remove('open');
+                if (opt.dataset.action === 'off') { _clearSleepTimer(); }
+                else if (opt.dataset.action === 'track') { _setSleepEndOfTrack(); }
+                else { _setSleepTimer(parseInt(opt.dataset.mins, 10)); }
+            };
+        });
+        const closeDd = (e) => { if (!dd.contains(e.target)) { dd.classList.remove('open'); document.removeEventListener('click', closeDd, true); } };
+        setTimeout(() => document.addEventListener('click', closeDd, true), 0);
+    }
+
+    /* ── Playback Speed ────────────────────────────────── */
+    const _SPEED_STEPS = [0.5, 0.75, 1, 1.25, 1.5, 2];
+
+    function _cycleSpeed() {
+        const idx = _SPEED_STEPS.indexOf(_playbackRate);
+        _playbackRate = _SPEED_STEPS[(idx + 1) % _SPEED_STEPS.length];
+        if (_audio) _audio.playbackRate = _playbackRate;
+        _syncSpeedUi();
+    }
+
+    function _syncSpeedUi() {
+        const btn = bodyEl?.querySelector('#rm-np-speed');
+        if (!btn) return;
+        btn.textContent = _playbackRate === 1 ? '1x' : _playbackRate + 'x';
+        btn.classList.toggle('rm-speed-changed', _playbackRate !== 1);
+    }
+
+    /* ── Keyboard Shortcuts ────────────────────────────── */
+    function _onKeyDown(e) {
+        if (!bodyEl || !bodyEl.isConnected) return;
+        const tag = e.target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable) return;
+
+        switch (e.key) {
+            case ' ':
+                e.preventDefault();
+                if (_audio) { _audio.paused ? _audio.play().catch(() => {}) : _audio.pause(); }
+                break;
+            case 'ArrowRight':
+                if (_audio && _audio.duration && isFinite(_audio.duration)) { _audio.currentTime = Math.min(_audio.duration, _audio.currentTime + 10); }
+                break;
+            case 'ArrowLeft':
+                if (_audio && _audio.duration) { _audio.currentTime = Math.max(0, _audio.currentTime - 10); }
+                break;
+            case 'ArrowUp':
+                e.preventDefault();
+                if (_audio) { _audio.volume = Math.min(1, _audio.volume + 0.05); const v = bodyEl.querySelector('#rm-vol'); if (v) v.value = _audio.volume; }
+                break;
+            case 'ArrowDown':
+                e.preventDefault();
+                if (_audio) { _audio.volume = Math.max(0, _audio.volume - 0.05); const v = bodyEl.querySelector('#rm-vol'); if (v) v.value = _audio.volume; }
+                break;
+            case 'n': case 'N':
+                _skipStation(1);
+                break;
+            case 'p': case 'P':
+                _skipStation(-1);
+                break;
+            case 'm': case 'M':
+                if (_audio) { _audio.muted = !_audio.muted; }
+                break;
+            case 'Escape': {
+                const np = bodyEl.querySelector('.rm-np-overlay');
+                if (np) _hideNowPlaying();
+                const dd = bodyEl.querySelector('.rm-sleep-dropdown.open');
+                if (dd) dd.classList.remove('open');
+                break;
+            }
+        }
+    }
+
+    /* ── Synced Lyrics (LRC) ───────────────────────────── */
+    function _parseLrc(lrc) {
+        if (!lrc) return null;
+        const lines = [];
+        lrc.split('\n').forEach(line => {
+            const m = line.match(/^\[(\d{2}):(\d{2})\.(\d{2,3})\]\s*(.*)/);
+            if (m) {
+                const ms = parseInt(m[1]) * 60000 + parseInt(m[2]) * 1000 + parseInt(m[3].padEnd(3, '0'));
+                lines.push({ time: ms, text: m[4] });
+            }
+        });
+        return lines.length > 3 ? lines : null;
+    }
+
+    function _renderSyncedLyrics(panel, lines) {
+        panel.innerHTML = lines.map((l, i) =>
+            '<div class="rm-lyrics-line" data-idx="' + i + '">' + escH(l.text || '♪') + '</div>'
+        ).join('');
+    }
+
+    function _startLyricsSync(panel) {
+        _stopLyricsSync();
+        if (!_syncedLyrics || !_audio) return;
+        _lyrSyncInterval = setInterval(() => {
+            if (!_audio || _audio.paused) return;
+            const ms = _audio.currentTime * 1000;
+            let active = 0;
+            for (let i = _syncedLyrics.length - 1; i >= 0; i--) {
+                if (_syncedLyrics[i].time <= ms) { active = i; break; }
+            }
+            panel.querySelectorAll('.rm-lyrics-line').forEach((el, i) => {
+                el.classList.toggle('rm-lyr-active', i === active);
+                el.classList.toggle('rm-lyr-near', i === active - 1 || i === active + 1);
+            });
+            const activeEl = panel.querySelector('.rm-lyr-active');
+            if (activeEl) activeEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        }, 300);
+    }
+
+    function _stopLyricsSync() {
+        if (_lyrSyncInterval) { clearInterval(_lyrSyncInterval); _lyrSyncInterval = null; }
+        _syncedLyrics = null;
+    }
+
+    /* ── Queue Drag & Drop ─────────────────────────────── */
+    function _setupQueueDnD(panel) {
+        let dragIdx = -1;
+        panel.addEventListener('pointerdown', (e) => {
+            const handle = e.target.closest('.rm-np-q-item-drag');
+            if (!handle) return;
+            const item = handle.closest('.rm-np-q-item');
+            if (!item) return;
+            dragIdx = parseInt(item.dataset.idx, 10);
+            if (isNaN(dragIdx)) return;
+            item.classList.add('rm-q-dragging');
+            item.setPointerCapture(e.pointerId);
+
+            const onMove = (ev) => {
+                const el = document.elementFromPoint(ev.clientX, ev.clientY)?.closest('.rm-np-q-item');
+                panel.querySelectorAll('.rm-np-q-item').forEach(q => q.classList.remove('rm-q-drag-over'));
+                if (el && el !== item) el.classList.add('rm-q-drag-over');
+            };
+            const onUp = (ev) => {
+                item.classList.remove('rm-q-dragging');
+                item.releasePointerCapture(ev.pointerId);
+                panel.removeEventListener('pointermove', onMove);
+                panel.removeEventListener('pointerup', onUp);
+                const target = document.elementFromPoint(ev.clientX, ev.clientY)?.closest('.rm-np-q-item');
+                panel.querySelectorAll('.rm-np-q-item').forEach(q => q.classList.remove('rm-q-drag-over'));
+                if (!target) return;
+                const dropIdx = parseInt(target.dataset.idx, 10);
+                if (isNaN(dropIdx) || dropIdx === dragIdx) return;
+                // Reorder _musicQueue
+                const [moved] = _musicQueue.splice(dragIdx, 1);
+                _musicQueue.splice(dropIdx, 0, moved);
+                // Fix current index
+                if (_musicQueueIdx === dragIdx) _musicQueueIdx = dropIdx;
+                else if (dragIdx < _musicQueueIdx && dropIdx >= _musicQueueIdx) _musicQueueIdx--;
+                else if (dragIdx > _musicQueueIdx && dropIdx <= _musicQueueIdx) _musicQueueIdx++;
+                if (_renderNpQueueFn) _renderNpQueueFn();
+            };
+            panel.addEventListener('pointermove', onMove);
+            panel.addEventListener('pointerup', onUp);
+        });
+    }
+
+    /* ── Podcast Episode Progress ──────────────────────── */
+    function _loadEpProgress() {
+        try { _epProgress = JSON.parse(localStorage.getItem('rm_ep_progress') || '{}'); } catch(_) { _epProgress = {}; }
+    }
+
+    function _saveEpProgress() {
+        try { localStorage.setItem('rm_ep_progress', JSON.stringify(_epProgress)); } catch(_) {}
+    }
+
+    function _updateEpProgress(url, pos, dur) {
+        if (!url || !dur) return;
+        const done = pos / dur > 0.95;
+        _epProgress[url] = { pos: Math.floor(pos), dur: Math.floor(dur), done };
+        _saveEpProgress();
+    }
+
+    function _getEpProgressPct(url) {
+        const p = _epProgress[url];
+        if (!p || !p.dur) return 0;
+        return p.done ? 100 : Math.floor(p.pos / p.dur * 100);
+    }
+
+    /* ── Crossfade User Setting ────────────────────────── */
+    function _loadCrossfadeSetting() {
+        try {
+            const v = parseInt(localStorage.getItem('rm_crossfade_ms'), 10);
+            if (v >= 0 && v <= 12000) _crossfadeDuration = v;
+        } catch(_) {}
+    }
+
+    function _saveCrossfadeSetting(ms) {
+        _crossfadeDuration = ms;
+        try { localStorage.setItem('rm_crossfade_ms', String(ms)); } catch(_) {}
     }
 
     /* ── Chromecast / Google Cast SDK ──────────────────── */
@@ -4553,8 +5766,8 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         menu.className = 'rm-arch-menu';
         menu.style.cssText = 'position:fixed;background:#1e1e1e;border:1px solid rgba(255,255,255,.12);border-radius:8px;padding:4px 0;z-index:9999;min-width:180px;box-shadow:0 4px 24px rgba(0,0,0,.5);font-size:13px;color:#fff';
         menu.innerHTML = `
-            <button class="rm-arch-menu-item" data-action="del-phone"><i class="fas fa-mobile-screen-button" style="color:#f59e0b;width:18px"></i> ${t('Usuń z telefonu')}</button>
-            <button class="rm-arch-menu-item" data-action="del-nas"><i class="fas fa-trash" style="color:#ef4444;width:18px"></i> ${t('Usuń z NAS')}</button>
+            <button class="rm-arch-menu-item" data-action="del-phone"><i class="fas fa-mobile-screen-button" style="color:var(--rm-warning);width:18px"></i> ${t('Usuń z telefonu')}</button>
+            <button class="rm-arch-menu-item" data-action="del-nas"><i class="fas fa-trash" style="color:var(--rm-error);width:18px"></i> ${t('Usuń z NAS')}</button>
             <button class="rm-arch-menu-item" data-action="cancel"><i class="fas fa-times" style="color:rgba(255,255,255,.4);width:18px"></i> ${t('Anuluj')}</button>`;
         const rect = anchor.getBoundingClientRect();
         menu.style.left = Math.min(rect.right, window.innerWidth - 190) + 'px';
@@ -4751,7 +5964,19 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             if (cur)  cur.textContent = '0:00';
             if (dur)  dur.textContent = '0:00';
 
-            // Step 7: update MediaSession with new track
+            // Step 7: clear stale lyrics from previous track
+            _stopLyricsSync();
+            const lyrPanel = _npOverlay.querySelector('#rm-np-lyrics-panel');
+            if (lyrPanel) { lyrPanel.innerHTML = ''; lyrPanel.classList.remove('rm-lyrics-visible'); }
+            const lyrBtn = _npOverlay.querySelector('#rm-np-lyrics');
+            if (lyrBtn) lyrBtn.classList.remove('rm-lyrics-active');
+
+            // Step 8: sync NP favorite and download buttons to new track
+            if (_npSyncFav) _npSyncFav();
+            if (_npSyncDownload) _npSyncDownload();
+            if (_npReloadSimilar) _npReloadSimilar();
+
+            // Step 9: update MediaSession with new track
             _updateMediaSession();
 
         }, 160); // wait for fade-out transition to complete
@@ -4762,8 +5987,13 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
 
         // If overlay exists and is just minimized (same track), re-expand it — no DOM rebuild
         if (_npOverlay && _npOverlay.classList.contains('rm-np-minimized')) {
-            _npOverlay.style.transform = '';
             _npOverlay.classList.remove('rm-np-minimized');
+            _npOverlay.style.transform = '';
+            // WAAPI slide-up: element at final position for hit-testing, visual-only animation
+            _npOverlay.animate([
+                { transform: 'translateY(100%)', opacity: 0 },
+                { transform: 'translateY(0)', opacity: 1 }
+            ], { duration: 380, easing: 'cubic-bezier(0.32,0.72,0,1)' });
             if (!history.state?.rmNpOpen) history.pushState({ rmNpOpen: true }, '');
             localStorage.setItem('rm_np_open', '1');
             const visCvs = _npOverlay.querySelector('#rm-np-vis');
@@ -4779,7 +6009,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         }
 
         _hideNowPlaying();
-        const item = _playing;
+        let item = _playing;
         const isMusic = item.type === 'music';
         const isPodcast = item.type === 'podcast';
         const hasSeek = isMusic || isPodcast;
@@ -4813,15 +6043,18 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                     <button class="rm-np-btn" id="rm-np-repeat" title="${t('Powtarzaj')}"><i class="fas fa-redo"></i></button>
                 </div>
                 <div class="rm-np-actions">
+                    <button class="rm-np-action" id="rm-np-sleep"><i class="fas fa-moon"></i> ${t('Timer')}</button>
+                    <button class="rm-speed-btn" id="rm-np-speed">${_playbackRate === 1 ? '1x' : _playbackRate + 'x'}</button>
                     <button class="rm-np-action" id="rm-np-queue-btn"><i class="fas fa-list-ol"></i> ${t('Kolejka')}</button>
                     <button class="rm-np-action" id="rm-np-lyrics"><i class="fas fa-align-left"></i> ${t('Tekst')}</button>
                     <button class="rm-np-action" id="rm-np-addpl"><i class="fas fa-plus"></i> ${t('Playlista')}</button>
                     <button class="rm-np-action rm-np-cast-action" id="rm-np-cast"><i class="fab fa-chromecast"></i> Chromecast</button>
-                    <button class="rm-np-action" id="rm-np-lock"><i class="fas fa-lock"></i> ${t('Blokada')}</button>
-                    <button class="rm-np-action" id="rm-np-close2"><i class="fas fa-times"></i> ${t('Zamknij')}</button>
+                    <button class="rm-np-action" id="rm-np-fav"><i class="fas fa-heart"></i> ${t('Ulubione')}</button>
+                    <button class="rm-np-action" id="rm-np-download"><i class="fas fa-cloud-arrow-down"></i> ${t('Pobierz')}</button>
                 </div>
                 <div class="rm-lyrics-panel" id="rm-np-lyrics-panel"></div>
                 <div class="rm-np-queue" id="rm-np-queue-panel"></div>
+                <div class="rm-np-similar" id="rm-np-similar-panel"></div>
             </div>`;
 
         // Art image
@@ -4836,35 +6069,109 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             artContainer.innerHTML = '<div class="rm-letter-icon" style="background:hsl(' + hue + ',50%,35%);display:flex;align-items:center;justify-content:center;font-size:64px;color:#fff">' + letter + '</div>';
         }
 
-        // Close handlers — minimize (CSS slide-down), not destroy
+        // Close handler — minimize (CSS slide-down), not destroy
         ov.querySelector('.rm-np-close').onclick = () => _minimizeNowPlaying();
-        ov.querySelector('#rm-np-close2').onclick = () => _minimizeNowPlaying();
 
-        // Physics swipe-down: tracks finger, springs back or minimizes at 100px
-        // Guards: ignore Motorola/Android edge-gesture zones (top/bottom 44px)
-        let _swStartY = 0, _swActive = false;
-        ov.addEventListener('touchstart', (e) => {
+        // Favorite button — toggle radio favorite or liked song
+        const favBtn = ov.querySelector('#rm-np-fav');
+        function _syncNpFav() {
+            if (!favBtn || !_playing) return;
+            const isFav = _playing.type === 'radio'
+                ? _favorites.some(f => f.uuid === (_playing.uuid || _playing.stationuuid))
+                : _likedSongs.some(s => s.url === _playing.url);
+            favBtn.classList.toggle('rm-lyrics-active', isFav);
+            favBtn.innerHTML = isFav
+                ? '<i class="fas fa-heart" style="color:var(--rm-accent)"></i> ' + t('Ulubione')
+                : '<i class="far fa-heart"></i> ' + t('Ulubione');
+        }
+        if (favBtn) {
+            favBtn.onclick = async () => {
+                if (!_playing) return;
+                if (_playing.type === 'radio') {
+                    await toggleFavorite(_playing);
+                } else {
+                    await toggleLikedSong(_playing);
+                }
+                _syncNpFav();
+            };
+            _syncNpFav();
+        }
+
+        // Download/Archive button — trigger NAS archive for music tracks
+        const dlBtn = ov.querySelector('#rm-np-download');
+        function _syncNpDownload() {
+            if (!dlBtn || !_playing) return;
+            const isMusic = _playing.type === 'music';
+            if (!isMusic) { dlBtn.style.display = 'none'; return; }
+            dlBtn.style.display = '';
+            const entry = _archiveDb[_playing.url] || {};
+            const st = entry.status || 'none';
+            if (st === 'done') {
+                dlBtn.innerHTML = '<i class="fas fa-cloud-check" style="color:var(--rm-accent)"></i> ' + t('Pobrano');
+                dlBtn.classList.add('rm-lyrics-active');
+            } else if (st === 'downloading') {
+                dlBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> ' + (entry.progress || 0) + '%';
+            } else {
+                dlBtn.innerHTML = '<i class="fas fa-cloud-arrow-down"></i> ' + t('Pobierz');
+                dlBtn.classList.remove('rm-lyrics-active');
+            }
+        }
+        if (dlBtn) {
+            dlBtn.onclick = () => {
+                if (!_playing || !_playing.url) return;
+                _onArchiveBtnClick(_playing.url, dlBtn);
+                setTimeout(_syncNpDownload, 500);
+            };
+            _syncNpDownload();
+        }
+        // Expose sync functions for track changes
+        _npSyncFav = _syncNpFav;
+        _npSyncDownload = _syncNpDownload;
+
+        // Sleep timer button
+        const sleepBtn = ov.querySelector('#rm-np-sleep');
+        if (sleepBtn) sleepBtn.onclick = (e) => { e.stopPropagation(); _showSleepDropdown(sleepBtn); };
+        _syncSleepUi();
+
+        // Playback speed button
+        const speedBtn = ov.querySelector('#rm-np-speed');
+        if (speedBtn) speedBtn.onclick = (e) => { e.stopPropagation(); _cycleSpeed(); };
+        _syncSpeedUi();
+
+        // Swipe-down to dismiss: ONLY on the art area (avoids conflict with buttons & scrolling)
+        let _swStartY = 0, _swActive = false, _swMoving = false;
+        const _npArt = ov.querySelector('#rm-np-art');
+        _npArt.addEventListener('touchstart', (e) => {
             const t = e.touches[0];
-            if (t.clientY < 44 || t.clientY > window.innerHeight - 44) return; // edge gesture zone
-            if (_npSeekDragging) return; // don't fight seekbar drag
+            if (_npSeekDragging) return;
             _swStartY = t.clientY;
             _swActive = true;
-            ov.style.transition = 'none'; // live-track finger — no easing during drag
+            _swMoving = false;
         }, { passive: true });
-        ov.addEventListener('touchmove', (e) => {
+        _npArt.addEventListener('touchmove', (e) => {
             if (!_swActive) return;
             const dy = Math.max(0, e.touches[0].clientY - _swStartY);
+            if (!_swMoving) {
+                if (dy < 12) return;
+                _swMoving = true;
+            }
             ov.style.transform = `translateY(${dy}px)`;
         }, { passive: true });
-        ov.addEventListener('touchend', (e) => {
+        _npArt.addEventListener('touchend', (e) => {
             if (!_swActive) return;
             _swActive = false;
-            ov.style.transition = ''; // restore CSS transition
+            if (!_swMoving) return;
             const dy = e.changedTouches[0].clientY - _swStartY;
             if (dy > 100) {
                 _minimizeNowPlaying();
             } else {
-                ov.style.transform = ''; // spring back to translateY(0)
+                // Snap back to position via WAAPI
+                const curDy = Math.max(0, dy);
+                ov.style.transform = '';
+                ov.animate([
+                    { transform: `translateY(${curDy}px)` },
+                    { transform: 'translateY(0)' }
+                ], { duration: 200, easing: 'ease-out' });
             }
         }, { passive: true });
 
@@ -4928,12 +6235,12 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         _syncNpRepeat();
         _syncNpShuffle();
 
-        // Add to playlist
+        // Add to playlist — use live _playing
         ov.querySelector('#rm-np-addpl').onclick = () => {
-            if (typeof _showAddToPlaylistModal === 'function') _showAddToPlaylistModal(item);
+            if (typeof _showAddToPlaylistModal === 'function' && _playing) _showAddToPlaylistModal(_playing);
         };
 
-        // Lyrics toggle
+        // Lyrics toggle — always uses live _playing, not stale closure item
         ov.querySelector('#rm-np-lyrics').onclick = async () => {
             const lyrBtn = ov.querySelector('#rm-np-lyrics');
             const panel = ov.querySelector('#rm-np-lyrics-panel');
@@ -4950,8 +6257,11 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             panel.classList.add('rm-lyrics-visible');
             panel.innerHTML = '<div class="rm-lyrics-loading"><i class="fas fa-spinner fa-spin"></i> ' + t('Szukam tekstu...') + '</div>';
 
+            const curItem = _playing;
+            if (!curItem) { panel.innerHTML = '<div class="rm-lyrics-empty"><i class="fas fa-music"></i> ' + t('Nic nie gra') + '</div>'; return; }
+
             // Parse artist/title from name — YouTube titles are often "Artist - Title (Official Video)"
-            let rawName = item.name || '';
+            let rawName = curItem.name || '';
             // Strip common YouTube suffixes
             let cleanName = rawName.replace(/\s*[\(\[](official\s*(video|audio|music\s*video|lyric\s*video|visualizer)|lyrics?|teledysk|audio|video|clip|hd|hq|4k|remastered|live)[\)\]]/gi, '').trim();
 
@@ -4963,16 +6273,27 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 title = parts.slice(1).join(' - ').trim();
             }
             // If no artist from name, try meta (YouTube channel)
-            if (!artist && item.meta) artist = item.meta;
+            if (!artist && curItem.meta) artist = curItem.meta;
 
             // Try search with parsed artist+title first
             let data = await api('/radio-music/lyrics?title=' + encodeURIComponent(title) + '&artist=' + encodeURIComponent(artist));
+            // Bail if track changed during fetch
+            if (_playing !== curItem) return;
             // Fallback: try with just the clean name if not found
             if (!data.lyrics && title !== cleanName) {
                 data = await api('/radio-music/lyrics?title=' + encodeURIComponent(cleanName) + '&artist=');
+                if (_playing !== curItem) return;
             }
             if (data.lyrics) {
-                panel.textContent = data.lyrics;
+                _stopLyricsSync();
+                const parsed = _parseLrc(data.syncedLyrics || '');
+                if (parsed) {
+                    _syncedLyrics = parsed;
+                    _renderSyncedLyrics(panel, parsed);
+                    _startLyricsSync(panel);
+                } else {
+                    panel.textContent = data.lyrics;
+                }
             } else {
                 panel.innerHTML = '<div class="rm-lyrics-empty"><i class="fas fa-music"></i> ' + t('Nie znaleziono tekstu') + '</div>';
             }
@@ -4993,6 +6314,7 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 const meta = tr.meta || tr.channel || '';
                 const art = tr.image || tr.thumbnail || tr.favicon || '';
                 html += '<div class="rm-np-q-item' + (isCurrent ? ' rm-q-current' : '') + '" data-idx="' + idx + '">'
+                    + '<span class="rm-np-q-item-drag"><i class="fas fa-grip-vertical"></i></span>'
                     + '<span class="rm-np-q-item-idx">' + (isCurrent ? '<i class="fas fa-volume-up"></i>' : (idx + 1)) + '</span>'
                     + (art ? '<img class="rm-np-q-item-art" src="' + escH(art) + '" onerror="this.style.display=\'none\'">' : '')
                     + '<div class="rm-np-q-item-info"><div class="rm-np-q-item-title">' + escH(name) + '</div>'
@@ -5036,9 +6358,96 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             queuePanel.classList.add('rm-np-queue-visible');
             _renderNpQueue();
         };
+        _setupQueueDnD(queuePanel);
 
-        // Lock screen — blocks all touches until swipe-up unlock
-        ov.querySelector('#rm-np-lock').onclick = () => _showLockScreen();
+        // Similar artists panel (lazy-loaded from Deezer)
+        const simBtn = ov.querySelector('#rm-np-similar-btn');
+        const simPanel = ov.querySelector('#rm-np-similar-panel');
+        let _simLoaded = false;
+        let _simArtist = '';
+        let _simArtists = []; // cached list for queuing
+        function _loadSimilarArtists() {
+            const artist = (item.meta || item.artist || '').trim();
+            if (!artist) {
+                simPanel.innerHTML = '';
+                return;
+            }
+            if (_simLoaded && _simArtist === artist) return;
+            _simLoaded = true;
+            _simArtist = artist;
+            simPanel.innerHTML = '<div class="rm-np-similar-loading"><i class="fas fa-spinner fa-spin"></i> ' + t('Szukam podobnych...') + '</div>';
+            api('/radio-music/similar-artists?artist=' + encodeURIComponent(artist)).then(data => {
+                if (!data || !data.artists || !data.artists.length) {
+                    simPanel.innerHTML = '';
+                    return;
+                }
+                _simArtists = data.artists;
+                let html = '<div class="rm-np-similar-header"><i class="fas fa-users"></i> ' + t('Podobni do') + ' ' + escH(artist) + '</div>';
+                html += '<div class="rm-np-similar-scroll">';
+                data.artists.forEach((a, idx) => {
+                    const fans = a.nb_fan ? (a.nb_fan > 1000000 ? (a.nb_fan / 1000000).toFixed(1) + 'M' : a.nb_fan > 1000 ? Math.round(a.nb_fan / 1000) + 'K' : a.nb_fan) : '';
+                    const pic = a.picture_medium || a.picture || '';
+                    html += '<div class="rm-np-similar-card" data-name="' + escH(a.name) + '" data-idx="' + idx + '">'
+                        + (pic ? '<img src="' + escH(pic) + '" loading="lazy" onerror="this.style.display=\'none\'">' : '<div style="width:80px;height:80px;border-radius:50%;background:rgba(255,255,255,.06);display:flex;align-items:center;justify-content:center;font-size:28px;color:rgba(255,255,255,.15)"><i class="fas fa-user"></i></div>')
+                        + '<span class="rm-nps-name">' + escH(a.name) + '</span>'
+                        + (fans ? '<span class="rm-nps-fans"><i class="fas fa-heart" style="font-size:8px;margin-right:2px"></i>' + fans + '</span>' : '')
+                        + '</div>';
+                });
+                html += '</div>';
+                simPanel.innerHTML = html;
+                simPanel.querySelectorAll('.rm-np-similar-card').forEach(card => {
+                    card.onclick = async () => {
+                        const name = card.dataset.name;
+                        const clickedIdx = parseInt(card.dataset.idx, 10);
+                        if (!name) return;
+                        card.style.opacity = '.5';
+                        // Search for the clicked artist's music
+                        const data = await api('/radio-music/music/search?q=' + encodeURIComponent(name) + '&limit=5');
+                        if (!data || !data.items || !data.items.length) {
+                            card.style.opacity = '1';
+                            return;
+                        }
+                        // Play the first track
+                        const first = data.items[0];
+                        _musicQueue = data.items.map(tr => ({
+                            id: tr.id, name: tr.title, url: tr.url, type: 'music',
+                            meta: tr.channel, image: tr.thumbnail,
+                            duration: tr.duration, source: tr.source || 'youtube',
+                        }));
+                        _musicQueueIdx = 0;
+                        // Also queue tracks from remaining similar artists (background)
+                        const remaining = _simArtists.filter((_, i) => i !== clickedIdx).slice(0, 6);
+                        _queueSimilarArtists(remaining);
+                        playAudio(_musicQueue[0]);
+                    };
+                });
+            });
+        }
+        // Lazy queue: fetch one track per remaining similar artist and append to queue
+        async function _queueSimilarArtists(artists) {
+            for (const a of artists) {
+                try {
+                    const d = await api('/radio-music/music/search?q=' + encodeURIComponent(a.name) + '&limit=2');
+                    if (d && d.items && d.items.length) {
+                        const tr = d.items[0];
+                        _musicQueue.push({
+                            id: tr.id, name: tr.title, url: tr.url, type: 'music',
+                            meta: tr.channel, image: tr.thumbnail,
+                            duration: tr.duration, source: tr.source || 'youtube',
+                        });
+                        if (_renderNpQueueFn) _renderNpQueueFn();
+                    }
+                } catch (_) {}
+            }
+        }
+        // Auto-load on open (for music/podcast tracks that have an artist)
+        if (item.meta || item.artist) _loadSimilarArtists();
+        // Expose for track-change refresh
+        _npReloadSimilar = () => {
+            _simLoaded = false;
+            item = _playing; // update closure ref to new track
+            _loadSimilarArtists();
+        };
 
         // Cast button in NP overlay
         const npCastBtn = ov.querySelector('#rm-np-cast');
@@ -5071,36 +6480,32 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             document.addEventListener('touchend', () => { _npSeekDragging = false; }, { passive: true });
         }
 
-        // Insert overlay — start off-screen (translateY 100%), animate in via rAF double-tick
+        // Insert overlay — element at final position immediately (for hit-testing),
+        // visual entrance via WAAPI so buttons are responsive from the start
         const wrap = bodyEl.querySelector('.rm-wrap');
-        ov.classList.add('rm-np-minimized'); // start hidden
         if (wrap) wrap.appendChild(ov);
         _npOverlay = ov;
 
-        // FLIP shared-element transition: album art flies from mini-player up to full overlay
+        // WAAPI slide-up + optional FLIP art transition
         const miniArt = bodyEl.querySelector('#rm-player-art');
         const fullArt = ov.querySelector('#rm-np-art');
+        ov.animate([
+            { transform: 'translateY(100%)', opacity: 0 },
+            { transform: 'translateY(0)', opacity: 1 }
+        ], { duration: 380, easing: 'cubic-bezier(0.32,0.72,0,1)' });
         if (miniArt && fullArt) {
-            const from = miniArt.getBoundingClientRect();
             requestAnimationFrame(() => {
-                ov.classList.remove('rm-np-minimized');
-                requestAnimationFrame(() => {
-                    const to = fullArt.getBoundingClientRect();
-                    const dx = from.left - to.left;
-                    const dy = from.top - to.top;
-                    const sx = from.width / to.width;
-                    const sy = from.height / to.height;
-                    fullArt.animate([
-                        { transform: `translate(${dx}px,${dy}px) scale(${sx},${sy})`, opacity: 0.7 },
-                        { transform: 'translate(0,0) scale(1)', opacity: 1 }
-                    ], { duration: 340, easing: 'cubic-bezier(0.4,0,0.2,1)', fill: 'none' });
-                });
+                const from = miniArt.getBoundingClientRect();
+                const to = fullArt.getBoundingClientRect();
+                const dx = from.left - to.left;
+                const dy = from.top - to.top;
+                const sx = from.width / to.width;
+                const sy = from.height / to.height;
+                fullArt.animate([
+                    { transform: `translate(${dx}px,${dy}px) scale(${sx},${sy})`, opacity: 0.7 },
+                    { transform: 'translate(0,0) scale(1)', opacity: 1 }
+                ], { duration: 340, easing: 'cubic-bezier(0.4,0,0.2,1)' });
             });
-        } else {
-            // Two rAF frames needed: first triggers layout, second removes class so transition fires
-            requestAnimationFrame(() => requestAnimationFrame(() => {
-                ov.classList.remove('rm-np-minimized');
-            }));
         }
 
         // Expose _renderNpQueue so the store subscriber can refresh it on Next/Prev
@@ -5130,32 +6535,72 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             _npOverlay = null;
         }
         _renderNpQueueFn = null;
+        _npSyncFav = null;
+        _npSyncDownload = null;
+        _npReloadSimilar = null;
         localStorage.removeItem('rm_np_open');
     }
 
-    // Minimize overlay to mini player (CSS slide-down, DOM kept alive)
+    // Minimize overlay to mini player (WAAPI slide-down, DOM kept alive)
     function _minimizeNowPlaying() {
         if (!_npOverlay || _npMinimizing) return;
+        _npMinimizing = true;
         _stopVisualizer();
-        _npOverlay.style.transition = '';
+        const curTransform = _npOverlay.style.transform || 'translateY(0)';
         _npOverlay.style.transform = '';
-        _npOverlay.classList.add('rm-np-minimized');
+        _npOverlay.animate([
+            { transform: curTransform, opacity: 1 },
+            { transform: 'translateY(100%)', opacity: 0 }
+        ], { duration: 300, easing: 'cubic-bezier(0.4, 0, 1, 1)' }).onfinish = () => {
+            _npOverlay.classList.add('rm-np-minimized');
+            _npMinimizing = false;
+        };
         localStorage.removeItem('rm_np_open');
         if (history.state?.rmNpOpen) history.back();
     }
 
-    // Android back button handler — intercepts popstate to minimize overlay
+    // Android back button handler — intercepts popstate to minimize overlay,
+    // navigate between sections, and prevent exiting the app
     function _onPopState() {
         if (_npMinimizing) return;
+
+        // 1. NP overlay open → minimize it
         if (_npOverlay && !_npOverlay.classList.contains('rm-np-minimized')) {
             _npMinimizing = true;
             _stopVisualizer();
-            _npOverlay.style.transition = '';
             _npOverlay.style.transform = '';
-            _npOverlay.classList.add('rm-np-minimized');
+            _npOverlay.animate([
+                { transform: 'translateY(0)', opacity: 1 },
+                { transform: 'translateY(100%)', opacity: 0 }
+            ], { duration: 300, easing: 'cubic-bezier(0.4, 0, 1, 1)' }).onfinish = () => {
+                _npOverlay.classList.add('rm-np-minimized');
+                _npMinimizing = false;
+            };
             localStorage.removeItem('rm_np_open');
-            setTimeout(() => { _npMinimizing = false; }, 500);
+            // Re-push sentinel so next back press is also caught
+            if (!history.state?.rmApp) history.pushState({ rmApp: true }, '');
+            return;
         }
+
+        // 2. "More" sheet open → close it
+        if (bodyEl) {
+            const sheet = bodyEl.querySelector('#rm-more-sheet');
+            if (sheet && sheet.classList.contains('open')) {
+                sheet.classList.remove('open');
+                if (!history.state?.rmApp) history.pushState({ rmApp: true }, '');
+                return;
+            }
+        }
+
+        // 3. Not on home section → go back to home
+        if (activeSection !== 'most-played') {
+            _navTo('most-played');
+            if (!history.state?.rmApp) history.pushState({ rmApp: true }, '');
+            return;
+        }
+
+        // 4. Already on home → re-push sentinel to prevent app exit
+        if (!history.state?.rmApp) history.pushState({ rmApp: true }, '');
     }
 
     function _startVisualizer(canvas) {
