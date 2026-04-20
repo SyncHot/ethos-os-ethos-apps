@@ -950,6 +950,67 @@ def create_vm():
     return jsonify({'status': 'ok', 'id': vm_id, 'name': name, 'message': msg})
 
 
+def _mark_image_installed(disk_file):
+    """Mount a qcow2 disk image and prepare it for direct boot.
+
+    Builder images boot into ethos-preboot.service (the disk installer)
+    by default.  For quick-created VMs the system is already on disk,
+    so the preboot must be skipped.  This function:
+    1. Creates /opt/ethos/.installed — tells systemd's
+       ConditionPathExists to NOT start preboot.
+    2. Enables ethos.service — so the main app starts on boot.
+    3. Disables ethos-preboot.service — belt-and-suspenders.
+    """
+    nbd_dev = '/dev/nbd0'
+    mnt = '/tmp/_vm_mark_installed'
+    try:
+        host_run('modprobe nbd max_part=8', timeout=10)
+        r = host_run(f'qemu-nbd --connect={nbd_dev} {q(disk_file)}', timeout=15)
+        if r.returncode != 0:
+            log.warning('Cannot attach nbd for .installed marker: %s', r.stderr)
+            return
+        import time as _time
+        _time.sleep(1)  # let kernel discover partitions
+        # Root is partition 2 in standard EthOS layout (1=ESP, 2=root)
+        root_part = f'{nbd_dev}p2'
+        os.makedirs(mnt, exist_ok=True)
+        r = host_run(f'mount {root_part} {mnt}', timeout=15)
+        if r.returncode != 0:
+            log.warning('Cannot mount root partition for .installed marker: %s', r.stderr)
+            return
+        # 1. Create .installed marker
+        marker = os.path.join(mnt, 'opt/ethos/.installed')
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, 'w') as f:
+            f.write('installed\n')
+        # 2. Enable ethos.service, disable preboot via systemd symlinks
+        systemd_dir = os.path.join(mnt, 'etc/systemd/system')
+        wants_dir = os.path.join(systemd_dir, 'multi-user.target.wants')
+        os.makedirs(wants_dir, exist_ok=True)
+        ethos_link = os.path.join(wants_dir, 'ethos.service')
+        preboot_link = os.path.join(wants_dir, 'ethos-preboot.service')
+        if not os.path.exists(ethos_link):
+            try:
+                os.symlink('/etc/systemd/system/ethos.service', ethos_link)
+            except OSError:
+                pass
+        if os.path.islink(preboot_link):
+            try:
+                os.remove(preboot_link)
+            except OSError:
+                pass
+        log.info('Marked image as installed and enabled ethos.service')
+    except Exception as e:
+        log.warning('Failed to mark image as installed: %s', e)
+    finally:
+        host_run(f'umount {mnt} 2>/dev/null', timeout=10)
+        host_run(f'qemu-nbd --disconnect {nbd_dev} 2>/dev/null', timeout=10)
+        try:
+            os.rmdir(mnt)
+        except OSError:
+            pass
+
+
 @vm_bp.route('/quick-create-ethos', methods=['POST'])
 @admin_required
 @_require_qemu
@@ -1027,10 +1088,35 @@ def quick_create_ethos():
     os.makedirs(vm_path, exist_ok=True)
 
     disk_file = os.path.join(vm_path, f'disk0.{disk_format}')
+
+    # Convert the builder image directly to qcow2 as the boot disk.
+    # Builder .img files are complete bootable system images — converting them
+    # gives a ready-to-boot VM.  Creating an empty disk + boot_image is wrong
+    # because the auto-eject on stop clears boot_image, leaving empty disks.
+    img_ext = os.path.splitext(boot_image)[1].lower()
+    is_raw_image = img_ext in ('.img', '.raw')
+
     try:
-        r = host_run(f'qemu-img create -f {disk_format} "{disk_file}" {disk_size}', timeout=60)
-        if r.returncode != 0:
-            return jsonify({'error': f'Disk creation error: {r.stderr}'}), 500
+        if is_raw_image:
+            r = host_run(
+                f'qemu-img convert -O {disk_format} "{boot_image}" "{disk_file}"',
+                timeout=600,
+            )
+            if r.returncode != 0:
+                return jsonify({'error': f'Image conversion error: {r.stderr}'}), 500
+            # Resize to target size if larger than the source image
+            r2 = host_run(f'qemu-img resize "{disk_file}" {disk_size}', timeout=60)
+            if r2.returncode != 0:
+                log.warning('Resize after convert failed: %s', r2.stderr)
+            # Create .installed marker so preboot installer is skipped.
+            # Builder images boot into ethos-preboot.service by default;
+            # for quick-created VMs the system is already installed.
+            _mark_image_installed(disk_file)
+        else:
+            # ISO or other format — create empty disk, attach image as boot media
+            r = host_run(f'qemu-img create -f {disk_format} "{disk_file}" {disk_size}', timeout=60)
+            if r.returncode != 0:
+                return jsonify({'error': f'Disk creation error: {r.stderr}'}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
@@ -1049,7 +1135,7 @@ def quick_create_ethos():
             'bus': disk_bus,
         }],
         'os_type': os_type,
-        'boot_image': boot_image,
+        'boot_image': '' if is_raw_image else boot_image,
         'description': f'Quick-created EthOS VM (image: {os.path.basename(boot_image)})',
         'network': network,
         'created': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -1866,19 +1952,23 @@ def stop_vm(vm_id):
     _destroy_tap(info.get('tap_dev'))
     _running_vms.pop(vm_id, None)
 
-    # Auto-eject ISO after stop — installation is assumed complete.
-    # This ensures next boot goes to disk instead of re-booting the ISO.
+    # Auto-eject boot media after stop — installation is assumed complete.
+    # This ensures next boot goes to disk instead of re-booting the installer.
     # Also reset NVRAM so stale CD-ROM boot entries are cleared.
     vms = _load_vms()
     vm_def = vms.get(vm_id, {})
     boot_img = vm_def.get('boot_image', '')
-    if boot_img and os.path.splitext(boot_img)[1].lower() in ('.iso',):
+    eject_exts = ('.iso', '.img', '.raw', '.qcow2', '.vdi', '.vmdk')
+    if boot_img and os.path.splitext(boot_img)[1].lower() in eject_exts:
         vm_def['boot_image'] = ''
         vm_vars = os.path.join(_vm_dir(vm_id), 'OVMF_VARS.fd')
-        if os.path.exists(vm_vars):
-            os.remove(vm_vars)
+        try:
+            if os.path.exists(vm_vars):
+                os.remove(vm_vars)
+        except OSError as e:
+            log.warning('Failed to reset NVRAM for VM %s: %s', vm_id, e)
         _save_vms(vms)
-        log.info('Auto-ejected ISO from VM %s and reset NVRAM', vm_id)
+        log.info('Auto-ejected boot media from VM %s and reset NVRAM', vm_id)
 
     return jsonify({'status': 'ok'})
 
