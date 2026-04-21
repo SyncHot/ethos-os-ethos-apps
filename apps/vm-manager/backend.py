@@ -25,6 +25,7 @@ Endpoints:
   POST   /api/vm/quick-create-ethos                      — quick-create EthOS VM
   POST   /api/vm/import-disk                             — import disk image
   POST   /api/vm/convert                                 — convert disk format
+  GET    /api/vm/machines/<id>/installer-logs            — proxy installer logs from running VM
 """
 
 import os
@@ -36,12 +37,13 @@ import subprocess
 import sys
 import time
 import threading
+import urllib.request
 from functools import wraps
 from flask import Blueprint, request, jsonify, send_from_directory, abort
 from blueprints.admin_required import admin_required
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from host import host_run, check_dep, ensure_dep, get_data_disk as _get_data_disk, app_path as _app_path
+from host import host_run, check_dep, ensure_dep, get_data_disk as _get_data_disk, app_path as _app_path, q
 from utils import register_pkg_routes, require_tools, check_tool
 
 vm_bp = Blueprint('vm_mgr', __name__, url_prefix='/api/vm')
@@ -971,6 +973,15 @@ def _mark_image_installed(disk_file):
             return
         import time as _time
         _time.sleep(1)  # let kernel discover partitions
+        # Repair backup GPT header — qemu-img resize extends the disk but
+        # leaves the backup GPT at the old end-of-disk position.  sgdisk -e
+        # moves it to the actual end so OVMF and GRUB see a clean GPT.
+        gpt_fix = host_run(f'sgdisk -e {nbd_dev} 2>/dev/null', timeout=15)
+        if gpt_fix.returncode == 0:
+            log.info('Relocated backup GPT to end of resized disk')
+            _time.sleep(0.5)  # let nbd settle after GPT write
+        else:
+            log.warning('sgdisk -e failed (non-fatal): %s', gpt_fix.stderr)
         # Root is partition 2 in standard EthOS layout (1=ESP, 2=root)
         root_part = f'{nbd_dev}p2'
         os.makedirs(mnt, exist_ok=True)
@@ -999,6 +1010,20 @@ def _mark_image_installed(disk_file):
                 os.remove(preboot_link)
             except OSError:
                 pass
+        # 3. Create installer_result.json so the setup wizard skips the
+        #    installer step (OS is already on disk — no need to repartition)
+        import time as _time2
+        result_file = os.path.join(mnt, 'opt/ethos/data/installer_result.json')
+        os.makedirs(os.path.dirname(result_file), exist_ok=True)
+        with open(result_file, 'w') as f:
+            json.dump({
+                'version': 2,
+                'timestamp': _time2.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                'strategy': 'usb',
+                'system_device': '',
+                'data_devices': [],
+                'encrypt': False,
+            }, f, indent=2)
         log.info('Marked image as installed and enabled ethos.service')
     except Exception as e:
         log.warning('Failed to mark image as installed: %s', e)
@@ -1089,36 +1114,31 @@ def quick_create_ethos():
 
     disk_file = os.path.join(vm_path, f'disk0.{disk_format}')
 
-    # Convert the builder image directly to qcow2 as the boot disk.
-    # Builder .img files are complete bootable system images — converting them
-    # gives a ready-to-boot VM.  Creating an empty disk + boot_image is wrong
-    # because the auto-eject on stop clears boot_image, leaving empty disks.
+    # For EthOS builder images (.img/.raw): convert the image to qcow2 and
+    # mark it as installed so it boots directly into the EthOS setup wizard
+    # (skipping the preboot disk installer which is meant for real hardware).
     img_ext = os.path.splitext(boot_image)[1].lower()
     is_raw_image = img_ext in ('.img', '.raw')
 
     try:
         if is_raw_image:
-            r = host_run(
-                f'qemu-img convert -O {disk_format} "{boot_image}" "{disk_file}"',
-                timeout=600,
-            )
-            if r.returncode != 0:
-                return jsonify({'error': f'Image conversion error: {r.stderr}'}), 500
-            # Resize to target size if larger than the source image
-            r2 = host_run(f'qemu-img resize "{disk_file}" {disk_size}', timeout=60)
-            if r2.returncode != 0:
-                log.warning('Resize after convert failed: %s', r2.stderr)
-            # Create .installed marker so preboot installer is skipped.
-            # Builder images boot into ethos-preboot.service by default;
-            # for quick-created VMs the system is already installed.
-            _mark_image_installed(disk_file)
+            src_fmt = 'raw'
+            r = host_run(f'qemu-img convert -f {src_fmt} -O {disk_format} {q(boot_image)} {q(disk_file)}', timeout=300)
         else:
-            # ISO or other format — create empty disk, attach image as boot media
-            r = host_run(f'qemu-img create -f {disk_format} "{disk_file}" {disk_size}', timeout=60)
-            if r.returncode != 0:
-                return jsonify({'error': f'Disk creation error: {r.stderr}'}), 500
+            src_fmt = img_ext.lstrip('.')
+            r = host_run(f'qemu-img convert -f {src_fmt} -O {disk_format} {q(boot_image)} {q(disk_file)}', timeout=300)
+        if r.returncode != 0:
+            return jsonify({'error': f'Disk conversion error: {r.stderr}'}), 500
+        # Resize to target size if the converted image is smaller
+        r2 = host_run(f'qemu-img resize {q(disk_file)} {disk_size}', timeout=60)
+        if r2.returncode != 0:
+            log.warning('Could not resize disk to %s: %s', disk_size, r2.stderr)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+    # Mark image as installed so the VM boots into ethos.service (setup wizard)
+    # instead of ethos-preboot.service (disk installer for real hardware).
+    _mark_image_installed(disk_file)
 
     vms[vm_id] = {
         'name': name,
@@ -1135,7 +1155,7 @@ def quick_create_ethos():
             'bus': disk_bus,
         }],
         'os_type': os_type,
-        'boot_image': '' if is_raw_image else boot_image,
+        'boot_image': '',
         'description': f'Quick-created EthOS VM (image: {os.path.basename(boot_image)})',
         'network': network,
         'created': time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -1761,7 +1781,7 @@ def start_vm(vm_id):
                 # Boot image as primary drive (bootindex=0) — acts like a USB installer
                 # snapshot=on: temp CoW overlay so guest can write without modifying the original
                 cmd += ['-drive', f'file={boot_image},format={img_fmt},if=none,id=bootimg,snapshot=on']
-                cmd += ['-device', 'virtio-blk-pci,drive=bootimg,bootindex=0']
+                cmd += ['-device', f'virtio-blk-pci,drive=bootimg,bootindex=0']
 
         # Disks — loop over all VM disks
         disks = vm.get('disks', [])
@@ -1959,6 +1979,7 @@ def stop_vm(vm_id):
     vm_def = vms.get(vm_id, {})
     boot_img = vm_def.get('boot_image', '')
     eject_exts = ('.iso', '.img', '.raw', '.qcow2', '.vdi', '.vmdk')
+
     if boot_img and os.path.splitext(boot_img)[1].lower() in eject_exts:
         vm_def['boot_image'] = ''
         vm_vars = os.path.join(_vm_dir(vm_id), 'OVMF_VARS.fd')
@@ -2604,6 +2625,55 @@ def delete_snapshot(vm_id, tag):
         if r.returncode == 0:
             return jsonify({'ok': True})
         return jsonify({'error': r.stderr}), 500
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+
+# ═══════════════════════════════════════════════════════════
+#  INSTALLER LOGS PROXY
+# ═══════════════════════════════════════════════════════════
+
+@vm_bp.route('/machines/<vm_id>/installer-logs')
+@admin_required
+def get_installer_logs(vm_id):
+    """Proxy installer log entries from a running VM's installer service.
+
+    The EthOS installer inside the VM exposes GET /api/install/logs?since=N
+    on port 9000 (the 'EthOS Web' port forward).  This endpoint fetches those
+    logs from the host-side forwarded port so that Copilot and other tools
+    can access them without needing a direct connection to the VM.
+
+    Query params:
+      since (int, default 0) — return only entries after this index
+    """
+    vms = _load_vms()
+    vm = vms.get(vm_id)
+    if not vm:
+        return jsonify({'error': 'VM not found'}), 404
+
+    if not _check_vm_process(vm_id):
+        return jsonify({'error': 'VM is not running'}), 409
+
+    # Find the host port mapped to guest port 9000 (EthOS Web / installer)
+    network = vm.get('network') or {}
+    host_port = None
+    for pf in network.get('port_forwards', []):
+        if int(pf.get('guest', 0)) == 9000 and pf.get('host'):
+            host_port = int(pf['host'])
+            break
+
+    if not host_port:
+        return jsonify({'error': 'No port forward found for guest port 9000'}), 404
+
+    since = request.args.get('since', 0, type=int)
+    url = f'http://127.0.0.1:{host_port}/api/install/logs?since={since}'
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        return jsonify(data)
+    except urllib.error.URLError as e:
+        return jsonify({'error': f'Cannot reach installer at port {host_port}: {e.reason}'}), 502
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 

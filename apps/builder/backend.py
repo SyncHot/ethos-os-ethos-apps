@@ -28,26 +28,25 @@ Endpoints:
   GET  /api/builder/manifest              -> verify & return manifest JSON
   POST /api/builder/beacon                -> receive "I AM ALIVE" from a freshly booted EthOS VM (no auth)
   GET  /api/builder/beacon                -> return last received beacon info
+  POST /api/builder/resume-image          -> resume an interrupted image build (SSE)
 """
 
 import json
 import logging
 import os
 import re
-import subprocess
 import threading
 import time
-import traceback
 import sys
-from datetime import date, datetime
+from datetime import date
 from flask import Blueprint, jsonify, request, Response, stream_with_context
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from host import host_run as _host_run_base, host_run_stream as _host_run_stream_base, \
     app_path, data_path, log_path, q as _q
 from utils import load_json as _load_json, save_json as _save_json, fmt_bytes, register_pkg_routes, \
-    require_tools, check_tool
-from blueprints.builder_spec import load_spec, save_spec, generate_default_spec, \
+    require_tools
+from blueprints.builder_spec import load_spec, save_spec, \
     spec_to_shell_vars, DEFAULT_SPEC
 from blueprints.admin_required import admin_required
 
@@ -839,7 +838,6 @@ def resume_image():
     if not _build_state.get('resume_available'):
         return jsonify({'error': 'No resumable build found.'}), 400
     build_dir = _build_state.get('build_dir', '/tmp/ethos-x86-build-web')
-    import os
     ckpt_dir = os.path.join(build_dir, '.ckpts')
     if not os.path.isdir(ckpt_dir):
         return jsonify({'error': f'Build directory not found: {build_dir}'}), 400
@@ -1746,6 +1744,7 @@ set default=0
 insmod part_gpt
 insmod ext2
 insmod gzio
+insmod search_fs_uuid
 menuentry "EthOS v${{VERSION}}" {{
     search --no-floppy --fs-uuid --set=root ${{ROOT_UUID}}
     linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro quiet loglevel=3 rd.systemd.show_status=auto vt.global_cursor_default=0 splash net.ifnames=0 biosdevname=0 fsck.repair=preen console=tty0 console=ttyS0,115200n8
@@ -1881,6 +1880,7 @@ set default=0
 insmod part_gpt
 insmod ext2
 insmod gzio
+insmod search_fs_uuid
 menuentry "EthOS v${{VERSION}}" {{
     search --no-floppy --fs-uuid --set=root ${{ROOT_UUID}}
     linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro quiet loglevel=3 rd.systemd.show_status=auto vt.global_cursor_default=0 splash net.ifnames=0 biosdevname=0 fsck.repair=preen console=tty0 console=ttyS0,115200n8
@@ -2127,6 +2127,7 @@ set default=0
 insmod part_gpt
 insmod ext2
 insmod gzio
+insmod search_fs_uuid
 menuentry "EthOS v${{VERSION}}" {{
     search --no-floppy --fs-uuid --set=root ${{ROOT_UUID}}
     linux ${{KERN}} root=UUID=${{ROOT_UUID}} ro quiet loglevel=3 rd.systemd.show_status=auto vt.global_cursor_default=0 splash net.ifnames=0 biosdevname=0 fsck.repair=preen console=tty0 console=ttyS0,115200n8
@@ -2242,8 +2243,6 @@ echo "LOG:Files copied — $(du -sh "$ETHOS_DIR" | awk '{{print $1}}')"
 
 # ── Python venv + environment file ──
 echo "LOG:Creating Python venv..."
-# Install build deps needed by some pip packages (pyudev needs libudev-dev)
-chroot "$ROOT" apt-get install -y -qq libudev-dev libffi-dev 2>&1 | tail -3 || echo "LOG:build deps issue"
 chroot "$ROOT" python3 -m venv /opt/ethos/venv 2>&1 | tail -3 || echo "LOG:venv creation issue"
 echo "LOG:pip install requirements..."
 chroot "$ROOT" /opt/ethos/venv/bin/pip install --no-cache-dir -r /opt/ethos/backend/requirements.txt 2>&1 | tail -15 || echo "LOG:pip install issue"
@@ -2255,12 +2254,14 @@ echo "LOG:Caching pip wheels for offline firstboot..."
 PIP_CACHE="$ETHOS_DIR/.pip-cache"
 mkdir -p "$PIP_CACHE"
 chroot "$ROOT" /opt/ethos/venv/bin/pip download -d /opt/ethos/.pip-cache -r /opt/ethos/backend/requirements.txt 2>&1 | tail -5 || echo "LOG:WARNING: pip wheel cache failed"
+# Pre-build wheel for GPUtil (ships only as sdist — build it now so offline firstboot can install it)
+# setuptools is needed for the build; install it temporarily then remove.
+echo "LOG:Pre-building wheels for sdist-only packages..."
+chroot "$ROOT" /opt/ethos/venv/bin/pip install --no-cache-dir setuptools 2>&1 | tail -2 || true
+chroot "$ROOT" /opt/ethos/venv/bin/pip wheel --no-deps --no-build-isolation \
+    -w /opt/ethos/.pip-cache GPUtil==1.4.0 2>&1 | tail -3 || echo "LOG:WARNING: GPUtil wheel build failed (non-fatal)"
 WHEEL_COUNT=$(ls "$PIP_CACHE"/*.whl 2>/dev/null | wc -l)
 echo "LOG:Cached $WHEEL_COUNT wheel files ($(du -sh "$PIP_CACHE" 2>/dev/null | awk '{{print $1}}'))"
-
-# Remove build deps no longer needed (saves ~50MB)
-chroot "$ROOT" apt-get remove -y --purge libudev-dev libffi-dev 2>&1 | tail -3 || true
-chroot "$ROOT" apt-get autoremove -y -qq 2>&1 | tail -3 || true
 
 cat > "$ETHOS_DIR/ethos.env" <<ENVFILE
 NAS_NAME=EthOS
@@ -2505,8 +2506,8 @@ USERPROFILE
 chown $(chroot "$ROOT" id -u $DEFAULT_USER):$(chroot "$ROOT" id -g $DEFAULT_USER) "$ROOT/home/$DEFAULT_USER/.bash_profile"
 
 # ── Pre-install console info screen service (activated after setup) ──
-cp "$ETHOS_DIR/tools/ethos-console.sh"      "$ROOT/opt/ethos/tools/ethos-console.sh"
-cp "$ETHOS_DIR/tools/ethos-console@.service" "$ROOT/etc/systemd/system/ethos-console@.service"
+cp "$NASOS/tools/ethos-console.sh"       "$ROOT/opt/ethos/tools/ethos-console.sh"
+cp "$NASOS/tools/ethos-console@.service" "$ROOT/etc/systemd/system/ethos-console@.service"
 chmod 755 "$ROOT/opt/ethos/tools/ethos-console.sh"
 
 echo "STEP:85:EthOS injected"
@@ -3669,7 +3670,7 @@ def _builder_on_uninstall(wipe):
                 'message': '', 'logs': [], 'pid': 0, 'result': None,
             })
             _save_build_state()
-    log.info('[builder] Processes stopped (uninstall, wipe=%s)', wipe)
+    _logger.info('[builder] Processes stopped (uninstall, wipe=%s)', wipe)
 
 
 register_pkg_routes(
