@@ -3429,24 +3429,28 @@ def github_release():
                 json.dump(ver_data, f, indent=2, ensure_ascii=False)
             _emit_log(f'Zapisano version.json v{new_ver}')
 
-            # 2. Git commit
+            # 2. Git commit (with Co-authored-by trailer)
             r = _host_run(f'{git} add -A', timeout=15)
             if r.returncode != 0:
                 raise RuntimeError(f'git add failed: {r.stderr}')
-            r = _host_run(f'{git} commit -m {_q(f"release: v{new_ver} — {title}")}', timeout=15)
+            commit_msg = _q(f'release: v{new_ver} — {title}\n\nCo-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>')
+            r = _host_run(f'{git} commit -m {commit_msg}', timeout=15)
             if r.returncode != 0 and 'nothing to commit' not in (r.stdout + r.stderr):
                 raise RuntimeError(f'git commit failed: {r.stderr}')
             _emit_log(f'git commit: release: v{new_ver}')
 
-            # 3. Tag + push
+            # 3. Tag + push via HTTPS (ethos service runs as root — no SSH key for GitHub)
             r = _host_run(f'{git} tag {_q(f"v{new_ver}")}', timeout=10)
             if r.returncode != 0 and 'already exists' not in r.stderr:
                 raise RuntimeError(f'git tag failed: {r.stderr}')
+            push_url = _q(f'https://x-access-token:{token}@github.com/{release_repo}.git')
+            r = _host_run(f'{git} rev-parse --abbrev-ref HEAD', timeout=5)
+            branch = r.stdout.strip() or 'main'
             _emit_log('git push…')
-            r = _host_run(f'{git} push origin HEAD', timeout=60)
+            r = _host_run(f'{git} push {push_url} HEAD:refs/heads/{_q(branch)}', timeout=60)
             if r.returncode != 0:
                 raise RuntimeError(f'git push failed: {r.stderr}')
-            r = _host_run(f'{git} push origin {_q(f"v{new_ver}")}', timeout=30)
+            r = _host_run(f'{git} push {push_url} {_q(f"v{new_ver}")}', timeout=30)
             if r.returncode != 0:
                 raise RuntimeError(f'git push tag failed: {r.stderr}')
             _emit_log('Push OK')
@@ -3504,9 +3508,11 @@ def github_release():
 
         except _ue.HTTPError as e:
             body = e.read().decode()[:300]
+            _logger.error('[github_release] HTTPError %s: %s', e.code, body)
             _emit_log(f'GitHub API error {e.code}: {body}', error=True)
             _emit_done(False, error=f'GitHub API {e.code}: {body}')
         except Exception as ex:
+            _logger.exception('[github_release] %s', ex)
             _emit_log(f'Błąd: {ex}', error=True)
             _emit_done(False, error=str(ex))
 

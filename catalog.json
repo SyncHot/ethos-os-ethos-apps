@@ -215,7 +215,7 @@
         {
             "id": "builder",
             "name": "Builder",
-            "version": "1.0.18",
+            "version": "1.0.19",
             "icon": "fa-hammer",
             "color": "#f97316",
             "category": "System",
