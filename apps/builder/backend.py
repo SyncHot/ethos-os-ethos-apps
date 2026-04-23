@@ -1578,6 +1578,7 @@ mkdir -p "$ROOT/etc/ssh/sshd_config.d"
 cat > "$ROOT/etc/ssh/sshd_config.d/ethos-hardening.conf" <<'SSHH'
 # EthOS SSH Hardening
 PermitRootLogin no
+PasswordAuthentication yes
 MaxAuthTries 3
 LoginGraceTime 30
 X11Forwarding no
@@ -1586,12 +1587,23 @@ SSHH
 
 # Gate SSH login until the default password is changed via the Web UI.
 # ForceCommand runs check_password_changed.sh which blocks or exec's the shell.
+# During installer mode (.installed absent) the script allows access for debugging.
 cat >> "$ROOT/etc/ssh/sshd_config" <<'SSHGATE'
 
 # EthOS: block SSH until default password changed via Web UI
 Match User *
     ForceCommand /opt/ethos/tools/check_password_changed.sh
 SSHGATE
+
+# ── SSH host key regeneration drop-in ──
+# Host keys are wiped at dist-sec time so each deployed system gets unique keys.
+# This drop-in ensures sshd generates any missing keys before starting —
+# without it the ssh.service ControlProcess (sshd -t) can fail on first boot.
+mkdir -p "$ROOT/etc/systemd/system/ssh.service.d"
+cat > "$ROOT/etc/systemd/system/ssh.service.d/ethos-keygen.conf" <<'SSHKEYGEN'
+[Service]
+ExecStartPre=/usr/bin/ssh-keygen -A 2>/dev/null
+SSHKEYGEN
 
 # ── Force password change on first boot ──
 rm -f "$ROOT/opt/ethos/.password_changed"
@@ -2050,7 +2062,7 @@ fi
 
 echo "ethos-overlay: mounting overlay lowerdir=/run/ethos-sqsh upperdir=$UPPER workdir=$WORK"
 if ! mount -t overlay overlay \
-    -o "lowerdir=/run/ethos-sqsh,upperdir=$UPPER,workdir=$WORK" \
+    -o "lowerdir=/run/ethos-sqsh,upperdir=$UPPER,workdir=$WORK,index=off,nfs_export=off" \
     "${{rootmnt}}"; then
     echo "ethos-overlay: FAILED to mount overlay — falling back to raw root"
     umount /run/ethos-sqsh 2>/dev/null
@@ -2424,12 +2436,14 @@ mkdir -p "$ROOT/etc/systemd/system/multi-user.target.wants"
 chroot "$ROOT" systemctl set-default multi-user.target 2>/dev/null || true
 
 # ── ethos.service (pre-create — firstboot.sh enables + starts it after stopping preboot) ──
-# NOTE: Do NOT add After=ethos-firstboot.service — it causes deadlock!
-# (firstboot is Type=oneshot and calls systemctl restart ethos from within itself)
+# After=ethos-firstboot.service: prevents race where ethos starts before firstboot
+# creates the venv (which would cause repeated failures + systemd start-rate lock).
+# firstboot uses --no-block so it exits immediately after queuing the start —
+# no deadlock.
 cat > "$ROOT/etc/systemd/system/ethos.service" <<SVCETHOS
 [Unit]
 Description=EthOS NAS
-After=network.target local-fs.target
+After=network.target local-fs.target ethos-firstboot.service
 Wants=network.target
 Conflicts=ethos-preboot.service
 RequiresMountsFor=/mnt/data
@@ -2583,7 +2597,11 @@ if command -v mksquashfs >/dev/null 2>&1; then
         -e "$ROOT/lost+found" \
         -e "$ROOT/swapfile" \
         -e "$ROOT/var/swap" \
-        -e "$ROOT/opt/ethos/installer/images" \
+        -e "$ROOT/opt/ethos/installer/images/ethos-x86.img" \
+        -e "$ROOT/opt/ethos/installer/images/ethos-root.sqsh" \
+        -e "$ROOT/opt/ethos/installer/images/ethos-root.sqsh.verity" \
+        -e "$ROOT/opt/ethos/installer/images/ethos-root.sqsh.roothash" \
+        -e "$ROOT/opt/ethos/installer/images/ethos-manifest.json" \
         2>&1 | tail -10
 
     SQSH_SIZE=$(stat -c%s "$SQSH_OUT" 2>/dev/null || echo 0)
@@ -2926,6 +2944,7 @@ losetup -d "$LOOP_DEV" 2>/dev/null || true
 LOOP_DEV=""
 
 # Move image from tmpfs to persistent storage
+mkdir -p "$(dirname "$FINAL_IMG")"
 if [ "$USE_TMPFS" -eq 1 ] && [ -f "$OUTPUT_IMG" ]; then
     echo "LOG:Copying image from RAM to disk ($FINAL_IMG)..."
     cp "$OUTPUT_IMG" "$FINAL_IMG"
