@@ -52,6 +52,13 @@ from blueprints.admin_required import admin_required
 
 builder_bp = Blueprint('builder', __name__, url_prefix='/api/builder')
 
+_socketio = None
+
+
+def init_builder(socketio):
+    global _socketio
+    _socketio = socketio
+
 # ── Logging ──
 LOG_DIR = log_path()
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -3328,6 +3335,7 @@ def get_publish_config():
         'repo': cfg.get('repo', _PUBLISH_REPO_DEFAULT),
         'token': masked,
         'has_token': bool(token),
+        'release_repo': cfg.get('release_repo', ''),
     })
 
 
@@ -3343,8 +3351,167 @@ def set_publish_config():
     repo = data.get('repo', '').strip()
     if repo:
         cfg['repo'] = repo
+    release_repo = data.get('release_repo', '').strip()
+    if release_repo:
+        cfg['release_repo'] = release_repo
 
     _save_publish_config(cfg)
+    return jsonify({'ok': True})
+
+
+@builder_bp.route('/github-release', methods=['POST'])
+def github_release():
+    """Commit, push and create a GitHub Release with update package.
+    Uses token from publish-config (same PAT). Streams via SocketIO."""
+    import urllib.request as _ur
+    import urllib.error as _ue
+    import tarfile as _tar
+
+    data = request.json or {}
+    bump = data.get('bump', 'patch')
+    title = data.get('title', '').strip()
+    changes = data.get('changes', [])
+    if not title:
+        return jsonify({'error': 'Tytuł zmiany jest wymagany'}), 400
+
+    cfg = _load_publish_config()
+    token = cfg.get('token', '').strip()
+    release_repo = cfg.get('release_repo', '').strip()
+    if not token:
+        return jsonify({'error': 'GitHub Token nie skonfigurowany (tab Publikuj apki)'}), 400
+    if not release_repo:
+        return jsonify({'error': 'Release repo nie skonfigurowane (tab Publikuj apki → Repozytorium release)'}), 400
+
+    def _emit_log(msg, error=False):
+        if _socketio:
+            _socketio.emit('builder_gh_log', {'message': msg, 'error': error})
+
+    def _emit_done(ok, **kw):
+        if _socketio:
+            _socketio.emit('builder_gh_done', {'ok': ok, **kw})
+
+    def _run():
+        import re as _re
+        nasos = _get_host_nasos_dir()
+        git = f'git -C {_q(nasos)}'
+
+        try:
+            _emit_log('── GitHub Release ──')
+
+            # 1. Read + bump version.json
+            ver_file = os.path.join(nasos, 'backend', 'version.json')
+            with open(ver_file) as f:
+                ver_data = json.load(f)
+            current = ver_data.get('version', '0.0.0')
+            parts = current.split('.')
+            maj, mi, pat = int(parts[0]), int(parts[1]), int(parts[2]) if len(parts) > 2 else 0
+            if bump == 'major':
+                new_ver = f'{maj+1}.0.0'
+            elif bump == 'minor':
+                new_ver = f'{maj}.{mi+1}.0'
+            else:
+                new_ver = f'{maj}.{mi}.{pat+1}'
+            _emit_log(f'Wersja: {current} → {new_ver}')
+
+            ver_data['version'] = new_ver
+            ver_data['build_date'] = str(date.today())
+            cl = ver_data.get('changelog', [])
+            if not isinstance(cl, list):
+                cl = []
+            cl.insert(0, {
+                'version': new_ver,
+                'date': ver_data['build_date'],
+                'title': title,
+                'changes': changes if changes else [title],
+            })
+            ver_data['changelog'] = cl
+            with open(ver_file, 'w') as f:
+                json.dump(ver_data, f, indent=2, ensure_ascii=False)
+            _emit_log(f'Zapisano version.json v{new_ver}')
+
+            # 2. Git commit
+            r = _host_run(f'{git} add -A', timeout=15)
+            if r.returncode != 0:
+                raise RuntimeError(f'git add failed: {r.stderr}')
+            r = _host_run(f'{git} commit -m {_q(f"release: v{new_ver} — {title}")}', timeout=15)
+            if r.returncode != 0 and 'nothing to commit' not in (r.stdout + r.stderr):
+                raise RuntimeError(f'git commit failed: {r.stderr}')
+            _emit_log(f'git commit: release: v{new_ver}')
+
+            # 3. Tag + push
+            r = _host_run(f'{git} tag {_q(f"v{new_ver}")}', timeout=10)
+            if r.returncode != 0 and 'already exists' not in r.stderr:
+                raise RuntimeError(f'git tag failed: {r.stderr}')
+            _emit_log('git push…')
+            r = _host_run(f'{git} push origin HEAD', timeout=60)
+            if r.returncode != 0:
+                raise RuntimeError(f'git push failed: {r.stderr}')
+            r = _host_run(f'{git} push origin {_q(f"v{new_ver}")}', timeout=30)
+            if r.returncode != 0:
+                raise RuntimeError(f'git push tag failed: {r.stderr}')
+            _emit_log('Push OK')
+
+            # 4. Build .tar.gz
+            _emit_log('Budowanie paczki .tar.gz…')
+            pkg_dir = data_path('updates')
+            os.makedirs(pkg_dir, exist_ok=True)
+            pkg_name = f'ethos-{new_ver}'
+            pkg_filename = f'{pkg_name}.tar.gz'
+            pkg_path = os.path.join(pkg_dir, pkg_filename)
+            with _tar.open(pkg_path, 'w:gz') as tar:
+                for subdir in ['backend', 'frontend']:
+                    src = os.path.join(nasos, subdir)
+                    if os.path.exists(src):
+                        tar.add(src, arcname=f'{pkg_name}/{subdir}')
+            size = os.path.getsize(pkg_path)
+            _emit_log(f'Paczka: {pkg_filename} ({size // 1024} KB)')
+
+            # 5. Create GitHub Release
+            _emit_log('Tworzenie GitHub Release…')
+            body_text = '\n'.join(f'- {c}' for c in (changes if changes else [title]))
+            status, release = _github_api('POST', f'/repos/{release_repo}/releases', token, {
+                'tag_name': f'v{new_ver}',
+                'name': f'v{new_ver} — {title}',
+                'body': body_text,
+                'draft': False,
+                'prerelease': False,
+            })
+            if status not in (200, 201):
+                raise RuntimeError(f'GitHub API {status}: {release}')
+            release_id = release['id']
+            upload_url = _re.sub(r'\{.*\}', '', release.get('upload_url', ''))
+            _emit_log(f'Release #{release_id} utworzony')
+
+            # 6. Upload asset
+            _emit_log(f'Upload {pkg_filename}…')
+            with open(pkg_path, 'rb') as f:
+                asset_data = f.read()
+            upload_req = _ur.Request(
+                f'{upload_url}?name={pkg_filename}',
+                data=asset_data,
+                headers={
+                    'Authorization': f'token {token}',
+                    'Content-Type': 'application/octet-stream',
+                    'User-Agent': 'EthOS-Builder/1.0',
+                },
+                method='POST',
+            )
+            with _ur.urlopen(upload_req, timeout=120) as resp:
+                asset = json.loads(resp.read().decode())
+            _emit_log(f'Asset: {asset.get("browser_download_url", "")}')
+            _emit_log(f'✓ GitHub Release v{new_ver} gotowy!')
+            _emit_done(True, version=new_ver, url=release.get('html_url', ''))
+
+        except _ue.HTTPError as e:
+            body = e.read().decode()[:300]
+            _emit_log(f'GitHub API error {e.code}: {body}', error=True)
+            _emit_done(False, error=f'GitHub API {e.code}: {body}')
+        except Exception as ex:
+            _emit_log(f'Błąd: {ex}', error=True)
+            _emit_done(False, error=str(ex))
+
+    import gevent
+    gevent.spawn(_run)
     return jsonify({'ok': True})
 
 

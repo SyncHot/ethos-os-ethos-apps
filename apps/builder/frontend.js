@@ -195,13 +195,121 @@ function renderBuilderApp(body) {
                 <div class="bl-toggle-log" id="bl-toggle-log">${t('Pokaż logi ▼')}</div>
             </div>
             <div class="bl-log" id="bl-log"></div>
-            <div class="bl-result" id="bl-result"></div>`;
+            <div class="bl-result" id="bl-result"></div>
+
+            <div class="bl-section" style="margin-top:16px">
+                <div class="bl-section-title"><i class="fab fa-github"></i> GitHub Release</div>
+                <div style="color:var(--text-secondary);font-size:12px;margin-bottom:12px;line-height:1.5">
+                    ${t('Commit, push i GitHub Release z paczką .tar.gz do auto-update. Używa tokena z zakładki Publikuj apki.')}
+                </div>
+                <div class="bl-row">
+                    <label>${t('Release repo:')}</label>
+                    <input class="bl-input" id="bl-gh-repo" placeholder="user/repo" style="max-width:280px">
+                    <button class="bl-btn bl-btn-sm bl-btn-outline" id="bl-gh-save-repo"><i class="fas fa-save"></i></button>
+                </div>
+                <div style="text-align:right;margin-top:6px">
+                    <button class="bl-btn bl-btn-green" id="bl-gh-release-btn"><i class="fab fa-github"></i> Commit, Push & Release</button>
+                </div>
+                <div class="bl-progress-wrap" id="bl-gh-progress" style="margin-top:12px">
+                    <div class="bl-progress-detail" id="bl-gh-log-detail" style="font-size:12px;color:var(--text-secondary)"></div>
+                </div>
+                <div class="bl-result" id="bl-gh-result" style="display:none"></div>
+            </div>`;
 
         blBody.querySelector('#bl-release-btn').onclick = startRelease;
         blBody.querySelector('#bl-toggle-log').onclick = () => {
             const log = blBody.querySelector('#bl-log');
             log.classList.toggle('visible');
         };
+
+        // Load release repo config
+        (async () => {
+            try {
+                const cfg = await api('/builder/publish-config');
+                const repoEl = blBody.querySelector('#bl-gh-repo');
+                if (repoEl && cfg.release_repo) repoEl.value = cfg.release_repo;
+            } catch {}
+        })();
+
+        blBody.querySelector('#bl-gh-save-repo').onclick = async () => {
+            const repo = blBody.querySelector('#bl-gh-repo').value.trim();
+            if (!repo) { toast(t('Podaj repo (user/repo)'), 'warning'); return; }
+            try {
+                await api('/builder/publish-config', { method: 'PUT', body: { release_repo: repo } });
+                toast(t('Zapisano'), 'success');
+            } catch (e) { toast(e.message || t('Błąd'), 'error'); }
+        };
+
+        blBody.querySelector('#bl-gh-release-btn').onclick = startGitHubRelease;
+
+        // SocketIO handlers for GitHub Release progress
+        let _ghSioLog, _ghSioDone;
+        _ghSioLog = (d) => {
+            const el = blBody.querySelector('#bl-gh-log-detail');
+            if (!el) return;
+            const color = d.error ? '#ef4444' : 'var(--text-secondary)';
+            el.innerHTML += `<div style="color:${color}">${d.message}</div>`;
+            el.scrollTop = el.scrollHeight;
+        };
+        _ghSioDone = (d) => {
+            NAS.socket.off('builder_gh_log', _ghSioLog);
+            NAS.socket.off('builder_gh_done', _ghSioDone);
+            const resultEl = blBody.querySelector('#bl-gh-result');
+            if (!resultEl) return;
+            resultEl.style.display = '';
+            if (d.ok) {
+                resultEl.innerHTML = `<div class="bl-result-icon" style="color:#10b981"><i class="fas fa-check-circle"></i></div>
+                    <div style="font-weight:600;color:#10b981">GitHub Release v${d.version} gotowy!</div>
+                    ${d.url ? `<div style="margin-top:6px"><a href="${d.url}" target="_blank" style="color:var(--accent)">${d.url}</a></div>` : ''}`;
+                toast(`GitHub Release v${d.version} opublikowany!`, 'success');
+                loadInfo();
+            } else {
+                resultEl.innerHTML = `<div class="bl-result-icon" style="color:#ef4444"><i class="fas fa-times-circle"></i></div>
+                    <div style="font-weight:600;color:#ef4444">${t('Błąd')}</div>
+                    <div style="font-size:12px;color:var(--text-muted);margin-top:4px">${d.error || ''}</div>`;
+                toast(t('GitHub Release nie powiódł się'), 'error');
+            }
+            state.building = false;
+            setDisabled(false);
+        };
+
+        async function startGitHubRelease() {
+            if (state.building) return;
+            const bump = blBody.querySelector('#bl-bump').value || 'patch';
+            const title = blBody.querySelector('#bl-cl-title').value.trim();
+            const changesRaw = blBody.querySelector('#bl-cl-changes').value.trim();
+            const changes = changesRaw ? changesRaw.split('\n').map(l => l.trim()).filter(Boolean) : [];
+            if (!title) { toast(t('Podaj tytuł zmian'), 'warning'); return; }
+
+            state.building = true;
+            setDisabled(true);
+            const logDetail = blBody.querySelector('#bl-gh-log-detail');
+            const resultEl = blBody.querySelector('#bl-gh-result');
+            const progress = blBody.querySelector('#bl-gh-progress');
+            logDetail.innerHTML = '';
+            resultEl.style.display = 'none';
+            progress.classList.add('active');
+
+            NAS.socket.on('builder_gh_log', _ghSioLog);
+            NAS.socket.on('builder_gh_done', _ghSioDone);
+
+            try {
+                const res = await api('/builder/github-release', { method: 'POST', body: { bump, title, changes } });
+                if (res.error) {
+                    NAS.socket.off('builder_gh_log', _ghSioLog);
+                    NAS.socket.off('builder_gh_done', _ghSioDone);
+                    toast(res.error, 'error');
+                    state.building = false;
+                    setDisabled(false);
+                }
+            } catch (e) {
+                NAS.socket.off('builder_gh_log', _ghSioLog);
+                NAS.socket.off('builder_gh_done', _ghSioDone);
+                toast(e.message || t('Błąd'), 'error');
+                state.building = false;
+                setDisabled(false);
+            }
+        }
     }
 
     function bumpVersion(v, type) {
@@ -297,6 +405,10 @@ function renderBuilderApp(body) {
                     <label>Repozytorium:</label>
                     <input class="bl-input" id="bl-pub-repo" value="SyncHot/ethos-os-ethos-apps" style="max-width:320px" readonly>
                 </div>
+                <div class="bl-row">
+                    <label>Release repo:</label>
+                    <input class="bl-input" id="bl-pub-release-repo" placeholder="np. SyncHot/ethos" style="max-width:320px">
+                </div>
             </div>
             <div class="bl-section" id="bl-pub-diff-section">
                 <div class="bl-section-title">
@@ -331,6 +443,8 @@ function renderBuilderApp(body) {
                 const cfg = await api('/builder/publish-config');
                 if (cfg.has_token) tokenEl.value = cfg.token;
                 if (cfg.repo) repoEl.value = cfg.repo;
+                const releaseRepoEl = blBody.querySelector('#bl-pub-release-repo');
+                if (releaseRepoEl && cfg.release_repo) releaseRepoEl.value = cfg.release_repo;
             } catch {}
             loadPublishDiff();
         })();
@@ -345,7 +459,11 @@ function renderBuilderApp(body) {
             try {
                 await api('/builder/publish-config', {
                     method: 'PUT',
-                    body: { token, repo: repoEl.value.trim() },
+                    body: {
+                        token,
+                        repo: repoEl.value.trim(),
+                        release_repo: (blBody.querySelector('#bl-pub-release-repo')?.value || '').trim(),
+                    },
                 });
                 toast(t('Token zapisany'), 'success');
                 loadPublishDiff();
