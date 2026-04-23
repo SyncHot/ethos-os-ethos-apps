@@ -462,13 +462,21 @@ function renderDockerManager(body) {
         main.innerHTML = `
             <div class="dkr-toolbar">
                 <span class="dkr-toolbar-title"><i class="fas fa-layer-group"></i> Projekty Docker Compose</span>
+                <span class="dkr-compose-dir-label" id="dkr-compose-dir-label" title="${t('Katalog projektów')}"></span>
                 <input class="dkr-filter" id="dkr-proj-filter" placeholder="Filtruj...">
-                <button class="dkr-btn primary" id="dkr-proj-create"><i class="fas fa-plus"></i> Nowy projekt</button>
+                ${isAdmin ? `<button class="dkr-btn primary" id="dkr-proj-create"><i class="fas fa-plus"></i> Nowy projekt</button>` : ''}
+                ${isAdmin ? `<button class="dkr-btn" id="dkr-proj-dir-btn" title="${t('Zmień katalog projektów')}"><i class="fas fa-folder-open"></i></button>` : ''}
                 <button class="dkr-btn" id="dkr-proj-refresh"><i class="fas fa-sync-alt"></i></button>
             </div>
             <div class="dkr-projects" id="dkr-projects"><div class="dkr-loading"><i class="fas fa-spinner fa-spin"></i></div></div>
         `;
         const wrap = main.querySelector('#dkr-projects');
+
+        // Load and display the current compose dir
+        api('/docker/settings').then(s => {
+            const lbl = main.querySelector('#dkr-compose-dir-label');
+            if (lbl && s?.effective_compose_dir) lbl.textContent = s.effective_compose_dir;
+        }).catch(() => {});
 
         // Infinite scroll
         let ticking = false;
@@ -488,13 +496,64 @@ function renderDockerManager(body) {
         });
 
         main.querySelector('#dkr-proj-refresh').addEventListener('click', async () => { await loadProjects(); fillProjects(); });
-        main.querySelector('#dkr-proj-create').addEventListener('click', () => openCreateProjectModal());
+        if (isAdmin) {
+            main.querySelector('#dkr-proj-create').addEventListener('click', () => openCreateProjectModal());
+            main.querySelector('#dkr-proj-dir-btn').addEventListener('click', () => openComposeDirModal());
+        }
         main.querySelector('#dkr-proj-filter').addEventListener('input', e => {
             S.projLimit = 10;
             if (wrap) wrap.scrollTop = 0;
             fillProjects();
         });
         loadProjects().then(() => fillProjects());
+
+        async function openComposeDirModal() {
+            const settings = await api('/docker/settings').catch(() => ({}));
+            const currentDir = settings?.compose_dir || '';
+            const defaultDir = settings?.default_compose_dir || '';
+            const overlay = document.createElement('div');
+            overlay.className = 'dkr-modal-overlay';
+            overlay.innerHTML = `
+                <div class="dkr-modal" style="max-width:520px">
+                    <div class="dkr-modal-header">
+                        <span><i class="fas fa-folder-open"></i> ${t('Katalog projektów Docker Compose')}</span>
+                        <button class="dkr-modal-close" id="dkr-dir-close"><i class="fas fa-times"></i></button>
+                    </div>
+                    <div class="dkr-modal-body" style="padding:18px 20px">
+                        <p class="dkr-muted" style="margin:0 0 12px">${t('Wskaż katalog, w którym przechowywane są projekty Docker Compose. Każdy podkatalog z plikiem docker-compose.yaml staje się projektem.')}</p>
+                        <label class="app-form-label">${t('Ścieżka katalogu')}</label>
+                        <input class="app-input" id="dkr-dir-input" type="text" value="${esc(currentDir)}" placeholder="${esc(defaultDir)}" style="width:100%;box-sizing:border-box">
+                        <p class="dkr-muted" style="margin:8px 0 0;font-size:12px">${t('Domyślny')}: <code>${esc(defaultDir)}</code></p>
+                        <p class="dkr-muted" style="margin:4px 0 0;font-size:12px">${t('Zostaw puste, aby użyć domyślnego katalogu.')}</p>
+                    </div>
+                    <div class="dkr-modal-footer">
+                        <button class="dkr-btn" id="dkr-dir-cancel">${t('Anuluj')}</button>
+                        <button class="dkr-btn" id="dkr-dir-reset" style="margin-right:auto">${t('Przywróć domyślny')}</button>
+                        <button class="dkr-btn primary" id="dkr-dir-save"><i class="fas fa-save"></i> ${t('Zapisz')}</button>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(overlay);
+            const close = () => overlay.remove();
+            overlay.querySelector('#dkr-dir-close').addEventListener('click', close);
+            overlay.querySelector('#dkr-dir-cancel').addEventListener('click', close);
+            overlay.querySelector('#dkr-dir-reset').addEventListener('click', () => {
+                overlay.querySelector('#dkr-dir-input').value = '';
+            });
+            overlay.querySelector('#dkr-dir-save').addEventListener('click', async () => {
+                const val = overlay.querySelector('#dkr-dir-input').value.trim();
+                try {
+                    const r = await api('/docker/settings', { method: 'POST', body: { compose_dir: val } });
+                    if (r?.error) { toast(r.error, 'error'); return; }
+                    toast(t('Zapisano katalog projektów'), 'success');
+                    const lbl = main.querySelector('#dkr-compose-dir-label');
+                    if (lbl && r?.effective_compose_dir) lbl.textContent = r.effective_compose_dir;
+                    close();
+                    await loadProjects();
+                    fillProjects();
+                } catch { toast(t('Błąd zapisu ustawień'), 'error'); }
+            });
+        }
 
         function fillProjects() {
             const wrap = main.querySelector('#dkr-projects');

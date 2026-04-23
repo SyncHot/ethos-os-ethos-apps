@@ -8,6 +8,10 @@ Backup & Restore endpoints:
   POST   /api/docker/backups                   — create backup (bg, SocketIO: docker_backup)
   DELETE /api/docker/backups/<id>              — delete backup
   POST   /api/docker/backups/<id>/restore      — restore from backup (bg, SocketIO: docker_restore)
+
+Settings endpoints:
+  GET    /api/docker/settings                  — get current settings (compose_dir)
+  POST   /api/docker/settings                  — save settings (compose_dir)
 """
 
 import os
@@ -21,9 +25,10 @@ from flask import Blueprint, request, jsonify, g
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from host import host_run as _host_run_base, host_path, NATIVE_MODE, check_dep, ensure_dep, \
-    get_data_disk as _get_data_disk
+    get_data_disk as _get_data_disk, data_path as _data_path
 from utils import docker_available as _docker_available_util, run_host, \
-    find_compose_projects as _find_compose_projects_util, register_pkg_routes, get_ethos_user
+    find_compose_projects as _find_compose_projects_util, register_pkg_routes, get_ethos_user, \
+    load_json as _load_json, save_json as _save_json
 from audit import audit_log
 
 # Import sandbox policy helper — used to apply resource limits to containers
@@ -35,7 +40,7 @@ except ImportError:
 
 docker_bp = Blueprint('docker_mgr', __name__, url_prefix='/api/docker')
 
-# Fallback defaults when no data disk is configured
+# Default when no path is explicitly configured
 _DEFAULT_COMPOSE_ROOT = f'/home/{get_ethos_user()}/docker'
 
 # Projects that cannot be stopped/deleted via the UI (self-protection)
@@ -43,13 +48,23 @@ _PROTECTED_PROJECTS = {'nasos'}
 _SANDBOX_OVERRIDE_FILENAME = 'docker-compose.ethos-sandbox.yml'
 _DEFAULT_COMPOSE_OVERRIDES = ('docker-compose.override.yml', 'docker-compose.override.yaml')
 
-# Where compose projects live
+_CONFIG_FILE = _data_path('docker_manager.json')
+
+
+def _load_settings():
+    return _load_json(_CONFIG_FILE, {})
+
+
+def _save_settings(cfg):
+    _save_json(_CONFIG_FILE, cfg)
+
+
 def _compose_root():
-    dd = _get_data_disk()
-    if dd:
-        p = os.path.join(dd, 'apps', 'compose')
-        os.makedirs(p, mode=0o755, exist_ok=True)
-        return p
+    """Return compose projects directory — always from settings, never auto-detected."""
+    cfg = _load_settings()
+    custom = cfg.get('compose_dir', '').strip()
+    if custom and os.path.isabs(custom):
+        return custom
     return _DEFAULT_COMPOSE_ROOT
 
 
@@ -533,6 +548,72 @@ def _policy_to_service_limits(policy):
     return service_config
 
 
+def _detect_legacy_mem_limit_services(project_path, main_filename):
+    """Return set of service names that use the legacy top-level mem_limit key."""
+    result = set()
+    main_path = os.path.join(project_path, main_filename)
+    try:
+        import yaml  # type: ignore
+        with open(main_path) as f:
+            data = yaml.safe_load(f)
+        for svc_name, svc_cfg in (data or {}).get('services', {}).items():
+            if isinstance(svc_cfg, dict) and 'mem_limit' in svc_cfg:
+                result.add(svc_name)
+    except Exception:
+        pass
+    return result
+
+
+def _policy_to_legacy_limits(policy):
+    """Translate sandbox policy into legacy top-level service keys.
+
+    Used instead of _policy_to_service_limits when the compose file already
+    uses the legacy ``mem_limit`` key so that ``deploy.resources.limits`` is
+    not mixed in — Docker Compose rejects that combination.
+    """
+    cfg: dict = {}
+
+    mem_limit = str(policy.get('mem_limit', '')).strip()
+    if mem_limit and mem_limit != '0':
+        cfg['mem_limit'] = mem_limit
+
+    mem_reservation = str(policy.get('mem_reservation', '')).strip()
+    if mem_reservation and mem_reservation != '0':
+        cfg['mem_reservation'] = mem_reservation
+
+    cpu_quota = policy.get('cpu_quota', 0)
+    try:
+        cpu_quota = float(cpu_quota)
+    except (TypeError, ValueError):
+        cpu_quota = 0
+    if cpu_quota > 0:
+        cfg['cpus'] = round(cpu_quota / 100.0, 3)
+
+    pids_limit = policy.get('pids_limit', 0)
+    try:
+        pids_limit = int(pids_limit)
+    except (TypeError, ValueError):
+        pids_limit = 0
+    if pids_limit > 0:
+        cfg['pids_limit'] = pids_limit
+
+    if policy.get('read_only_root'):
+        cfg['read_only'] = True
+
+    if policy.get('no_new_privileges'):
+        cfg['security_opt'] = ['no-new-privileges:true']
+
+    cap_drop = policy.get('cap_drop') or []
+    if cap_drop:
+        cfg['cap_drop'] = cap_drop
+
+    cap_add = policy.get('cap_add') or []
+    if cap_add:
+        cfg['cap_add'] = cap_add
+
+    return cfg
+
+
 def _ensure_sandbox_override(project_name, project_path, main_filename):
     """Create/update sandbox override compose file with enforced limits."""
     policy = _get_sandbox_policy(project_name) or {}
@@ -547,7 +628,19 @@ def _ensure_sandbox_override(project_name, project_path, main_filename):
     if not limits:
         return None, None
 
-    override = {'version': '3', 'services': {svc: dict(limits) for svc in services}}
+    # Services using legacy mem_limit must not get any deploy.resources.limits
+    # block — Docker Compose rejects the combination even when only cpus/pids
+    # are in deploy.resources.limits (it internally maps mem_limit to
+    # deploy.resources.limits.memory, causing a "distinct values" conflict).
+    # Use legacy top-level keys (cpus, mem_limit, pids_limit …) for those.
+    legacy_mem_svcs = _detect_legacy_mem_limit_services(project_path, main_filename)
+    legacy_limits = _policy_to_legacy_limits(policy) if legacy_mem_svcs else {}
+
+    override_services = {}
+    for svc in services:
+        override_services[svc] = dict(legacy_limits if svc in legacy_mem_svcs else limits)
+
+    override = {'version': '3', 'services': override_services}
     override_path = os.path.join(project_path, _SANDBOX_OVERRIDE_FILENAME)
 
     try:
@@ -953,6 +1046,43 @@ def docker_system_info():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+# ═══════════════════════════════════════════════════════════
+#  SETTINGS
+# ═══════════════════════════════════════════════════════════
+
+@docker_bp.route('/settings')
+def get_settings():
+    """Return current docker manager settings."""
+    cfg = _load_settings()
+    return jsonify({
+        'compose_dir': cfg.get('compose_dir', ''),
+        'default_compose_dir': _DEFAULT_COMPOSE_ROOT,
+        'effective_compose_dir': _compose_root(),
+    })
+
+
+@docker_bp.route('/settings', methods=['POST'])
+@_require_docker
+def save_settings():
+    """Save docker manager settings. Admin only."""
+    if getattr(g, 'role', None) != 'admin':
+        return jsonify({'error': 'Permission denied — admin role required'}), 403
+    data = request.get_json(force=True) if request.data else {}
+    compose_dir = data.get('compose_dir', '').strip()
+    if compose_dir and not os.path.isabs(compose_dir):
+        return jsonify({'error': 'compose_dir must be an absolute path'}), 400
+    if compose_dir and not os.path.isdir(compose_dir):
+        return jsonify({'error': f'Directory does not exist: {compose_dir}'}), 400
+    cfg = _load_settings()
+    if compose_dir:
+        cfg['compose_dir'] = compose_dir
+    else:
+        cfg.pop('compose_dir', None)
+    _save_settings(cfg)
+    audit_log('docker_settings_saved', {'compose_dir': compose_dir or '(default)'})
+    return jsonify({'ok': True, 'effective_compose_dir': _compose_root()})
 
 
 # ═══════════════════════════════════════════════════════════

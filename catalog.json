@@ -120,7 +120,7 @@
         {
             "id": "docker-manager",
             "name": "Docker Manager",
-            "version": "1.0.7",
+            "version": "1.0.8",
             "icon": "fa-cubes",
             "color": "#2496ed",
             "category": "System",
