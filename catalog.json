@@ -135,7 +135,7 @@
         {
             "id": "vm-manager",
             "name": "VM Manager",
-            "version": "1.0.10",
+            "version": "1.0.11",
             "icon": "fa-desktop",
             "color": "#8b5cf6",
             "category": "System",
@@ -215,7 +215,7 @@
         {
             "id": "builder",
             "name": "Builder",
-            "version": "1.0.19",
+            "version": "1.0.20",
             "icon": "fa-hammer",
             "color": "#f97316",
             "category": "System",
@@ -651,7 +651,7 @@
         {
             "id": "video-station",
             "name": "Video Station",
-            "version": "0.0.9",
+            "version": "0.0.10",
             "icon": "fa-film",
             "color": "#7c3aed",
             "category": "Media",

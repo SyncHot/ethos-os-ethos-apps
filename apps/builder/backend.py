@@ -1867,13 +1867,22 @@ echo "LOG:Disk usage before kernel/firmware update:"
 df -h "$ROOT" 2>/dev/null | tail -1 || true
 
 if [ "$BASE_DISTRO" = "ubuntu" ]; then
-    echo "LOG:Ubuntu: upgrading kernel and linux-firmware if newer available..."
-    chroot "$ROOT" apt-get install -y -qq --only-upgrade linux-image-generic linux-firmware 2>&1 | tail -5 || echo "LOG:Kernel/firmware upgrade skipped"
+    echo "LOG:Ubuntu: installing HWE kernel (linux-image-generic-hwe-24.04) for latest hardware support..."
+    chroot "$ROOT" apt-get install -y -qq linux-image-generic-hwe-24.04 linux-headers-generic-hwe-24.04 linux-firmware 2>&1 | tail -5 || echo "LOG:HWE kernel install skipped"
 else
     echo "LOG:Installing linux-image-amd64 from backports..."
     chroot "$ROOT" apt-get install -y -qq -t ${{DEBIAN_RELEASE}}-backports linux-image-amd64 2>&1 | tail -5 || echo "LOG:Backports kernel skipped"
 fi
 
+# Remove non-HWE generic kernel if HWE was installed (to save ~200MB and avoid dual initramfs)
+if [ "$BASE_DISTRO" = "ubuntu" ]; then
+    NON_HWE=$(chroot "$ROOT" dpkg -l 'linux-image-[0-9]*' 2>/dev/null | awk '/^ii/{{print $2}}' | grep -v hwe | head -1 || true)
+    if [[ -n "$NON_HWE" ]]; then
+        echo "LOG:Removing non-HWE kernel package $NON_HWE..."
+        chroot "$ROOT" apt-get remove -y --purge "$NON_HWE" linux-image-generic linux-headers-generic 2>&1 | tail -3 || true
+        echo "LOG:Non-HWE kernel removed"
+    fi
+fi
 # Remove OLD kernel to save ~200MB and avoid initramfs for 2 kernels
 OLD_KERN=$(ls "$ROOT/boot/vmlinuz-"* 2>/dev/null | sort -V | head -1 | sed 's|.*/vmlinuz-||')
 NEW_KERN=$(ls "$ROOT/boot/vmlinuz-"* 2>/dev/null | sort -V | tail -1 | sed 's|.*/vmlinuz-||')
@@ -1929,7 +1938,8 @@ done
 echo "LOG:GRUB refreshed for latest kernel"
 
 if [ "$BASE_DISTRO" = "ubuntu" ]; then
-    echo "LOG:Ubuntu: linux-firmware already up-to-date from main repos"
+    echo "LOG:Ubuntu: installing extra firmware for newer hardware (Intel/AMD iGPU, WiFi, audio)..."
+    chroot "$ROOT" apt-get install -y -qq linux-firmware firmware-sof-signed 2>&1 | tail -5 || echo "LOG:Firmware install skipped"
 else
     echo "LOG:Installing firmware-iwlwifi from backports..."
     chroot "$ROOT" apt-get install -y -qq -t ${{DEBIAN_RELEASE}}-backports firmware-iwlwifi 2>&1 | tail -5 || echo "LOG:Backports iwlwifi skipped"

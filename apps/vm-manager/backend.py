@@ -1781,24 +1781,24 @@ def start_vm(vm_id):
         # RAM
         cmd += ['-m', str(vm.get('ram', 1024))]
 
-        # Boot image (ISO/IMG) — must be resolved before disk so we can
-        # set boot priority when a disk image is used as installer media.
+        # Boot image (ISO/IMG) — resolve format but defer adding to QEMU command
+        # until after disks are counted, so we can assign correct bootindex.
         has_disk_boot_image = False
+        bootimg_drive_args = []
         if boot_image and os.path.exists(boot_image):
             ext = os.path.splitext(boot_image)[1].lower()
-            if ext in ('.iso',):
-                pass  # handled below after disk
-            else:
+            if ext not in ('.iso',):
                 has_disk_boot_image = True
                 fmt_map = {
                     '.img': 'raw', '.raw': 'raw',
                     '.qcow2': 'qcow2', '.vdi': 'vdi', '.vmdk': 'vmdk',
                 }
                 img_fmt = fmt_map.get(ext, 'raw')
-                # Boot image as primary drive (bootindex=0) — acts like a USB installer
-                # snapshot=on: temp CoW overlay so guest can write without modifying the original
-                cmd += ['-drive', f'file={boot_image},format={img_fmt},if=none,id=bootimg,snapshot=on']
-                cmd += ['-device', f'virtio-blk-pci,drive=bootimg,bootindex=0']
+                # Drive args stored here; bootindex assigned after counting disks.
+                # snapshot=on: temp CoW overlay so guest can write without modifying the original.
+                bootimg_drive_args = [
+                    ['-drive', f'file={boot_image},format={img_fmt},if=none,id=bootimg,snapshot=on'],
+                ]
 
         # Disks — loop over all VM disks
         disks = vm.get('disks', [])
@@ -1814,9 +1814,14 @@ def start_vm(vm_id):
         if need_sata_ctrl:
             cmd += ['-device', 'ich9-ahci,id=sata0']
 
+        # Count valid disks so we can assign boot_image a higher bootindex.
+        valid_disk_count = sum(1 for d in disks if d.get('file') and os.path.exists(d['file']))
+
+        # Disks get bootindex=0,1,2,… — UEFI tries them first.
+        # On a fresh (empty) disk it finds no EFI → falls through to the installer image.
+        # After installation the disk has a valid EFI entry → boots from disk automatically.
         scsi_idx = 0
         sata_idx = 0
-        boot_offset = 1 if has_disk_boot_image else 0
         for i, disk in enumerate(disks):
             df = disk.get('file', '')
             if not df or not os.path.exists(df):
@@ -1825,7 +1830,7 @@ def start_vm(vm_id):
             did = disk.get('id', f'disk{i}')
             bus = disk.get('bus', 'virtio')
             cmd += ['-drive', f'file={df},format={dfmt},if=none,id={did}']
-            boot_str = f',bootindex={i + boot_offset}'
+            boot_str = f',bootindex={i}'
             if bus == 'scsi':
                 cmd += ['-device', f'scsi-hd,bus=scsi0.0,drive={did},lun={scsi_idx}{boot_str}']
                 scsi_idx += 1
@@ -1836,6 +1841,14 @@ def start_vm(vm_id):
                 cmd += ['-device', f'ide-hd,drive={did}{boot_str}']
             else:
                 cmd += ['-device', f'virtio-blk-pci,drive={did}{boot_str}']
+
+        # Add boot image (IMG/QCOW2) after disks with higher bootindex.
+        # When disks are present: installer is fallback (disk boots first after install).
+        # When no disks: installer gets bootindex=0 and boots immediately.
+        if bootimg_drive_args:
+            for args in bootimg_drive_args:
+                cmd += args
+            cmd += ['-device', f'virtio-blk-pci,drive=bootimg,bootindex={valid_disk_count}']
 
         # ISO boot image (CD-ROM) — no forced boot order; UEFI uses
         # bootindex (disks=0,1,… before CD) and NVRAM for boot priority.
