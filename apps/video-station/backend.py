@@ -124,8 +124,15 @@ _HLS_MAX_SESSIONS = 3         # kill oldest session when this many are active
 # File-watcher state: folder_path → last-seen mtime
 _watcher_state = {}           # populated by _start_hls_cleanup_loop
 
+# VAAPI render node (Intel/AMD iGPU)
+RENDER_NODE = '/dev/dri/renderD128'
+
 # Hardware encoder detection (run once at import)
 _HW_ENCODER = None  # 'h264_nvenc' | 'h264_vaapi' | 'h264_videotoolbox' | 'libx264'
+
+# VAAPI decodable codecs (parsed from vainfo VAEntrypointVLD profiles)
+_VAAPI_DECODE_CODECS = None  # set of codec names: {'h264', 'hevc', 'vp9', 'av1'}
+
 
 def _detect_hw_encoder():
     """Probe available HW H.264 encoders. Returns best available encoder name."""
@@ -136,15 +143,18 @@ def _detect_hw_encoder():
         _HW_ENCODER = 'libx264'
         return _HW_ENCODER
     candidates = [
-        ('h264_nvenc',        '-f lavfi -i nullsrc=s=64x64:d=0.1 -c:v h264_nvenc -f null -'),
-        ('h264_vaapi',        '-vaapi_device /dev/dri/renderD128 -f lavfi -i nullsrc=s=64x64:d=0.1 '
-                              '-vf format=nv12,hwupload -c:v h264_vaapi -f null -'),
-        ('h264_videotoolbox', '-f lavfi -i nullsrc=s=64x64:d=0.1 -c:v h264_videotoolbox -f null -'),
+        ('h264_nvenc',
+         ['-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.1', '-c:v', 'h264_nvenc', '-f', 'null', '-']),
+        ('h264_vaapi',
+         ['-vaapi_device', RENDER_NODE, '-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.1',
+          '-vf', 'format=nv12,hwupload', '-c:v', 'h264_vaapi', '-f', 'null', '-']),
+        ('h264_videotoolbox',
+         ['-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.1', '-c:v', 'h264_videotoolbox', '-f', 'null', '-']),
     ]
     for name, args in candidates:
         try:
             r = subprocess.run(
-                ['ffmpeg', '-hide_banner', '-loglevel', 'error'] + args.split(),
+                ['ffmpeg', '-hide_banner', '-loglevel', 'error'] + args,
                 capture_output=True, timeout=5)
             if r.returncode == 0:
                 _HW_ENCODER = name
@@ -155,6 +165,43 @@ def _detect_hw_encoder():
     _HW_ENCODER = 'libx264'
     log.info("HLS HW encoder: libx264 (no HW accel)")
     return _HW_ENCODER
+
+
+def _detect_vaapi_decode_codecs():
+    """Return set of codec names decodable via VAAPI (from vainfo VAEntrypointVLD profiles).
+
+    Uses vainfo to parse supported decode profiles. VAEntrypointVLD = hardware decode.
+    Result is cached at module level to avoid repeated subprocess calls.
+    Returns a set of strings from {'h264', 'hevc', 'vp9', 'av1'}.
+    """
+    global _VAAPI_DECODE_CODECS
+    if _VAAPI_DECODE_CODECS is not None:
+        return _VAAPI_DECODE_CODECS
+    _VAAPI_DECODE_CODECS = set()
+    if not shutil.which('vainfo') or not os.path.exists(RENDER_NODE):
+        return _VAAPI_DECODE_CODECS
+    try:
+        r = subprocess.run(
+            ['vainfo', '--display', 'drm', '--device', RENDER_NODE],
+            capture_output=True, timeout=8, text=True)
+        output = (r.stdout or '') + (r.stderr or '')
+        if r.returncode != 0 or 'VAEntrypoint' not in output:
+            return _VAAPI_DECODE_CODECS
+        profile_map = {
+            'VAProfileH264':  'h264',
+            'VAProfileHEVC':  'hevc',
+            'VAProfileVP9':   'vp9',
+            'VAProfileAV1':   'av1',
+        }
+        for line in output.splitlines():
+            if 'VAEntrypointVLD' in line:
+                for prefix, codec in profile_map.items():
+                    if prefix in line:
+                        _VAAPI_DECODE_CODECS.add(codec)
+        log.info("VAAPI decodable codecs: %s", _VAAPI_DECODE_CODECS)
+    except Exception:
+        pass
+    return _VAAPI_DECODE_CODECS
 
 
 def _detect_docker():
@@ -219,6 +266,46 @@ def _render_node_group_info(render_node):
     except Exception:
         # Fallback: simple access check
         return os.access(render_node, os.R_OK), 'render', ''
+
+
+def _compute_vaapi_scale(w, h, max_w=4096, max_h=4096):
+    """Return (scale_w, scale_h) to fit (w,h) within VAAPI encoder limits.
+
+    Returns (0, 0) if no scaling is needed or dimensions are unknown.
+    Output dimensions are divisible by 2 (required by h264_vaapi).
+    """
+    if not w or not h or (w <= max_w and h <= max_h):
+        return 0, 0
+    ratio = min(max_w / w, max_h / h)
+    sw = int(w * ratio) & ~1
+    sh = int(h * ratio) & ~1
+    return max(sw, 2), max(sh, 2)
+
+
+def _get_intel_media_driver_version():
+    """Return installed version of intel-media-va-driver-non-free, or '' if not installed."""
+    try:
+        r = subprocess.run(
+            ['dpkg-query', '-W', '-f=${Version}', 'intel-media-va-driver-non-free'],
+            capture_output=True, text=True, timeout=5
+        )
+        if r.returncode == 0:
+            # e.g. "24.1.0+ds1-1" → major int 24
+            return r.stdout.strip().split('+')[0].split('~')[0]
+    except Exception:
+        pass
+    return ''
+
+
+def _intel_driver_needs_ppa_upgrade(version_str):
+    """Return True if installed Intel media driver is too old for newer Intel GPUs (< 25.x)."""
+    if not version_str:
+        return False
+    try:
+        major = int(version_str.split('.')[0])
+        return major < 25
+    except (ValueError, IndexError):
+        return False
 
 
 def _hw_health_check():
@@ -375,29 +462,55 @@ def _hw_health_check():
                 pass
 
         if ihd_init_failed:
-            status = 'ihd_init_failed'
-            message = ('Wykryto procesor Intel N100, ale sterownik iHD nie może wystartować. '
-                       'iHD_drv_video.so init failed — brakujące zależności lub LIBVA_DRIVER_NAME.')
-            steps = [
-                {'title': '1. Zainstaluj brakujące zależności (Intel N100 — GMKtec G3 Plus)',
-                 'commands': [
-                     'sudo apt install -y intel-media-va-driver-non-free libmfx1 libmfx-gen1 libva-drm2',
-                 ]},
-                {'title': '2. Wymuś sterownik iHD (LIBVA_DRIVER_NAME=ihd)',
-                 'commands': [
-                     'export LIBVA_DRIVER_NAME=ihd  # tymczasowo w bieżącej sesji',
-                     '# Trwale — dodaj do /etc/environment:',
-                     'echo "LIBVA_DRIVER_NAME=ihd" | sudo tee -a /etc/environment',
-                     '# Dla usługi EthOS — edytuj /etc/default/ethos (lub /etc/systemd/system/ethos.service):',
-                     'sudo sed -i \'/^\\[Service\\]/a Environment=LIBVA_DRIVER_NAME=ihd\' /etc/systemd/system/ethos.service',
-                     'sudo systemctl daemon-reload',
-                 ]},
-                {'title': '3. Dodaj użytkownika do grup render i video',
-                 'commands': [
-                     'sudo usermod -aG render,video %s' % run_user,
-                     'sudo systemctl restart ethos',
-                 ]},
-            ]
+            installed_ver = _get_intel_media_driver_version()
+            needs_ppa = _intel_driver_needs_ppa_upgrade(installed_ver)
+            if needs_ppa:
+                status = 'driver_too_old'
+                message = (
+                    'Sterownik Intel iHD nie inicjalizuje się — zainstalowana wersja %s jest za stara '
+                    'dla tego GPU. Wymagana aktualizacja z Intel Graphics PPA (≥ 25.x).' % installed_ver
+                )
+                steps = [
+                    {'title': '1. Zaktualizuj sterownik Intel z Intel Graphics PPA',
+                     'commands': [
+                         '# Automatycznie przez Video Station — kliknij "Zainstaluj sterowniki"',
+                         '# lub ręcznie:',
+                         'curl -sL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x0C0E6AF955CE463C03FC51574D098D70AFBE5E1F" | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/kobuk-intel-graphics.gpg',
+                         'echo "deb https://ppa.launchpadcontent.net/kobuk-team/intel-graphics/ubuntu noble main" | sudo tee /etc/apt/sources.list.d/intel-graphics.list',
+                         'sudo apt update',
+                         'sudo apt install -y intel-media-va-driver-non-free libigdgmm12 libva2 libva-drm2 libvpl2',
+                     ]},
+                    {'title': '2. Zweryfikuj instalację',
+                     'commands': [
+                         'vainfo --display drm --device /dev/dri/renderD128',
+                     ]},
+                    {'title': '3. Uruchom ponownie EthOS i odśwież enkoder',
+                     'commands': ['sudo systemctl restart ethos']},
+                ]
+            else:
+                status = 'ihd_init_failed'
+                message = ('Wykryto procesor Intel N100, ale sterownik iHD nie może wystartować. '
+                           'iHD_drv_video.so init failed — brakujące zależności lub LIBVA_DRIVER_NAME.')
+                steps = [
+                    {'title': '1. Zainstaluj brakujące zależności (Intel N100 — GMKtec G3 Plus)',
+                     'commands': [
+                         'sudo apt install -y intel-media-va-driver-non-free libmfx1 libmfx-gen1 libva-drm2',
+                     ]},
+                    {'title': '2. Wymuś sterownik iHD (LIBVA_DRIVER_NAME=ihd)',
+                     'commands': [
+                         'export LIBVA_DRIVER_NAME=ihd  # tymczasowo w bieżącej sesji',
+                         '# Trwale — dodaj do /etc/environment:',
+                         'echo "LIBVA_DRIVER_NAME=ihd" | sudo tee -a /etc/environment',
+                         '# Dla usługi EthOS — edytuj /etc/default/ethos (lub /etc/systemd/system/ethos.service):',
+                         'sudo sed -i \'/^\\[Service\\]/a Environment=LIBVA_DRIVER_NAME=ihd\' /etc/systemd/system/ethos.service',
+                         'sudo systemctl daemon-reload',
+                     ]},
+                    {'title': '3. Dodaj użytkownika do grup render i video',
+                     'commands': [
+                         'sudo usermod -aG render,video %s' % run_user,
+                         'sudo systemctl restart ethos',
+                     ]},
+                ]
         elif not iHD_present:
             status = 'missing_driver'
             message = ('Węzeł GPU dostępny, ale brak sterownika Intel Media Driver (iHD_drv_video.so). '
@@ -473,6 +586,7 @@ def _hw_health_check():
         'is_intel': is_intel,
         'is_amd': is_amd,
         'is_nvidia': is_nvidia,
+        'driver_version': _get_intel_media_driver_version(),
         'setup_steps': steps,
         'message': message,
     }
@@ -547,13 +661,21 @@ def _start_hls_cleanup_loop(socketio_instance=None):
                 pass
 
     def _heartbeat_watchdog():
-        """Kill sessions whose client hasn't sent a heartbeat for _HLS_HEARTBEAT_TIMEOUT s."""
+        """Kill sessions whose client hasn't sent a heartbeat for _HLS_HEARTBEAT_TIMEOUT s.
+        Also proactively cleanup sessions where ffmpeg has already crashed."""
         while True:
             gevent.sleep(5)
             now = time.time()
             for sid in list(_hls_sessions):
                 sess = _hls_sessions.get(sid)
                 if not sess:
+                    continue
+                proc = sess.get('proc')
+                # Proactively cleanup crashed ffmpeg (OOM, signal, etc.)
+                if proc and proc.poll() is not None:
+                    log.warning("HLS ffmpeg crashed sid=%s (exit %s) — cleaning up",
+                                sid, proc.returncode)
+                    _cleanup_hls(sid)
                     continue
                 last = sess.get('last_heartbeat', sess.get('created', now))
                 if now - last > _HLS_HEARTBEAT_TIMEOUT:
@@ -1318,8 +1440,22 @@ def get_folders():
     return jsonify({"folders": _load_folders()})
 
 
-@video_station_bp.route("/folders", methods=["POST"])
+# System directories that should never be added as library folders
+_SYSTEM_PATHS = {'/', '/etc', '/sys', '/proc', '/dev', '/boot', '/root', '/run', '/tmp', '/var', '/snap'}
+_SYSTEM_PREFIXES = ('/etc/', '/sys/', '/proc/', '/dev/', '/boot/', '/root/', '/run/', '/snap/')
 
+def _is_safe_library_path(folder):
+    """Reject system directories and paths inside protected system trees."""
+    rp = os.path.realpath(folder)
+    if rp in _SYSTEM_PATHS:
+        return False
+    if rp.startswith(_SYSTEM_PREFIXES):
+        return False
+    return True
+
+
+@video_station_bp.route("/folders", methods=["POST"])
+@admin_required
 def save_folders():
     folders = (request.json or {}).get("folders", [])
     valid = []
@@ -1327,14 +1463,14 @@ def save_folders():
         if not isinstance(f, str) or not f.startswith("/"):
             continue
         rp = os.path.realpath(f)
-        if os.path.isdir(rp):
+        if os.path.isdir(rp) and _is_safe_library_path(rp):
             valid.append(rp)
     _save_folders(valid)
     return jsonify({"ok": True, "folders": valid})
 
 
 @video_station_bp.route("/scan", methods=["POST"])
-
+@admin_required
 def start_scan():
     if _scan_state["running"]:
         return jsonify({"error": "Skan juz trwa."}), 409
@@ -1351,7 +1487,7 @@ def start_scan():
 
 
 @video_station_bp.route("/scan-stop", methods=["POST"])
-
+@admin_required
 def stop_scan():
     _scan_state["stop_requested"] = True
     return jsonify({"ok": True})
@@ -1439,6 +1575,8 @@ def library():
     q_search = request.args.get("q", "").strip()
     folder_filter = request.args.get("folder", "")
     watched_filter = request.args.get("watched", "")
+    codec_filter = request.args.get("codec", "")      # "hevc" | "av1" | "h264" | "transcode"
+    res_filter = request.args.get("res", "")           # "4k" | "1080p" | "720p"
     show_hidden = request.args.get("show_hidden", "") == "1"
     order_map = {
         "added_desc": "added_at DESC", "added_asc": "added_at ASC",
@@ -1463,6 +1601,18 @@ def library():
         where.append("COALESCE(ws.watched, 0)=1")
     elif watched_filter == '0':
         where.append("COALESCE(ws.watched, 0)=0")
+    if codec_filter == 'transcode':
+        where.append("(LOWER(v.codec) NOT IN ('h264','avc1','vp8','vp9','theora','av1')"
+                     " OR LOWER(v.audio_codec) NOT IN ('aac','mp3','opus','vorbis','flac'))")
+    elif codec_filter in ('hevc', 'av1', 'h264'):
+        where.append("LOWER(v.codec)=?")
+        params.append(codec_filter)
+    if res_filter == '4k':
+        where.append("v.width >= 3840")
+    elif res_filter == '1080p':
+        where.append("v.width >= 1920 AND v.width < 3840")
+    elif res_filter == '720p':
+        where.append("v.width >= 1280 AND v.width < 1920")
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     total = conn.execute(
         "SELECT COUNT(*) FROM videos v LEFT JOIN watch_state ws ON ws.video_id=v.id "
@@ -1902,22 +2052,63 @@ def transcode(vid):
 
     vcodec = (r["codec"] or "").lower()
     vcopy = vcodec in ("h264", "vp8", "vp9")
-    v_arg = "copy" if vcopy else "libx264"
 
     start_sec = max(0.0, request.args.get("start", 0, type=float))
     audio_idx = request.args.get("audio", None, type=int)
 
+    meta = json.loads(r["metadata_json"] or "{}")
+
     # Validate audio track index
     if audio_idx is not None:
         try:
-            tracks = json.loads(r["metadata_json"] or "{}").get("audio_tracks", [])
+            tracks = meta.get("audio_tracks", [])
         except Exception:
             tracks = []
         valid_indices = {t.get("index") for t in tracks} if tracks else set()
         if valid_indices and audio_idx not in valid_indices:
             return jsonify({"error": "Nieprawidłowy indeks ścieżki audio."}), 400
 
+    # Build video encoder args (with HW acceleration when available)
+    hw_pre = []
+    vid_w = int(meta.get('width') or 0)
+    vid_h = int(meta.get('height') or 0)
+    if vcopy:
+        video_enc_args = ["-c:v", "copy"]
+    else:
+        hw_enc = _detect_hw_encoder()
+        if hw_enc == 'h264_vaapi':
+            src = vcodec.replace('h265', 'hevc')
+            sw, sh = _compute_vaapi_scale(vid_w, vid_h)
+            if src in _detect_vaapi_decode_codecs():
+                # Full HW pipeline: GPU decode → GPU encode (zero memory copy)
+                hw_pre = ['-hwaccel', 'vaapi', '-hwaccel_device', RENDER_NODE,
+                          '-hwaccel_output_format', 'vaapi']
+                if sw:
+                    video_enc_args = ["-vf", "scale_vaapi=w=%d:h=%d" % (sw, sh),
+                                      "-c:v", "h264_vaapi", "-qp", "23"]
+                else:
+                    video_enc_args = ["-c:v", "h264_vaapi", "-qp", "23"]
+                log.info("transcode encode: %s → h264_vaapi (full HW%s)", vcodec,
+                         " scaled %dx%d" % (sw, sh) if sw else "")
+            else:
+                # CPU decode → GPU encode
+                hw_pre = ['-vaapi_device', RENDER_NODE]
+                if sw:
+                    video_enc_args = ["-vf", "scale=%d:%d,format=nv12,hwupload" % (sw, sh),
+                                      "-c:v", "h264_vaapi", "-qp", "23"]
+                else:
+                    video_enc_args = ["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-qp", "23"]
+                log.info("transcode encode: %s → h264_vaapi (CPU dec + GPU enc%s)", vcodec,
+                         " scaled %dx%d" % (sw, sh) if sw else "")
+        elif hw_enc in ('h264_nvenc', 'h264_videotoolbox'):
+            video_enc_args = ["-c:v", hw_enc, "-preset", "fast", "-cq", "23"]
+            log.info("transcode encode: %s → %s", vcodec, hw_enc)
+        else:
+            video_enc_args = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23"]
+            log.info("transcode encode: %s → libx264 (CPU)", vcodec)
+
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
+    cmd += hw_pre
     if start_sec > 0:
         cmd += ["-ss", str(start_sec)]
     cmd += ["-i", fp]
@@ -1926,9 +2117,8 @@ def transcode(vid):
     if audio_idx is not None:
         cmd += ["-map", "0:%d" % audio_idx]
     else:
-        cmd += ["-map", "0:a:0"]
+        cmd += ["-map", "0:a:0?"]
     cmd += [
-        "-c:v", v_arg,
         "-c:a", "aac", "-b:a", "192k", "-ac", "2",
         "-movflags", "frag_keyframe+empty_moov+default_base_moof",
         "-f", "mp4",
@@ -2007,22 +2197,52 @@ def hls_start(vid):
 
     vcodec = (r["codec"] or "").lower()
     vcopy = vcodec in ("h264", "vp8", "vp9")
+    pre_input_args = ""
+    vf_arg = ""
+    v_enc_arg = ""
+
+    # Get video dimensions for VAAPI resolution limit check (max 4096x4096 for h264_vaapi)
+    meta = json.loads(r["metadata_json"] or '{}')
+    vid_w = int(meta.get('width') or 0)
+    vid_h = int(meta.get('height') or 0)
+
     if vcopy:
-        v_arg = "copy"
+        v_enc_arg = "copy"
     else:
         hw_enc = _detect_hw_encoder()
         if hw_enc == 'h264_vaapi':
-            v_arg = "h264_vaapi -vf format=nv12,hwupload -qp 23"
+            src = vcodec.replace('h265', 'hevc')
+            sw, sh = _compute_vaapi_scale(vid_w, vid_h)
+            if src in _detect_vaapi_decode_codecs():
+                # Full HW pipeline: GPU decode → GPU encode (zero memory copy)
+                pre_input_args = "-hwaccel vaapi -hwaccel_device %s -hwaccel_output_format vaapi" % RENDER_NODE
+                vf_arg = "-vf scale_vaapi=w=%d:h=%d" % (sw, sh) if sw else ""
+                v_enc_arg = "h264_vaapi -qp 23"
+                log.info("HLS encode: %s → h264_vaapi (full HW%s)", vcodec,
+                         " scaled %dx%d" % (sw, sh) if sw else "")
+            else:
+                # CPU decode → GPU encode
+                pre_input_args = "-vaapi_device %s" % RENDER_NODE
+                if sw:
+                    vf_arg = "-vf scale=%d:%d,format=nv12,hwupload" % (sw, sh)
+                else:
+                    vf_arg = "-vf format=nv12,hwupload"
+                v_enc_arg = "h264_vaapi -qp 23"
+                log.info("HLS encode: %s → h264_vaapi (CPU dec + GPU enc%s)", vcodec,
+                         " scaled %dx%d" % (sw, sh) if sw else "")
         elif hw_enc in ('h264_nvenc', 'h264_videotoolbox'):
-            v_arg = "%s -preset fast -cq 23" % hw_enc
+            v_enc_arg = "%s -preset fast -cq 23" % hw_enc
+            log.info("HLS encode: %s → %s", vcodec, hw_enc)
         else:
-            v_arg = "libx264 -preset ultrafast -crf 23"
-        log.info("HLS encode: %s → %s", vcodec, v_arg.split()[0])
+            v_enc_arg = "libx264 -preset ultrafast -crf 23"
+            log.info("HLS encode: %s → libx264 (CPU)", vcodec)
 
     session_id = "%d_%s" % (vid, os.urandom(4).hex())
     tmpdir = tempfile.mkdtemp(prefix="vs_hls_")
 
     cmd = "ffmpeg -hide_banner -loglevel error"
+    if pre_input_args:
+        cmd += " %s" % pre_input_args
     if start_sec > 0:
         cmd += " -ss %s" % start_sec
     cmd += " -i %s" % q(fp)
@@ -2030,8 +2250,10 @@ def hls_start(vid):
     if audio_idx is not None:
         cmd += " -map 0:%d" % int(audio_idx)
     else:
-        cmd += " -map 0:a:0"
-    cmd += " -c:v %s -c:a aac -b:a 192k -ac 2" % v_arg
+        cmd += " -map 0:a:0?"
+    if vf_arg:
+        cmd += " %s" % vf_arg
+    cmd += " -c:v %s -c:a aac -b:a 192k -ac 2" % v_enc_arg
     cmd += " -f hls -hls_time 4 -hls_list_size 40"
     cmd += " -hls_segment_type mpegts"
     cmd += " -hls_segment_filename %s" % q(os.path.join(tmpdir, "seg%05d.ts"))
@@ -2288,8 +2510,9 @@ def gpu_retest():
       libva_driver_name : str
       libva_correct     : bool
     """
-    global _HW_ENCODER
-    _HW_ENCODER = None  # reset encoder cache to force re-detection
+    global _HW_ENCODER, _VAAPI_DECODE_CODECS
+    _HW_ENCODER = None          # reset encoder cache to force re-detection
+    _VAAPI_DECODE_CODECS = None  # reset decoder cache to force re-detection
 
     RENDER_NODE = '/dev/dri/renderD128'
     libva_driver_name = os.environ.get('LIBVA_DRIVER_NAME', '')
@@ -2329,25 +2552,30 @@ def gpu_retest():
         except Exception:
             error_code = 'EXCEPTION'
 
-    # ── per-codec ffmpeg probe ───────────────────────────────────────────
+    # ── per-codec ffmpeg probe (encode) ─────────────────────────────────
     codecs = {}
     if shutil.which('ffmpeg') and os.path.exists(RENDER_NODE):
-        _base = '-vaapi_device %s -f lavfi -i nullsrc=s=64x64:d=0.1 -vf format=nv12,hwupload' % RENDER_NODE
+        _base = ['-vaapi_device', RENDER_NODE, '-f', 'lavfi', '-i', 'nullsrc=s=64x64:d=0.1',
+                 '-vf', 'format=nv12,hwupload']
         codec_tests = [
-            ('h264',  '%s -c:v h264_vaapi -f null -'  % _base),
-            ('hevc',  '%s -c:v hevc_vaapi -f null -'  % _base),
-            ('vp9',   '%s -c:v vp9_vaapi  -f null -'  % _base),
-            ('av1',   '%s -c:v av1_vaapi  -f null -'  % _base),
+            ('h264', _base + ['-c:v', 'h264_vaapi', '-f', 'null', '-']),
+            ('hevc', _base + ['-c:v', 'hevc_vaapi', '-f', 'null', '-']),
+            ('vp9',  _base + ['-c:v', 'vp9_vaapi',  '-f', 'null', '-']),
+            ('av1',  _base + ['-c:v', 'av1_vaapi',  '-f', 'null', '-']),
         ]
         for codec_name, args in codec_tests:
             try:
                 cr = subprocess.run(
-                    ['ffmpeg', '-hide_banner', '-loglevel', 'error'] + args.split(),
+                    ['ffmpeg', '-hide_banner', '-loglevel', 'error'] + args,
                     capture_output=True, timeout=6
                 )
                 codecs[codec_name] = cr.returncode == 0
             except Exception:
                 codecs[codec_name] = False
+
+    # ── decode capability (from vainfo VAEntrypointVLD profiles) ─────────
+    dec_set = _detect_vaapi_decode_codecs()
+    decode_codecs = {c: (c in dec_set) for c in ('h264', 'hevc', 'vp9', 'av1')}
 
     new_encoder = _detect_hw_encoder()
     return jsonify(
@@ -2357,6 +2585,7 @@ def gpu_retest():
         error_code=error_code,
         profiles=profiles,
         codecs=codecs,
+        decode_codecs=decode_codecs,
         libva_driver_name=libva_driver_name,
         libva_correct=libva_correct,
         tooltip=('Intel QuickSync (iHD) — Aktywny' if vainfo_ok else
@@ -2404,12 +2633,39 @@ def hw_install():
                 if r.returncode != 0:
                     yield _send("⚠️  Nie udało się edytować sources.list (kontynuuję...)")
 
+            # Check if Intel media driver is too old for newer GPUs (N150, N200, etc.)
+            installed_ver = _get_intel_media_driver_version()
+            if _intel_driver_needs_ppa_upgrade(installed_ver):
+                yield _send("⚠️  Wykryto stary sterownik Intel Media Driver (%s < 25.x)." % installed_ver)
+                yield _send("📌 Dodawanie Intel Graphics PPA (kobuk-team) dla nowszych GPU...")
+
+                ppa_key_url = (
+                    "https://keyserver.ubuntu.com/pks/lookup"
+                    "?op=get&search=0x0C0E6AF955CE463C03FC51574D098D70AFBE5E1F"
+                )
+                key_path = "/etc/apt/trusted.gpg.d/kobuk-intel-graphics.gpg"
+                r = host_run(
+                    "curl -fsSL %s | gpg --dearmor -o %s" % (q(ppa_key_url), q(key_path)),
+                    timeout=20
+                )
+                if r.returncode != 0:
+                    yield _send("⚠️  Nie udało się pobrać klucza GPG PPA (kontynuuję bez PPA...)")
+                else:
+                    ppa_line = (
+                        "deb https://ppa.launchpadcontent.net/kobuk-team/intel-graphics/ubuntu noble main"
+                    )
+                    r = host_run(
+                        "echo %s > /etc/apt/sources.list.d/intel-graphics.list" % q(ppa_line),
+                        timeout=5
+                    )
+                    yield _send("✅ Dodano Intel Graphics PPA.")
+
             yield _send("🔄 Aktualizacja listy pakietów (apt update)...")
             for line in host_run_stream("apt-get update -qq 2>&1"):
                 yield _send(line.rstrip())
 
             yield _send("📥 Instalacja sterowników VAAPI...")
-            pkgs = "intel-media-va-driver-non-free i965-va-driver vainfo"
+            pkgs = "intel-media-va-driver-non-free libigdgmm12 libva2 libva-drm2 libvpl2 i965-va-driver vainfo"
             for line in host_run_stream(
                 "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends %s 2>&1" % pkgs
             ):
@@ -2500,7 +2756,7 @@ def rescan_metadata():
 
 
 @video_station_bp.route("/remove/<int:vid>", methods=["POST"])
-
+@admin_required
 def remove_from_library(vid):
     """Remove video from library without deleting the file."""
     conn = _get_db()
@@ -2525,6 +2781,7 @@ def remove_from_library(vid):
 
 # ── batch operations ───────────────────────────────────────────
 @video_station_bp.route("/batch", methods=["POST"])
+@admin_required
 def batch_action():
     """Batch operations on multiple videos: watched, unwatched, remove, hide, unhide."""
     d = request.json or {}
@@ -2593,6 +2850,7 @@ def _count_hidden():
 
 
 @video_station_bp.route("/hide-password", methods=["POST"])
+@admin_required
 def hide_password_set():
     """Set or change the hide password."""
     d = request.json or {}
@@ -2610,6 +2868,7 @@ def hide_password_set():
 
 
 @video_station_bp.route("/hide-password", methods=["DELETE"])
+@admin_required
 def hide_password_remove():
     """Remove hide password and unhide all videos."""
     d = request.json or {}
@@ -2786,6 +3045,7 @@ def watcher_status():
 
 
 @video_station_bp.route("/scan-folder", methods=["POST"])
+@admin_required
 def scan_folder():
     """Trigger an incremental scan of a specific folder path.
 
@@ -2858,14 +3118,24 @@ def tmdb_match_one(vid):
     return jsonify({"ok": True, "match": result})
 
 
-@video_station_bp.route("/tmdb-match-all", methods=["POST"])
+# Rate limit for tmdb-match-all (once per 60s)
+_last_tmdb_match_all = 0
 
+
+@video_station_bp.route("/tmdb-match-all", methods=["POST"])
+@admin_required
 def tmdb_match_all():
+    global _last_tmdb_match_all
     api_key = _load_tmdb_key()
     if not api_key:
         return jsonify({"error": "Brak klucza TMDb."}), 400
     if _scan_state["running"]:
         return jsonify({"error": "Skan juz trwa, poczekaj az sie skonczy."}), 409
+    now = time.time()
+    if now - _last_tmdb_match_all < 60:
+        remaining = int(60 - (now - _last_tmdb_match_all))
+        return jsonify({"error": "Poczekaj %ds przed kolejnym dopasowaniem." % remaining}), 429
+    _last_tmdb_match_all = now
     import gevent
 
     def _do_match():
@@ -3009,7 +3279,7 @@ def tmdb_apply(vid):
 
 
 @video_station_bp.route("/rename/<int:vid>", methods=["POST"])
-
+@admin_required
 def rename_video(vid):
     """Rename a video file on disk and update DB path/filename."""
     d = request.json or {}

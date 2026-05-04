@@ -146,9 +146,11 @@ def _smart_default_max_tokens():
 
 
 _CONFIG_DEFAULTS = {
-    'provider': 'local',            # openai | azure | custom | local
+    'provider': 'local',            # openai | azure | ollama | local
     'api_key': '',
     'endpoint': 'https://api.openai.com/v1/chat/completions',
+    'ollama_url': 'http://localhost:11434',  # Default local Ollama
+    'ollama_api_key': '',           # Optional API key for remote Ollama
     'model': 'gpt-4o',
     'max_tokens': 768,              # N150-safe default
     'temperature': 0.7,
@@ -417,7 +419,8 @@ def save_config():
     data = request.json or {}
     cfg = _load_config(username)
     for key in ('provider', 'endpoint', 'model', 'max_tokens', 'temperature',
-                'system_prompt', 'workspace', 'rag_enabled', 'rag_top_k'):
+                'system_prompt', 'workspace', 'rag_enabled', 'rag_top_k',
+                'ollama_url', 'ollama_api_key'):
         if key in data:
             cfg[key] = data[key]
     if 'api_key' in data:
@@ -687,14 +690,17 @@ def chat():
     req_provider = data.get('provider_override')
     if isinstance(req_provider, str):
         rp = req_provider.strip()
-        if rp in ('local', 'openai', 'azure', 'custom'):
+        if rp in ('local', 'openai', 'azure', 'ollama', 'custom'):
             provider = rp
     # Allow per-request override of RAG usage (without changing saved config)
     req_rag_enabled = data.get('rag_enabled')
     rag_enabled = cfg.get('rag_enabled', True) if req_rag_enabled is None else bool(req_rag_enabled)
     is_local = provider == 'local'
-    if not is_local and not cfg.get('api_key'):
+    is_ollama = provider == 'ollama'
+    if not is_local and not is_ollama and not cfg.get('api_key'):
         return jsonify({'error': 'API key not configured. Open settings (⚙) and enter your key.'}), 400
+    if is_ollama and not cfg.get('ollama_url'):
+        return jsonify({'error': 'Ollama URL not configured. Open settings (⚙) and enter the URL.'}), 400
 
     # Load/create conversation
     history = _load_history(username)
@@ -878,26 +884,48 @@ def chat():
                         time.sleep(0.05)
 
             else:
-                # ── REMOTE API (OpenAI / Azure / Custom) ──
-                api_body = {
-                    'model': model_name,
-                    'messages': api_messages,
-                    'max_tokens': int(cfg.get('max_tokens', 4096)),
-                    'temperature': float(cfg.get('temperature', 0.7)),
-                    'stream': True,
-                    'tools': TICKET_TOOLS,
-                }
-                body = json.dumps(api_body).encode('utf-8')
-
-                headers = {
-                    'Content-Type': 'application/json',
-                    'Authorization': f"Bearer {cfg['api_key']}",
-                }
-
-                endpoint = cfg.get('endpoint', _CONFIG_DEFAULTS['endpoint'])
-
-                # Tool call loop — may need multiple rounds
-                max_tool_rounds = 5
+                # ── REMOTE API (OpenAI / Azure / Ollama / Custom) ──
+                
+                # Determine endpoint and headers based on provider
+                if is_ollama:
+                    ollama_url = cfg.get('ollama_url', 'http://localhost:11434').rstrip('/')
+                    endpoint = f"{ollama_url}/api/chat"
+                    headers = {
+                        'Content-Type': 'application/json',
+                    }
+                    # Add API key if provided
+                    if cfg.get('ollama_api_key'):
+                        headers['Authorization'] = f"Bearer {cfg['ollama_api_key']}"
+                    
+                    # Ollama doesn't support tools natively, so exclude them
+                    api_body = {
+                        'model': model_name,
+                        'messages': api_messages,
+                        'stream': True,
+                    }
+                    # Ollama accepts temperature differently and doesn't use max_tokens
+                    api_body['options'] = {
+                        'temperature': float(cfg.get('temperature', 0.7)),
+                        'num_predict': int(cfg.get('max_tokens', 2048)),
+                    }
+                else:
+                    # OpenAI / Azure / Custom
+                    endpoint = cfg.get('endpoint', _CONFIG_DEFAULTS['endpoint'])
+                    headers = {
+                        'Content-Type': 'application/json',
+                        'Authorization': f"Bearer {cfg['api_key']}",
+                    }
+                    api_body = {
+                        'model': model_name,
+                        'messages': api_messages,
+                        'max_tokens': int(cfg.get('max_tokens', 4096)),
+                        'temperature': float(cfg.get('temperature', 0.7)),
+                        'stream': True,
+                        'tools': TICKET_TOOLS,
+                    }
+                
+                # Tool call loop — may need multiple rounds (only for non-Ollama providers)
+                max_tool_rounds = 5 if not is_ollama else 1
                 for _round in range(max_tool_rounds):
                     req = urllib.request.Request(endpoint, data=json.dumps(api_body).encode('utf-8'),
                                                 headers=headers, method='POST')
@@ -920,38 +948,51 @@ def chat():
                                 continue
                             if line == 'data: [DONE]':
                                 break
-                            if line.startswith('data: '):
-                                json_str = line[6:]
-                                try:
-                                    obj = json.loads(json_str)
+                            
+                            try:
+                                # Handle both OpenAI-style (data: {...}) and Ollama-style (direct JSON) formats
+                                json_str = line[6:] if line.startswith('data: ') else line
+                                obj = json.loads(json_str)
+                                
+                                # OpenAI format: response in obj['choices'][0]['delta']['content']
+                                if 'choices' in obj:
                                     delta = obj.get('choices', [{}])[0].get('delta', {})
                                     content = delta.get('content', '')
                                     if content:
                                         round_content += content
                                         full_response += content
                                         yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
-
-                                    # Accumulate tool calls
-                                    for tc in delta.get('tool_calls', []):
-                                        idx = tc.get('index', 0)
-                                        if idx not in tool_calls_acc:
-                                            tool_calls_acc[idx] = {'id': '', 'name': '', 'arguments': ''}
-                                        if tc.get('id'):
-                                            tool_calls_acc[idx]['id'] = tc['id']
-                                        fn = tc.get('function', {})
-                                        if fn.get('name'):
-                                            tool_calls_acc[idx]['name'] = fn['name']
-                                        if fn.get('arguments'):
-                                            tool_calls_acc[idx]['arguments'] += fn['arguments']
-                                except (json.JSONDecodeError, IndexError, KeyError):
+                                    
+                                    # Accumulate tool calls (only for non-Ollama)
+                                    if not is_ollama:
+                                        for tc in delta.get('tool_calls', []):
+                                            idx = tc.get('index', 0)
+                                            if idx not in tool_calls_acc:
+                                                tool_calls_acc[idx] = {'id': '', 'name': '', 'arguments': ''}
+                                            if tc.get('id'):
+                                                tool_calls_acc[idx]['id'] = tc['id']
+                                            fn = tc.get('function', {})
+                                            if fn.get('name'):
+                                                tool_calls_acc[idx]['name'] = fn['name']
+                                            if fn.get('arguments'):
+                                                tool_calls_acc[idx]['arguments'] += fn['arguments']
+                                
+                                # Ollama format: response in obj['message']['content']
+                                elif 'message' in obj and is_ollama:
+                                    content = obj['message'].get('content', '')
+                                    if content:
+                                        round_content += content
+                                        full_response += content
+                                        yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
+                            except (json.JSONDecodeError, IndexError, KeyError):
                                     pass
 
                     resp.close()
 
-                    if not tool_calls_acc:
-                        break  # No tool calls — normal response, done
+                    if not tool_calls_acc or is_ollama:
+                        break  # No tool calls or Ollama — normal response, done
 
-                    # Execute tool calls
+                    # Execute tool calls (only for non-Ollama providers with tool support)
                     # Add assistant message with tool_calls to conversation
                     assistant_tc_msg = {'role': 'assistant', 'content': round_content or None, 'tool_calls': []}
                     for idx in sorted(tool_calls_acc.keys()):
@@ -1836,3 +1877,24 @@ def status_aichat():
         'rag_enabled': cfg.get('rag_enabled', True),
     }
     return jsonify(result)
+
+
+@aichat_bp.route('/ollama-models', methods=['GET'])
+def list_ollama_models():
+    """Return list of models available on the configured Ollama server"""
+    import urllib.request as _ureq
+    username = _get_username()
+    cfg = _load_config(username)
+
+    # Use URL from query param (when user types a new URL before saving) or from config
+    ollama_url = request.args.get('url', '').strip() or cfg.get('ollama_url', 'http://localhost:11434')
+    ollama_url = ollama_url.rstrip('/')
+
+    try:
+        req = _ureq.Request(ollama_url + '/api/tags', headers={'Content-Type': 'application/json'})
+        with _ureq.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        models = [m['name'] for m in data.get('models', [])]
+        return jsonify({'models': models, 'url': ollama_url})
+    except Exception as e:
+        return jsonify({'models': [], 'error': str(e), 'url': ollama_url})

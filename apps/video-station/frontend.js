@@ -40,6 +40,9 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
     let currentQuery   = '';
     let currentFolder  = '';
     let currentWatched = '';
+    let currentCodec   = '';
+    let currentRes     = '';
+    let currentView   = localStorage.getItem('vs_view') || 'grid';
     let scanning       = false;
     let useTmdb        = true;
     let playerInterval = null;
@@ -573,20 +576,24 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
                 }
             }
 
-            // Codec pills
+            // Codec pills — encode and decode separately
             if (pillsEl && res.codecs) {
                 const codecList = [
                     { key: 'h264', label: 'H.264' },
-                    { key: 'hevc', label: 'H.265/HEVC' },
+                    { key: 'hevc', label: 'H.265' },
                     { key: 'vp9',  label: 'VP9' },
                     { key: 'av1',  label: 'AV1' },
                 ];
-                pillsEl.innerHTML = codecList.map(c =>
-                    '<span class="vs-codec-pill ' + (res.codecs[c.key] ? 'vs-codec-pill-ok' : 'vs-codec-pill-fail') + '" ' +
-                    'title="' + c.label + ': ' + (res.codecs[c.key] ? t('obsługiwany przez GPU') : t('tylko CPU')) + '">' +
-                    '<i class="fas fa-' + (res.codecs[c.key] ? 'check' : 'times') + '"></i> ' + c.label +
-                    '</span>'
-                ).join('');
+                const makePill = (c, supported, mode) =>
+                    '<span class="vs-codec-pill ' + (supported ? 'vs-codec-pill-ok' : 'vs-codec-pill-fail') + '" ' +
+                    'title="' + c.label + ' ' + mode + ': ' + (supported ? t('GPU') : t('CPU')) + '">' +
+                    '<i class="fas fa-' + (supported ? 'check' : 'times') + '"></i> ' + c.label +
+                    '</span>';
+                const encPills = codecList.map(c => makePill(c, res.codecs[c.key], t('enkoder'))).join('');
+                const decPills = codecList.map(c => makePill(c, !!(res.decode_codecs && res.decode_codecs[c.key]), t('dekoder'))).join('');
+                pillsEl.innerHTML =
+                    '<div class="vs-codec-pills-row"><span class="vs-codec-pills-label">' + t('Enkoder') + '</span>' + encPills + '</div>' +
+                    '<div class="vs-codec-pills-row"><span class="vs-codec-pills-label">' + t('Dekoder') + '</span>' + decPills + '</div>';
             }
 
             // Also update all player badges in the window
@@ -675,7 +682,21 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
     '<option value="0"' + (currentWatched === '0' ? ' selected' : '') + '>' + t('Nieobejrzane') + '</option>' +
     '<option value="1"' + (currentWatched === '1' ? ' selected' : '') + '>' + t('Obejrzane') + '</option>' +
   '</select>' +
+  '<select id="vs-codec-filter" class="vs-select">' +
+    '<option value=""' + (currentCodec === '' ? ' selected' : '') + '>' + t('Wszystkie kodeki') + '</option>' +
+    '<option value="transcode"' + (currentCodec === 'transcode' ? ' selected' : '') + '>' + t('Wymaga transkodowania') + '</option>' +
+    '<option value="h264"' + (currentCodec === 'h264' ? ' selected' : '') + '>H.264</option>' +
+    '<option value="hevc"' + (currentCodec === 'hevc' ? ' selected' : '') + '>HEVC</option>' +
+    '<option value="av1"' + (currentCodec === 'av1' ? ' selected' : '') + '>AV1</option>' +
+  '</select>' +
+  '<select id="vs-res-filter" class="vs-select">' +
+    '<option value=""' + (currentRes === '' ? ' selected' : '') + '>' + t('Wszystkie rozdzielczości') + '</option>' +
+    '<option value="4k"' + (currentRes === '4k' ? ' selected' : '') + '>4K</option>' +
+    '<option value="1080p"' + (currentRes === '1080p' ? ' selected' : '') + '>1080p</option>' +
+    '<option value="720p"' + (currentRes === '720p' ? ' selected' : '') + '>720p</option>' +
+  '</select>' +
   '<button id="vs-select-toggle" class="app-btn app-btn-sm" title="' + t('Zaznaczanie') + '"><i class="fas fa-check-square"></i></button>' +
+  '<button id="vs-view-toggle" class="app-btn app-btn-sm" title="' + t('Widok: siatka / lista') + '"><i class="fas fa-' + (currentView === 'list' ? 'th' : 'list') + '"></i></button>' +
   '<button class="app-btn app-btn-sm" title="' + t('Ustawienia, skanowanie, TMDb') + '" id="vs-lib-settings-btn"><i class="fas fa-sliders-h"></i></button>' +
 '</div>';
 
@@ -690,7 +711,18 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         bodyEl.querySelector('#vs-watched-filter').onchange = (e) => {
             currentWatched = e.target.value; libraryOffset = 0; loadLibrary();
         };
+        bodyEl.querySelector('#vs-codec-filter').onchange = (e) => {
+            currentCodec = e.target.value; libraryOffset = 0; loadLibrary();
+        };
+        bodyEl.querySelector('#vs-res-filter').onchange = (e) => {
+            currentRes = e.target.value; libraryOffset = 0; loadLibrary();
+        };
         bodyEl.querySelector('#vs-select-toggle').onclick = _toggleSelectMode;
+        bodyEl.querySelector('#vs-view-toggle').onclick = () => {
+            currentView = currentView === 'list' ? 'grid' : 'list';
+            localStorage.setItem('vs_view', currentView);
+            libraryOffset = 0; loadLibrary();
+        };
         bodyEl.querySelector('#vs-lib-settings-btn').onclick = () => switchSection('settings');
 
         if (scanning) checkScanStatus();
@@ -706,13 +738,15 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             sort: currentSort, q: currentQuery, folder: currentFolder,
             watched: currentWatched,
         });
+        if (currentCodec) params.set('codec', currentCodec);
+        if (currentRes) params.set('res', currentRes);
         const data = await api('/video-station/library?' + params);
         if (data.error) { content.innerHTML = '<div class="vs-empty">' + escH(data.error) + '</div>'; return; }
 
         libraryItems = data.items || [];
         libraryTotal = data.total || 0;
 
-        if (!libraryItems.length && !currentQuery && !currentFolder && !currentWatched) {
+        if (!libraryItems.length && !currentQuery && !currentFolder && !currentWatched && !currentCodec && !currentRes) {
             content.innerHTML =
                 '<div class="vs-empty"><i class="fas fa-film"></i>' +
                 '<p>' + t('Brak filmów w bibliotece') + '</p>' +
@@ -723,7 +757,7 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         let html = '';
 
         // Continue Watching section (only on first page with no filters)
-        if (libraryOffset === 0 && !currentQuery && !currentFolder && !currentWatched) {
+        if (libraryOffset === 0 && !currentQuery && !currentFolder && !currentWatched && !currentCodec && !currentRes) {
             const cw = await api('/video-station/continue-watching?limit=10');
             const cwItems = (cw && cw.items) ? cw.items : [];
             if (cwItems.length) {
@@ -755,7 +789,7 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         if (!libraryItems.length) {
             html += '<div class="vs-empty"><i class="fas fa-filter"></i><p>' + t('Brak wyników') + '</p></div>';
         } else {
-            html += renderGrid(libraryItems) + renderPagination();
+            html += (currentView === 'list' ? renderList(libraryItems) : renderGrid(libraryItems)) + renderPagination();
         }
         content.innerHTML = html;
         attachGridEvents(content);
@@ -1303,6 +1337,51 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         return '<div class="vs-genre-badges">' + names.map(n => '<span class="vs-genre-badge">' + escH(n) + '</span>').join('') + '</div>';
     }
 
+    function renderList(items) {
+        let html = '<div class="vs-list' + (selectMode ? ' vs-select-mode' : '') + '">';
+        html += '<div class="vs-list-header">';
+        html += '<span class="vs-list-col vs-list-col-thumb"></span>';
+        html += '<span class="vs-list-col vs-list-col-title">' + t('Tytuł') + '</span>';
+        html += '<span class="vs-list-col vs-list-col-year">' + t('Rok') + '</span>';
+        html += '<span class="vs-list-col vs-list-col-dur">' + t('Czas') + '</span>';
+        html += '<span class="vs-list-col vs-list-col-res">' + t('Rozdzielczość') + '</span>';
+        html += '<span class="vs-list-col vs-list-col-codec">' + t('Kodek') + '</span>';
+        html += '<span class="vs-list-col vs-list-col-size">' + t('Rozmiar') + '</span>';
+        html += '</div>';
+        items.forEach(v => {
+            const dur = formatDuration(v.duration);
+            const res = v.height ? (v.height >= 2160 ? '4K' : v.height >= 1080 ? '1080p' : v.height >= 720 ? '720p' : v.height + 'p') : '';
+            const codec = (v.codec || '').toUpperCase();
+            const size = v.file_size ? formatBytes(v.file_size) : '';
+            const year = v.tmdb_year || '';
+            const imgSrc = v.poster_ok
+                ? '/api/video-station/poster/' + v.id + '?token=' + NAS.token
+                : '/api/video-station/thumb/' + v.id + '?token=' + NAS.token;
+            const pct = v.duration && v.position ? Math.min(100, Math.round((v.position / v.duration) * 100)) : 0;
+            const sel = selectedIds.has(String(v.id));
+
+            html +=
+'<div class="vs-list-row' + (v.watched ? ' vs-watched' : '') + (sel ? ' vs-selected' : '') + '" data-id="' + v.id + '">' +
+  (selectMode ? '<div class="vs-checkbox' + (sel ? ' checked' : '') + '"><i class="fas fa-' + (sel ? 'check-square' : 'square') + '"></i></div>' : '') +
+  '<span class="vs-list-col vs-list-col-thumb">' +
+    '<img src="' + imgSrc + '" loading="lazy" alt="" onerror="this.style.display=\'none\'">' +
+    '<div class="vs-thumb-placeholder"><i class="fas fa-film"></i></div>' +
+  '</span>' +
+  '<span class="vs-list-col vs-list-col-title" title="' + escH(v.title || v.filename || '') + '">' +
+    escH(v.title || v.filename || '') +
+    (pct > 0 && !v.watched ? '<div class="vs-progress-bar"><div class="vs-progress-fill" style="width:' + pct + '%"></div></div>' : '') +
+  '</span>' +
+  '<span class="vs-list-col vs-list-col-year">' + escH(year) + '</span>' +
+  '<span class="vs-list-col vs-list-col-dur">' + dur + '</span>' +
+  '<span class="vs-list-col vs-list-col-res">' + res + '</span>' +
+  '<span class="vs-list-col vs-list-col-codec">' + codec + '</span>' +
+  '<span class="vs-list-col vs-list-col-size">' + size + '</span>' +
+'</div>';
+        });
+        html += '</div>';
+        return html;
+    }
+
     function renderGrid(items, showWatched) {
         let html = '<div class="vs-grid' + (selectMode ? ' vs-select-mode' : '') + '">';
         items.forEach(v => {
@@ -1341,7 +1420,7 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
     }
 
     function attachGridEvents(container) {
-        container.querySelectorAll('.vs-card[data-id]').forEach(card => {
+        container.querySelectorAll('.vs-card[data-id], .vs-list-row[data-id]').forEach(card => {
             card.onclick = (e) => {
                 if (selectMode) {
                     _toggleSelection(card);
@@ -1927,15 +2006,19 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         return '/api/video-station/stream/' + vid + '?token=' + NAS.token;
     }
 
-    /** Load hls.js from CDN if not already loaded. Returns a Promise. */
+    /** Load hls.js (local bundled copy first, CDN fallback). Returns a Promise. */
     function _ensureHlsJs() {
         if (window.Hls) return Promise.resolve();
-        return new Promise((resolve, reject) => {
+        const load = (src) => new Promise((resolve, reject) => {
             const s = document.createElement('script');
-            s.src = 'https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js';
+            s.src = src;
             s.onload = resolve;
             s.onerror = reject;
             document.head.appendChild(s);
+        });
+        // Try local bundled copy first, fall back to CDN
+        return load('/vendor/hls.min.js').catch(() => {
+            return load('https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js');
         });
     }
 
@@ -1974,6 +2057,8 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         const overlay = bodyEl.querySelector('#vs-player-overlay');
         if (!overlay) return;
 
+        // Cleanup previous thumbstrip listener to prevent accumulation
+        if (overlay._tsCleanup) { overlay._tsCleanup(); overlay._tsCleanup = null; }
         overlay.addEventListener('mousemove', _onSeekHover);
 
         function _onSeekHover(e) {
@@ -2158,9 +2243,9 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             speedSel.onchange = () => { video.playbackRate = parseFloat(speedSel.value); };
         }
 
-        // Audio track selector (for transcoded content only)
+        // Audio track selector \u2014 show whenever multiple tracks exist
         const tracks = info.audio_tracks || [];
-        if (tracks.length > 1 && needsTranscode) {
+        if (tracks.length > 1) {
             audioSel.innerHTML = tracks.map(t => {
                 const label = [t.language, t.title, t.codec, t.channels ? t.channels + 'ch' : ''].filter(Boolean).join(' \u00b7 ') || 'Track ' + t.index;
                 return '<option value="' + t.index + '">' + escH(label) + '</option>';
@@ -2168,7 +2253,12 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             audioSel.style.display = '';
             audioSel.onchange = () => {
                 _currentAudioIdx = parseInt(audioSel.value);
-                _startHls(vid, video.currentTime + _startOffset, _currentAudioIdx);
+                // Switch to HLS if not already transcoding (video-copy + audio remux for h264)
+                if (!_transcoding) {
+                    _startHls(vid, video.currentTime, _currentAudioIdx);
+                } else if (_hlsInstance) {
+                    _startHls(vid, video.currentTime + _startOffset, _currentAudioIdx);
+                }
             };
         } else {
             audioSel.style.display = 'none';
@@ -2211,8 +2301,8 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             await _doPlay(0);
         }
 
-        // Load subtitles (file-based + embedded via HLS) and populate subtitle picker
-        _loadSubtitles(vid, video);
+        // Set up lazy subtitle loading — tracks are fetched when user opens the picker
+        _setupLazySubtitles(vid, video);
 
         // HLS seeking beyond buffer
         if (needsTranscode) {
@@ -2236,8 +2326,20 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         // Set initial duration on seekbar
         _showControls();
 
-        // save position every 10 seconds
+        // Save position every 10 seconds while playing
+        clearInterval(playerInterval);
         playerInterval = setInterval(() => savePosition(vid, video), 10000);
+
+        // Pause interval when video is paused, resume on play
+        video.addEventListener('play', () => {
+            clearInterval(playerInterval);
+            playerInterval = setInterval(() => savePosition(vid, video), 10000);
+        }, sig);
+        video.addEventListener('pause', () => {
+            clearInterval(playerInterval);
+            // Still save one last position on pause
+            savePosition(vid, video);
+        }, sig);
 
         // mark watched at >90%
         video.ontimeupdate = () => {
@@ -2265,6 +2367,12 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
                 _transcoding = true;
                 badge.style.display = '';
                 _startHls(vid, 0, null);
+            } else if (_transcoding) {
+                // HLS transcode also failed — show error overlay with retry button
+                _cl('error', 'HLS transcode also failed', {
+                    vid, errorCode: video.error?.code, errorMsg: video.error?.message
+                });
+                _showPlayerError(vid, video);
             }
         };
 
@@ -2410,6 +2518,43 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         bodyEl.querySelector('#vs-player-close').onclick = () => closePlayer();
     }
 
+    function _showPlayerError(vid, video) {
+        const existing = bodyEl.querySelector('#vs-player-error');
+        if (existing) existing.remove();
+
+        const overlay = bodyEl.querySelector('#vs-player-overlay');
+        if (!overlay) return;
+
+        const errorBox = document.createElement('div');
+        errorBox.id = 'vs-player-error';
+        errorBox.className = 'vs-player-error';
+        errorBox.innerHTML =
+            '<div class="vs-player-error-box">' +
+              '<i class="fas fa-exclamation-triangle"></i>' +
+              '<p>' + t('Nie udało się odtworzyć tego pliku.') + '</p>' +
+              '<p class="vs-player-error-sub">' + t('Kodek może nie być wspierany przez przeglądarkę.') + '</p>' +
+              '<div class="vs-player-error-btns">' +
+                '<button class="app-btn app-btn-primary" id="vs-error-retry">' +
+                  '<i class="fas fa-redo"></i> ' + t('Spróbuj ponownie') +
+                '</button>' +
+                '<button class="app-btn" id="vs-error-close">' +
+                  '<i class="fas fa-times"></i> ' + t('Zamknij') +
+                '</button>' +
+              '</div>' +
+            '</div>';
+        overlay.appendChild(errorBox);
+
+        errorBox.querySelector('#vs-error-retry').onclick = () => {
+            errorBox.remove();
+            _transcoding = true;
+            _startHls(vid, 0, null);
+        };
+        errorBox.querySelector('#vs-error-close').onclick = () => {
+            errorBox.remove();
+            closePlayer();
+        };
+    }
+
     /**
      * Start HLS transcoding session and attach to video element.
      * Uses hls.js (for Chrome/Firefox) or native HLS (Safari).
@@ -2431,6 +2576,9 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         }
         _hlsSessionId = res.session_id;
         _startOffset = res.start_offset || 0;
+        _transcoding = true;
+        // Clear direct src to avoid conflicts with hls.js attachMedia
+        video.removeAttribute('src');
         _startHeartbeat(video);
 
         // Load embedded subtitle tracks from HLS start response
@@ -2520,6 +2668,28 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         }
     }
 
+    function _setupLazySubtitles(vid, video) {
+        // Show the sub-select with a placeholder; tracks load on first open
+        video._subsLoaded = false;
+        video._subsVid = vid;
+        const subSel = bodyEl.querySelector('#vs-sub-select');
+        if (!subSel) return;
+
+        // Show placeholder that triggers loading
+        subSel.style.display = '';
+        subSel.innerHTML = '<option value="">' + escH(t('Napisy...')) + '</option>';
+        subSel.onchange = null;
+        subSel.onclick = null;
+
+        // Load subtitles on first click
+        subSel.onclick = async () => {
+            if (video._subsLoaded) return;
+            video._subsLoaded = true;
+            subSel.innerHTML = '<option value="">' + escH(t('Ładowanie...')) + '</option>';
+            await _loadSubtitles(video._subsVid, video);
+        };
+    }
+
     async function _loadSubtitles(vid, video) {
         video.querySelectorAll('track').forEach(t => t.remove());
         const subSel = bodyEl.querySelector('#vs-sub-select');
@@ -2539,6 +2709,11 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             });
         }
 
+        // Also include already-loaded embedded tracks
+        video.querySelectorAll('track[data-embedded]').forEach((tr, i) => {
+            allTracks.push({ label: tr.label, idx: allTracks.length, type: 'embedded' });
+        });
+
         // Populate subtitle picker
         _updateSubSelect(video, allTracks);
     }
@@ -2547,7 +2722,6 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         const video = bodyEl && bodyEl.querySelector('#vs-player-video');
         if (!video || !subTracks || !subTracks.length) return;
         video.querySelectorAll('track[data-embedded]').forEach(t => t.remove());
-        const existingCount = video.querySelectorAll('track:not([data-embedded])').length;
         subTracks.forEach((sub, i) => {
             const track = document.createElement('track');
             track.kind = 'subtitles';
@@ -2557,13 +2731,15 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             track.dataset.embedded = '1';
             video.appendChild(track);
         });
-        // Rebuild subtitle picker with all tracks
-        const allTracks = [];
-        const trackEls = video.querySelectorAll('track');
-        trackEls.forEach((tr, i) => {
-            allTracks.push({ label: tr.label || ('Track ' + (i + 1)), idx: i, type: tr.dataset.embedded ? 'embedded' : 'file' });
-        });
-        _updateSubSelect(video, allTracks);
+
+        // Only rebuild picker if filesystem subs are already loaded
+        if (video._subsLoaded) {
+            const allTracks = [];
+            video.querySelectorAll('track').forEach((tr, i) => {
+                allTracks.push({ label: tr.label || ('Track ' + (i + 1)), idx: i, type: tr.dataset.embedded ? 'embedded' : 'file' });
+            });
+            _updateSubSelect(video, allTracks);
+        }
     }
 
     function _updateSubSelect(video, allTracks) {
@@ -2693,13 +2869,22 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 
     /* ── helpers ────────────────────────────────────────────── */
     function formatDuration(sec) {
-        if (!sec || sec <= 0) return '';
+        if (sec == null || sec < 0) return '';
         sec = Math.round(sec);
+        if (sec <= 0) return '0:00';
         const h = Math.floor(sec / 3600);
         const m = Math.floor((sec % 3600) / 60);
         const s = sec % 60;
         if (h > 0) return h + ':' + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
         return m + ':' + String(s).padStart(2, '0');
+    }
+
+    function formatBytes(bytes) {
+        if (bytes == null || bytes < 0) return '';
+        if (bytes === 0) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+        return (bytes / Math.pow(1024, i)).toFixed(i > 0 ? 1 : 0) + ' ' + units[i];
     }
 
     function escH(str) {
@@ -2787,6 +2972,30 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 '.vs-collection-thumb{aspect-ratio:16/10}',
 '.vs-collection-count{position:absolute;bottom:6px;left:6px;background:rgba(0,0,0,.75);color:#fff;font-size:11px;padding:2px 8px;border-radius:3px;z-index:2}',
 
+/* list view */
+'.vs-list{display:flex;flex-direction:column;gap:0}',
+'.vs-list-header{display:flex;align-items:center;padding:8px 12px;border-bottom:2px solid var(--border);font-size:11px;font-weight:600;color:var(--text-muted);text-transform:uppercase;letter-spacing:.5px}',
+'.vs-list-row{display:flex;align-items:center;padding:6px 12px;border-bottom:1px solid var(--border);cursor:pointer;transition:background .12s;font-size:13px;color:var(--text-primary)}',
+'.vs-list-row:hover{background:var(--bg-secondary)}',
+'.vs-list-row.vs-watched{opacity:.55}',
+'.vs-list-row.vs-selected{outline:2px solid var(--accent);outline-offset:-2px}',
+'.vs-list-col{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+'.vs-list-col-thumb{width:64px;min-width:64px;height:36px;position:relative;margin-right:12px;background:#111;border-radius:3px;overflow:hidden;display:flex;align-items:center;justify-content:center}',
+'.vs-list-col-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}',
+'.vs-list-col-thumb .vs-thumb-placeholder{font-size:14px;opacity:.3}',
+'.vs-list-col-title{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}',
+'.vs-list-col-title .vs-progress-bar{width:100%;height:3px;background:var(--bg-tertiary, rgba(255,255,255,.06));border-radius:1px;overflow:hidden}',
+'.vs-list-col-title .vs-progress-fill{height:100%;background:var(--accent)}',
+'.vs-list-col-year{width:60px;text-align:center;color:var(--text-muted);font-variant-numeric:tabular-nums}',
+'.vs-list-col-dur{width:70px;text-align:center;color:var(--text-muted);font-variant-numeric:tabular-nums}',
+'.vs-list-col-res{width:64px;text-align:center;color:var(--text-muted)}',
+'.vs-list-col-codec{width:72px;text-align:center;color:var(--text-muted);font-size:11px}',
+'.vs-list-col-size{width:80px;text-align:right;color:var(--text-muted);font-variant-numeric:tabular-nums}',
+'.vs-select-mode .vs-list-row{cursor:pointer}',
+'.vs-list-row .vs-checkbox{margin-right:12px}',
+'@media (max-width:768px){.vs-list-col-codec,.vs-list-col-size{display:none}.vs-list-col-year{display:none}}',
+'@media (max-width:480px){.vs-list-col-res{display:none}}',
+
 /* pagination */
 '.vs-pagination{display:flex;align-items:center;justify-content:center;gap:12px;padding:16px 0}',
 '.vs-page-info{font-size:13px;color:var(--text-muted)}',
@@ -2831,6 +3040,12 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 '.vs-sub-select option{background:#222;color:#fff}',
 '.vs-speed-select{background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:4px;padding:2px 6px;font-size:12px;cursor:pointer}',
 '.vs-speed-select option{background:#222;color:#fff}',
+'.vs-player-error{position:absolute;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.8);backdrop-filter:blur(8px)}',
+'.vs-player-error-box{text-align:center;color:#fff;max-width:380px;padding:32px}',
+'.vs-player-error-box i{font-size:48px;color:#ff9800;margin-bottom:16px}',
+'.vs-player-error-box p{font-size:16px;margin:8px 0}',
+'.vs-player-error-sub{font-size:13px!important;color:rgba(255,255,255,.5)}',
+'.vs-player-error-btns{display:flex;gap:10px;justify-content:center;margin-top:20px}',
 '.vs-ctx-menu{position:fixed;background:var(--bg-elevated,#2a2a2e);border:1px solid var(--border);border-radius:var(--r-md,6px);padding:4px 0;z-index:9999;min-width:180px;box-shadow:0 8px 24px rgba(0,0,0,.5)}',
 '.vs-ctx-item{padding:8px 14px;cursor:pointer;font-size:13px;color:var(--text-primary,#fff);display:flex;align-items:center;gap:8px;white-space:nowrap}',
 '.vs-ctx-item:hover{background:var(--bg-hover,rgba(255,255,255,.08))}',

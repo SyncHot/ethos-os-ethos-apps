@@ -1629,7 +1629,8 @@ After=local-fs.target
 [Service]
 Type=simple
 User=%i
-ExecStart=/usr/bin/devmon --no-gui
+ExecStart=/usr/bin/devmon --no-gui --exec-on-drive "chmod o+x /media/%i"
+ExecStartPost=/bin/chmod o+x /media/%i
 Restart=on-failure
 RestartSec=5
 
@@ -1981,6 +1982,12 @@ manual_add_modules loop
 manual_add_modules dm_verity
 manual_add_modules dm_mod
 manual_add_modules btrfs
+# NVMe/AHCI/virtio storage — must be in initrd so the kernel can
+# find the root partition on any storage controller, even when
+# building in a VM that has no NVMe hardware itself.
+manual_add_modules nvme nvme_core nvme_fabrics
+manual_add_modules ahci libahci
+manual_add_modules virtio_blk virtio_pci
 copy_exec /sbin/losetup /sbin
 copy_exec /sbin/blkid /sbin
 # dm-verity support (optional — only if veritysetup is installed)
@@ -3291,7 +3298,16 @@ def _github_api(method, path, token, body=None, timeout=30):
                     reset_ts = e.headers.get('X-RateLimit-Reset', '')
                     parsed['_hint'] = f'Przekroczono limit GitHub API. Poczekaj chwilę.'
                 else:
-                    parsed['_hint'] = 'Brak uprawnień. Token musi mieć scope: repo (lub contents:write).'
+                    msg_text = parsed.get('message', '')
+                    if 'personal access token' in msg_text or 'Resource not accessible' in msg_text:
+                        parsed['_hint'] = (
+                            'Fine-grained PAT nie ma uprawnienia do zapisu. '
+                            'Wejdź w GitHub Settings → Fine-grained tokens → edytuj token → '
+                            'Repository permissions → Contents: ustaw "Read and write". '
+                            'Lub użyj classic PAT (ghp_...) ze scope "repo".'
+                        )
+                    else:
+                        parsed['_hint'] = 'Brak uprawnień. Token musi mieć scope: repo (lub Contents: Read and write dla fine-grained PAT).'
             elif e.code == 404:
                 parsed['_hint'] = f'Nie znaleziono zasobu GitHub: {path}'
             elif e.code == 422:

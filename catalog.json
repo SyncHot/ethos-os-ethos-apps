@@ -23,7 +23,7 @@
         {
             "id": "ai-chat",
             "name": "AI Assistant",
-            "version": "1.0.2",
+            "version": "1.0.3",
             "icon": "fa-robot",
             "color": "#8b5cf6",
             "category": "Tools",
@@ -71,7 +71,7 @@
         {
             "id": "gallery",
             "name": "Gallery",
-            "version": "1.0.3",
+            "version": "1.0.4",
             "icon": "fa-images",
             "color": "#ec4899",
             "category": "Media",
@@ -215,7 +215,7 @@
         {
             "id": "builder",
             "name": "Builder",
-            "version": "1.0.20",
+            "version": "1.0.21",
             "icon": "fa-hammer",
             "color": "#f97316",
             "category": "System",
@@ -268,7 +268,7 @@
         {
             "id": "sharing-samba",
             "name": "File Sharing (Samba)",
-            "version": "1.0.20",
+            "version": "1.0.21",
             "icon": "fa-windows",
             "color": "#6366f1",
             "category": "Network",
@@ -572,7 +572,7 @@
         {
             "id": "tickets",
             "name": "Tickets",
-            "version": "1.0.1",
+            "version": "1.0.2",
             "icon": "fa-tasks",
             "color": "#06b6d4",
             "category": "Tools",
@@ -651,7 +651,7 @@
         {
             "id": "video-station",
             "name": "Video Station",
-            "version": "0.0.10",
+            "version": "0.0.11",
             "icon": "fa-film",
             "color": "#7c3aed",
             "category": "Media",
@@ -668,7 +668,7 @@
         {
             "id": "radio-music",
             "name": "Radio & Music",
-            "version": "0.0.7",
+            "version": "0.0.8",
             "icon": "fa-broadcast-tower",
             "color": "#10b981",
             "category": "Media",

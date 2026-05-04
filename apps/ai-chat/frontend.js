@@ -2012,6 +2012,14 @@ window._aicCloseSettings = function () {
 
 function _aicRenderSettings(root) {
     var c = _aic.cfg || {};
+    var provider = c.provider || 'local';
+    
+    var providerHint = provider === 'local'
+        ? '<div class="aic-field-hint aic-ok"><i class="fas fa-shield-alt"></i> ' + t('100% lokalny model — Twoje dane nie opuszczają serwera') + '</div>'
+        : provider === 'ollama'
+        ? '<div class="aic-field-hint aic-ok"><i class="fas fa-server"></i> ' + t('Zdalne Ollama — pełna kontrola nad danymi') + '</div>'
+        : '<div class="aic-field-hint aic-warning"><i class="fas fa-cloud"></i> ' + t('Zdalne API — Twoje dane są przesyłane do zewnętrznego serwera') + '</div>';
+    
     root.innerHTML =
         '<div class="aic-settings">' +
             '<div class="aic-settings-header">' +
@@ -2019,9 +2027,52 @@ function _aicRenderSettings(root) {
                 '<span class="aic-settings-title">' + t('Ustawienia AI Chat') + '</span>' +
             '</div>' +
             '<div class="aic-settings-body">' +
-                '<div class="aic-field">' +
-                    '<label>' + t('Dostawca') + '</label>' +
-                    '<div class="aic-field-hint aic-ok"><i class="fas fa-shield-alt"></i> ' + t('100% lokalny model — Twoje dane nie opuszczają serwera') + '</div>' +
+                /* ── Provider section ── */
+                '<div class="aic-settings-section">' +
+                    '<h3><i class="fas fa-network-wired"></i> ' + t('Dostawca') + '</h3>' +
+                    '<div class="aic-field">' +
+                        '<label>' + t('Dostawca usługi') + '</label>' +
+                        '<select id="aicProvider" onchange="window._aicUpdateProviderUI()">' +
+                            '<option value="local"' + (provider === 'local' ? ' selected' : '') + '>' + t('Lokalny model') + '</option>' +
+                            '<option value="ollama"' + (provider === 'ollama' ? ' selected' : '') + '>Ollama (' + t('zdalne') + ')</option>' +
+                            '<option value="openai"' + (provider === 'openai' ? ' selected' : '') + '>OpenAI</option>' +
+                            '<option value="azure"' + (provider === 'azure' ? ' selected' : '') + '>Azure OpenAI</option>' +
+                        '</select>' +
+                        providerHint +
+                    '</div>' +
+                    /* ── Ollama section (shown only when Ollama is selected) ── */
+                    '<div id="aicOllamaSection"' + (provider === 'ollama' ? '' : ' style="display:none"') + '>' +
+                        '<div class="aic-field">' +
+                            '<label>' + t('URL serwera Ollama') + '</label>' +
+                            '<input type="text" id="aicOllamaUrl" value="' + _aicEsc(c.ollama_url || 'http://localhost:11434') + '" placeholder="http://localhost:11434" onchange="window._aicUpdateProviderUI()">' +
+                            '<div class="aic-field-hint">' + t('np. http://192.168.1.100:11434 lub http://localhost:11434') + '</div>' +
+                        '</div>' +
+                        '<div class="aic-field">' +
+                            '<label>' + t('Klucz API Ollama') + ' (' + t('opcjonalnie') + ')</label>' +
+                            '<input type="password" id="aicOllamaApiKey" value="' + _aicEsc(c.ollama_api_key || '') + '" placeholder="' + t('Pozostaw puste jeśli nie jest wymagany') + '">' +
+                            '<div class="aic-field-hint">' + t('Jeśli serwer Ollama wymaga autentykacji') + '</div>' +
+                        '</div>' +
+                        '<div class="aic-field">' +
+                            '<label>' + t('Model Ollama') + ' <button type="button" id="aicOllamaRefresh" onclick="window._aicLoadOllamaModels()" style="margin-left:8px;font-size:11px;padding:2px 8px;cursor:pointer;background:var(--bg3);border:1px solid var(--border);border-radius:4px;color:var(--text2)" title="' + t('Odśwież listę modeli') + '"><i class="fas fa-sync-alt"></i></button></label>' +
+                            '<select id="aicOllamaModel" style="width:100%;padding:6px;background:var(--bg2);border:1px solid var(--border);border-radius:6px;color:var(--text1);font-size:13px">' +
+                                '<option value="' + _aicEsc(c.model || '') + '">' + _aicEsc(c.model || t('Ładowanie...')) + '</option>' +
+                            '</select>' +
+                            '<div class="aic-field-hint" id="aicOllamaModelHint">' + t('Kliknij odśwież aby załadować listę modeli z serwera') + '</div>' +
+                        '</div>' +
+                    '</div>' +
+                    /* ── OpenAI/Azure section ── */
+                    '<div id="aicRemoteApiSection"' + (provider === 'local' || provider === 'ollama' ? ' style="display:none"' : '') + '>' +
+                        '<div class="aic-field">' +
+                            '<label>' + t('Klucz API') + '</label>' +
+                            '<input type="password" id="aicApiKey" value="' + _aicEsc(c.api_key_set ? '••••••••' : '') + '" placeholder="' + t('Wklej swój klucz API') + '">' +
+                            '<div class="aic-field-hint">' + (c.api_key_masked ? t('Obecny klucz:') + ' ' + c.api_key_masked : '') + '</div>' +
+                        '</div>' +
+                        '<div class="aic-field">' +
+                            '<label>' + t('Endpoint') + '</label>' +
+                            '<input type="text" id="aicEndpoint" value="' + _aicEsc(c.endpoint || '') + '" placeholder="https://api.openai.com/v1/chat/completions">' +
+                            '<div class="aic-field-hint">' + t('Dla Azure: https://[nazwa].openai.azure.com/openai/deployments/[deployment]/chat/completions?api-version=2024-02-15-preview') + '</div>' +
+                        '</div>' +
+                    '</div>' +
                 '</div>' +
                 '<div class="aic-field-row">' +
                     '<div class="aic-field">' +
@@ -2088,16 +2139,81 @@ function _aicRenderSettings(root) {
                 '</div>' +
             '</div>' +
         '</div>';
+    // Auto-load Ollama models if Ollama is already selected
+    if (provider === 'ollama') {
+        setTimeout(function() { window._aicLoadOllamaModels(); }, 0);
+    }
 }
 
+window._aicUpdateProviderUI = function () {
+    var provider = document.getElementById('aicProvider').value;
+    var ollamaSection = document.getElementById('aicOllamaSection');
+    var remoteApiSection = document.getElementById('aicRemoteApiSection');
+    
+    if (provider === 'ollama') {
+        ollamaSection.style.display = 'block';
+        remoteApiSection.style.display = 'none';
+        window._aicLoadOllamaModels();
+    } else if (provider === 'local') {
+        ollamaSection.style.display = 'none';
+        remoteApiSection.style.display = 'none';
+    } else {
+        ollamaSection.style.display = 'none';
+        remoteApiSection.style.display = 'block';
+    }
+};
+
+window._aicLoadOllamaModels = function () {
+    var sel = document.getElementById('aicOllamaModel');
+    var hint = document.getElementById('aicOllamaModelHint');
+    var urlInput = document.getElementById('aicOllamaUrl');
+    if (!sel) return;
+    var currentVal = sel.value;
+    var urlParam = urlInput ? encodeURIComponent(urlInput.value.trim()) : '';
+    if (hint) hint.textContent = 'Ładowanie...';
+    _aicFetch('/api/aichat/ollama-models' + (urlParam ? '?url=' + urlParam : ''))
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            var models = data.models || [];
+            if (models.length === 0) {
+                sel.innerHTML = '<option value="">' + (data.error ? 'Błąd: ' + data.error.substring(0,60) : 'Brak modeli') + '</option>';
+                if (hint) hint.textContent = 'Nie znaleziono modeli. Sprawdź URL i czy Ollama działa.';
+            } else {
+                sel.innerHTML = models.map(function(m) {
+                    return '<option value="' + m + '"' + (m === currentVal ? ' selected' : '') + '>' + m + '</option>';
+                }).join('');
+                if (models.includes(currentVal)) sel.value = currentVal;
+                if (hint) hint.textContent = 'Znaleziono ' + models.length + ' modeli';
+            }
+        })
+        .catch(function() {
+            if (hint) hint.textContent = 'Nie można pobrać listy — sprawdź URL serwera Ollama';
+        });
+};
+
 window._aicSaveSettings = function () {
+    var provider = document.getElementById('aicProvider').value;
     var data = {
-        provider: 'local',
+        provider: provider,
         max_tokens: parseInt(document.getElementById('aicMaxTokens').value) || 4096,
         workspace: document.getElementById('aicWorkspace').value.trim(),
         rag_enabled: document.getElementById('aicRagEnabled') ? document.getElementById('aicRagEnabled').checked : true,
         rag_top_k: parseInt((document.getElementById('aicRagTopK') || {}).value) || 5,
     };
+    
+    // Add provider-specific fields
+    if (provider === 'ollama') {
+        data.ollama_url = document.getElementById('aicOllamaUrl').value.trim() || 'http://localhost:11434';
+        data.ollama_api_key = document.getElementById('aicOllamaApiKey').value.trim();
+        data.model = document.getElementById('aicOllamaModel').value.trim() || 'mistral';
+    } else if (provider !== 'local') {
+        var apiKeyInput = document.getElementById('aicApiKey').value.trim();
+        // Only update api_key if it's not masked (i.e., user typed a new one)
+        if (apiKeyInput && !apiKeyInput.includes('•')) {
+            data.api_key = apiKeyInput;
+        }
+        data.endpoint = document.getElementById('aicEndpoint').value.trim() || 'https://api.openai.com/v1/chat/completions';
+    }
 
     _aicFetch('/api/aichat/config', {
         method: 'POST',
