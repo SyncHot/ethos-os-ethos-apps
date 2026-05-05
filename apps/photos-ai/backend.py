@@ -593,7 +593,7 @@ def install_deps():
     def _do():
         steps = []
         try:
-            host_run('apt-get update -qq && apt-get install -y -qq cmake libopenblas-dev liblapack-dev && apt-get clean', timeout=120)
+            host_run('apt-get update -qq && apt-get install -y -qq cmake libopenblas-dev && apt-get clean', timeout=120)
             steps.append('system_deps')
             pip = os.path.join(app_path(), 'venv', 'bin', 'pip')
             host_run(f'{q(pip)} install --quiet face_recognition onnxruntime scipy', timeout=600)

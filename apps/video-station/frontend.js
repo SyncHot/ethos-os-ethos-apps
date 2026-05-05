@@ -182,50 +182,86 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
   </div>
 </div>
 <div class="vs-player-overlay" id="vs-player-overlay" style="display:none">
-  <div class="vs-player-top">
-    <span class="vs-player-title" id="vs-player-title"></span>
+
+  <!-- Top bar: title + badge -->
+  <div class="vs-nf-top" id="vs-player-top">
+    <span class="vs-nf-title" id="vs-player-title"></span>
     <span class="vs-player-badge" id="vs-player-badge" style="display:none"><i class="fas fa-sync-alt fa-spin"></i> ${t('Transkodowanie')}</span>
-    <select class="vs-audio-select" id="vs-audio-select" style="display:none"></select>
-    <select class="vs-sub-select" id="vs-sub-select" style="display:none"></select>
-    <select class="vs-speed-select" id="vs-speed-select">
-      <option value="0.5">0.5x</option>
-      <option value="0.75">0.75x</option>
-      <option value="1" selected>1x</option>
-      <option value="1.25">1.25x</option>
-      <option value="1.5">1.5x</option>
-      <option value="2">2x</option>
-    </select>
-    <button class="vs-pip-btn" id="vs-pip-btn" title="${t('Obraz w obrazie')}"><i class="fas fa-external-link-alt"></i></button>
-    <button class="vs-cast-btn" id="vs-cast-btn" title="${t('Cast na TV')}" style="display:none"><i class="fas fa-tv"></i></button>
-    <button class="vs-stats-btn" id="vs-stats-btn" title="${t('Statystyki dla geeków')}"><i class="fas fa-chart-bar"></i></button>
-    <button class="vs-fs-btn" id="vs-fs-btn" title="${t('Pełny ekran')}"><i class="fas fa-expand"></i></button>
-    <button class="vs-player-close" id="vs-player-close"><i class="fas fa-times"></i></button>
   </div>
+
+  <!-- Video -->
   <video id="vs-player-video" autoplay playsinline></video>
+
+  <!-- Center: click-to-toggle + animation feedback -->
   <div class="vs-player-center" id="vs-player-center">
-    <button class="vs-cc-btn" id="vs-cc-rw"><i class="fas fa-undo-alt"></i><span>10</span></button>
-    <button class="vs-cc-btn vs-cc-play" id="vs-cc-play"><i class="fas fa-pause"></i></button>
-    <button class="vs-cc-btn" id="vs-cc-ff"><i class="fas fa-redo-alt"></i><span>10</span></button>
+    <div class="vs-nf-anim" id="vs-nf-anim"></div>
   </div>
-  <div class="vs-player-bottom" id="vs-player-bottom">
-    <span class="vs-pb-time" id="vs-pb-cur">0:00</span>
-    <div class="vs-pb-seek-wrap" id="vs-pb-seek-wrap">
-      <div class="vs-pb-seek-track">
-        <div class="vs-pb-seek-buf" id="vs-pb-seek-buf"></div>
-        <div class="vs-pb-seek-fill" id="vs-pb-seek-fill"></div>
+
+  <!-- Bottom controls (Netflix layout) -->
+  <div class="vs-nf-bottom" id="vs-player-bottom">
+
+    <!-- Seek / progress bar -->
+    <div class="vs-nf-scrubber" id="vs-pb-seek-wrap">
+      <!-- Thumbstrip hover preview -->
+      <div class="vs-nf-preview" id="vs-thumbstrip-preview" style="display:none">
+        <canvas id="vs-thumbstrip-canvas" width="160" height="90"></canvas>
+        <span class="vs-nf-preview-time" id="vs-thumbstrip-time"></span>
       </div>
-      <input type="range" class="vs-pb-seek" id="vs-pb-seek" min="0" max="100" value="0" step="0.1">
+      <div class="vs-nf-bar">
+        <div class="vs-nf-bar-buf"  id="vs-pb-seek-buf"></div>
+        <div class="vs-nf-bar-fill" id="vs-pb-seek-fill"></div>
+        <div class="vs-nf-bar-dot"  id="vs-nf-thumb"></div>
+      </div>
+      <input type="range" class="vs-nf-range" id="vs-pb-seek" min="0" max="100" value="0" step="0.1">
     </div>
-    <span class="vs-pb-time" id="vs-pb-dur">0:00</span>
-  </div>
-  <div class="vs-seek-hint vs-seek-hint-left" id="vs-seek-hint-left"><i class="fas fa-backward"></i><span>-10s</span></div>
+
+    <!-- Controls row -->
+    <div class="vs-nf-controls">
+      <div class="vs-nf-ctrls-left">
+        <button class="vs-nf-btn vs-nf-btn-play" id="vs-pb-play" title="${t('Odtwórz/Pauza')}"><i class="fas fa-pause"></i></button>
+        <button class="vs-nf-btn vs-nf-btn-skip" id="vs-cc-rw" title="-10s">
+          <span class="vs-nf-skip-wrap"><i class="fas fa-rotate-left"></i><span class="vs-nf-skip-n">10</span></span>
+        </button>
+        <button class="vs-nf-btn vs-nf-btn-skip" id="vs-cc-ff" title="+10s">
+          <span class="vs-nf-skip-wrap"><i class="fas fa-rotate-right"></i><span class="vs-nf-skip-n">10</span></span>
+        </button>
+        <div class="vs-nf-vol-grp">
+          <button class="vs-nf-btn" id="vs-mute-btn" title="${t('Wycisz')}"><i class="fas fa-volume-up"></i></button>
+          <div class="vs-nf-vol-slider-wrap">
+            <input type="range" class="vs-nf-vol-range" id="vs-vol-range" min="0" max="1" step="0.02" value="1">
+          </div>
+        </div>
+        <div class="vs-nf-time-wrap">
+          <span class="vs-nf-time-cur" id="vs-pb-cur">0:00</span>
+          <span class="vs-nf-time-sep">&thinsp;/&thinsp;</span>
+          <span class="vs-nf-time-dur" id="vs-pb-dur">0:00</span>
+        </div>
+      </div>
+      <div class="vs-nf-ctrls-right">
+        <select class="vs-nf-select" id="vs-speed-select">
+          <option value="0.5">0.5×</option>
+          <option value="0.75">0.75×</option>
+          <option value="1" selected>1×</option>
+          <option value="1.25">1.25×</option>
+          <option value="1.5">1.5×</option>
+          <option value="2">2×</option>
+        </select>
+        <select class="vs-nf-select" id="vs-audio-select" style="display:none"></select>
+        <select class="vs-nf-select" id="vs-sub-select"   style="display:none"></select>
+        <button class="vs-nf-btn" id="vs-cast-btn"  title="${t('Cast na TV')}" style="display:none"><i class="fas fa-tv"></i></button>
+        <button class="vs-nf-btn" id="vs-pip-btn"   title="${t('Obraz w obrazie')}"><i class="fas fa-clone"></i></button>
+        <button class="vs-nf-btn" id="vs-stats-btn" title="${t('Statystyki')}"><i class="fas fa-chart-bar"></i></button>
+        <button class="vs-nf-btn vs-nf-btn-fs" id="vs-fs-btn" title="${t('Pełny ekran')}"><i class="fas fa-expand"></i></button>
+        <button class="vs-nf-btn vs-nf-btn-close" id="vs-player-close" title="${t('Zamknij')}"><i class="fas fa-times"></i></button>
+      </div>
+    </div>
+
+  </div><!-- /vs-nf-bottom -->
+
+  <div class="vs-seek-hint vs-seek-hint-left"  id="vs-seek-hint-left"><i class="fas fa-backward"></i><span>-10s</span></div>
   <div class="vs-seek-hint vs-seek-hint-right" id="vs-seek-hint-right"><i class="fas fa-forward"></i><span>+10s</span></div>
-  <div class="vs-swipe-hint" id="vs-swipe-hint"></div>
+  <div class="vs-swipe-hint"   id="vs-swipe-hint"></div>
   <div class="vs-stats-overlay" id="vs-stats-overlay" style="display:none"></div>
-  <div class="vs-thumbstrip-preview" id="vs-thumbstrip-preview" style="display:none">
-    <canvas id="vs-thumbstrip-canvas" width="160" height="90"></canvas>
-    <span class="vs-thumbstrip-time" id="vs-thumbstrip-time"></span>
-  </div>
   <div class="vs-resume-dialog" id="vs-resume-dialog" style="display:none">
     <div class="vs-resume-box">
       <div class="vs-resume-text" id="vs-resume-text"></div>
@@ -640,6 +676,24 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         const content = bodyEl.querySelector('#vs-content');
         if (!toolbar || !content) return;
 
+        // Toggle Netflix home mode
+        const layout = bodyEl.querySelector('.vs-layout');
+        if (layout) {
+            if (id === 'home') {
+                if (!layout.classList.contains('vs-home-mode'))
+                    layout.dataset.prevSidebar = layout.classList.contains('vs-sidebar-collapsed') ? '1' : '0';
+                layout.classList.add('vs-home-mode');
+            } else {
+                if (layout.classList.contains('vs-home-mode')) {
+                    layout.classList.remove('vs-home-mode');
+                    if (layout.dataset.prevSidebar === '0') {
+                        layout.classList.remove('vs-sidebar-collapsed');
+                        sidebarCollapsed = false;
+                    }
+                }
+            }
+        }
+
         switch (id) {
             case 'home':       toolbar.innerHTML = ''; loadHome(); break;
             case 'library':    renderLibraryToolbar(toolbar); loadLibrary(); break;
@@ -811,6 +865,21 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 
         let html = '<div class="vs-home">';
 
+        // Netflix-style top nav
+        html += '<div class="vs-nf-topnav" id="vs-nf-topnav">';
+        html += '<button class="vs-nf-topnav-menu" id="vs-nf-menu-btn" title="' + t('Menu') + '"><i class="fas fa-bars"></i></button>';
+        html += '<div class="vs-nf-topnav-logo" id="vs-nf-logo" title="' + t('Strona główna') + '"><i class="fas fa-film"></i></div>';
+        html += '<div class="vs-nf-topnav-links">';
+        html += '<span class="vs-nf-topnav-link active" data-section="home">' + t('Strona główna') + '</span>';
+        html += '<span class="vs-nf-topnav-link" data-section="library">' + t('Filmy') + '</span>';
+        html += '<span class="vs-nf-topnav-link" data-section="recent">' + t('Nowe') + '</span>';
+        html += '<span class="vs-nf-topnav-link" data-section="collections">' + t('Kolekcje') + '</span>';
+        html += '</div>';
+        html += '<div class="vs-nf-topnav-right">';
+        html += '<button class="vs-nf-topnav-btn" id="vs-nf-search-btn" title="' + t('Szukaj') + '"><i class="fas fa-search"></i></button>';
+        html += '</div>';
+        html += '</div>';
+
         // Hero banner
         const hero = data.hero;
         if (hero) {
@@ -881,6 +950,39 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         }
         html += '</div>';
         content.innerHTML = html;
+
+        // Top nav: scroll → solid background
+        const contentEl = bodyEl.querySelector('#vs-content');
+        const topnav = content.querySelector('#vs-nf-topnav');
+        if (contentEl && topnav) {
+            if (contentEl._vsNavScroll) contentEl.removeEventListener('scroll', contentEl._vsNavScroll);
+            contentEl._vsNavScroll = () => topnav.classList.toggle('vs-nf-solid', contentEl.scrollTop > 50);
+            contentEl.addEventListener('scroll', contentEl._vsNavScroll);
+        }
+        // Top nav link clicks
+        content.querySelectorAll('.vs-nf-topnav-link[data-section]').forEach(link =>
+            link.onclick = () => switchSection(link.dataset.section));
+        // Hamburger → show sidebar (exit home mode)
+        const menuBtn = content.querySelector('#vs-nf-menu-btn');
+        if (menuBtn) menuBtn.onclick = () => {
+            const layout = bodyEl.querySelector('.vs-layout');
+            if (layout) {
+                layout.classList.remove('vs-home-mode');
+                if (layout.dataset.prevSidebar === '0') {
+                    layout.classList.remove('vs-sidebar-collapsed');
+                    sidebarCollapsed = false;
+                }
+            }
+        };
+        // Logo → home
+        const logoBtn = content.querySelector('#vs-nf-logo');
+        if (logoBtn) logoBtn.onclick = () => switchSection('home');
+        // Search button → library with search focused
+        const searchBtn = content.querySelector('#vs-nf-search-btn');
+        if (searchBtn) searchBtn.onclick = () => {
+            switchSection('library');
+            setTimeout(() => { const si = bodyEl.querySelector('#vs-search'); if (si) si.focus(); }, 80);
+        };
 
         // Hero buttons
         content.querySelectorAll('.vs-hero-play').forEach(btn =>
@@ -1450,6 +1552,7 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             items += '<div class="vs-ctx-item" data-action="hide"><i class="fas fa-eye-slash"></i> ' + t('Ukryj') + '</div>';
         }
         items += '<div class="vs-ctx-item vs-ctx-danger" data-action="remove"><i class="fas fa-trash-alt"></i> ' + t('Usuń z biblioteki') + '</div>';
+        items += '<div class="vs-ctx-item vs-ctx-danger" data-action="delete"><i class="fas fa-trash"></i> ' + t('Usuń plik z dysku') + '</div>';
         menu.innerHTML = items;
         menu.style.left = e.clientX + 'px';
         menu.style.top = e.clientY + 'px';
@@ -1477,6 +1580,14 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
                     const res = await api('/video-station/remove/' + vid, { method: 'POST' });
                     if (res.error) { toast(res.error, 'error'); return; }
                     toast(t('Usunięto z biblioteki'), 'success');
+                    _reloadSection();
+                } else if (action === 'delete') {
+                    const item = libraryItems.find(i => String(i.id) === String(vid));
+                    const fname = item ? (item.filename || '') : '';
+                    if (!await confirmDialog(t('TRWALE usunąć plik z dysku?') + (fname ? '\n\n' + fname : '') + '\n\n' + t('Tej operacji nie można cofnąć!'))) return;
+                    const res = await api('/video-station/delete/' + vid, { method: 'POST' });
+                    if (res.error) { toast(res.error, 'error'); return; }
+                    toast(t('Plik usunięty z dysku'), 'success');
                     _reloadSection();
                 } else if (action === 'info') {
                     _showInfoModal(vid);
@@ -1621,9 +1732,19 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
     }
 
     /* ── TMDb search dialog ─────────────────────────────────────── */
-    function _showTmdbSearchDialog(vid) {
-        const item = libraryItems.find(i => String(i.id) === String(vid));
-        const initialQuery = item ? (item.title || item.filename || '').replace(/\.[^.]+$/, '') : '';
+    async function _showTmdbSearchDialog(vid) {
+        // Fetch parsed title+year from backend (handles DDLValley.me_83_ prefixes etc.)
+        let initialTitle = '';
+        let initialYear  = '';
+        const parsed = await api('/video-station/parse-title/' + vid).catch(() => null);
+        if (parsed && !parsed.error) {
+            initialTitle = parsed.title || '';
+            initialYear  = parsed.year  || '';
+        } else {
+            const item = libraryItems.find(i => String(i.id) === String(vid));
+            initialTitle = item ? (item.title || item.filename || '').replace(/\.[^.]+$/, '') : '';
+        }
+
         const overlay = document.createElement('div');
         overlay.className = 'vs-modal-overlay vs-tmdb-overlay';
         overlay.innerHTML =
@@ -1631,7 +1752,8 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             '<div class="vs-tmdb-header"><span><i class="fas fa-wand-magic-sparkles"></i> ' + t('Wyszukaj w TMDb') + '</span>' +
             '<button class="vs-tmdb-close"><i class="fas fa-times"></i></button></div>' +
             '<div class="vs-tmdb-search-row">' +
-            '<input class="vs-tmdb-search-input" id="vs-tmdb-q" type="text" placeholder="' + t('Tytuł filmu lub serialu…') + '" value="' + initialQuery.replace(/"/g, '&quot;') + '" />' +
+            '<input class="vs-tmdb-search-input vs-tmdb-q" id="vs-tmdb-q" type="text" placeholder="' + t('Tytuł filmu lub serialu…') + '" value="' + initialTitle.replace(/"/g, '&quot;') + '" />' +
+            '<input class="vs-tmdb-year-input" id="vs-tmdb-year" type="text" placeholder="' + t('Rok') + '" maxlength="4" value="' + initialYear + '" />' +
             '<button class="vs-btn-primary vs-tmdb-search-btn" id="vs-tmdb-search-btn"><i class="fas fa-search"></i> ' + t('Szukaj') + '</button>' +
             '</div>' +
             '<div class="vs-tmdb-results" id="vs-tmdb-results"><p class="vs-tmdb-hint">' + t('Wpisz tytuł i kliknij Szukaj') + '</p></div>' +
@@ -1641,12 +1763,14 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
 
         const doSearch = async () => {
-            const q = overlay.querySelector('#vs-tmdb-q').value.trim();
+            const q    = overlay.querySelector('#vs-tmdb-q').value.trim();
+            const year = overlay.querySelector('#vs-tmdb-year').value.trim();
             if (!q) return;
             const resultsEl = overlay.querySelector('#vs-tmdb-results');
             resultsEl.innerHTML = '<p class="vs-tmdb-hint"><i class="fas fa-spinner fa-spin"></i> ' + t('Szukam…') + '</p>';
             try {
-                const res = await api('/video-station/tmdb-search-list?q=' + encodeURIComponent(q));
+                const url = '/video-station/tmdb-search-list?q=' + encodeURIComponent(q) + (year ? '&year=' + encodeURIComponent(year) : '');
+                const res = await api(url);
                 if (res.error) { resultsEl.innerHTML = '<p class="vs-tmdb-hint vs-tmdb-error">' + res.error + '</p>'; return; }
                 if (!res.results || !res.results.length) { resultsEl.innerHTML = '<p class="vs-tmdb-hint">' + t('Brak wyników') + '</p>'; return; }
                 resultsEl.innerHTML = res.results.map(r => {
@@ -1670,7 +1794,7 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
                         try {
                             const r2 = await api('/video-station/tmdb-apply/' + vid, {
                                 method: 'POST',
-                                body: JSON.stringify({ tmdb_id: el.dataset.id, type: el.dataset.type })
+                                body: { tmdb_id: el.dataset.id, type: el.dataset.type }
                             });
                             if (r2.error) { toast(r2.error, 'error'); el.style.opacity = ''; return; }
                             toast(t('Metadane zaktualizowane!'), 'success');
@@ -1683,8 +1807,9 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         };
 
         overlay.querySelector('#vs-tmdb-search-btn').onclick = doSearch;
-        overlay.querySelector('#vs-tmdb-q').onkeydown = (e) => { if (e.key === 'Enter') doSearch(); };
-        if (initialQuery) doSearch();
+        overlay.querySelector('#vs-tmdb-q').onkeydown    = (e) => { if (e.key === 'Enter') doSearch(); };
+        overlay.querySelector('#vs-tmdb-year').onkeydown = (e) => { if (e.key === 'Enter') doSearch(); };
+        if (initialTitle) doSearch();
     }
 
 
@@ -2065,15 +2190,18 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             if (!_thumbVtt || !_thumbImg || !_thumbImg.complete || _thumbVid !== vid) return;
             const rect = overlay.getBoundingClientRect();
             const relY = e.clientY - rect.top;
-            // Only show preview when mouse is in bottom 60px (near seek bar)
-            if (relY < rect.height - 80 || relY > rect.height - 10) {
+            // Only show when mouse is near the bottom seek bar
+            if (relY < rect.height - 100 || relY > rect.height - 10) {
                 preview.style.display = 'none'; return;
             }
-            const relX = e.clientX - rect.left;
-            const fraction = Math.max(0, Math.min(1, relX / rect.width));
+            const scrubber = overlay.querySelector('.vs-nf-scrubber');
+            const scrubRect = scrubber ? scrubber.getBoundingClientRect() : rect;
+            const pad = 20; // scrubber padding
+            const barW = scrubRect.width - 2 * pad;
+            const relX = e.clientX - scrubRect.left - pad;
+            const fraction = Math.max(0, Math.min(1, relX / barW));
             const seekTime = fraction * duration;
-            const entry = _thumbVtt.find(t => seekTime >= t.start && seekTime <= t.end)
-                || _thumbVtt[0];
+            const entry = _thumbVtt.find(t => seekTime >= t.start && seekTime <= t.end) || _thumbVtt[0];
             if (!entry) { preview.style.display = 'none'; return; }
 
             const ctx = canvas.getContext('2d');
@@ -2084,9 +2212,10 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             } catch (_) { preview.style.display = 'none'; return; }
 
             timeEl.textContent = formatDuration(seekTime);
-            const px = Math.max(80, Math.min(rect.width - 80, e.clientX - rect.left));
-            preview.style.left = (px - canvas.width / 2) + 'px';
-            preview.style.bottom = '70px';
+            const halfW = canvas.width / 2;
+            // Position preview within scrubber (absolute left from scrubber edge)
+            const clampedX = Math.max(pad + halfW, Math.min(scrubRect.width - pad - halfW, relX + pad));
+            preview.style.left = (clampedX - halfW) + 'px';
             preview.style.display = 'flex';
         }
 
@@ -2161,17 +2290,136 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         overlay._playerAC = ac;
         const sig = { signal: ac.signal };
 
-        // Hide custom controls — use native browser controls
-        const center = bodyEl.querySelector('#vs-player-center');
-        const bottom = bodyEl.querySelector('#vs-player-bottom');
-        if (center) center.style.display = 'none';
-        if (bottom) bottom.style.display = 'none';
+        // Always use custom controls (unified player experience)
+        const center    = bodyEl.querySelector('#vs-player-center');
+        const bottom    = bodyEl.querySelector('#vs-player-bottom');
+        const seekFill  = bodyEl.querySelector('#vs-pb-seek-fill');
+        const seekBuf   = bodyEl.querySelector('#vs-pb-seek-buf');
+        const seekInput = bodyEl.querySelector('#vs-pb-seek');
+        const pbCur     = bodyEl.querySelector('#vs-pb-cur');
+        const pbDur     = bodyEl.querySelector('#vs-pb-dur');
+        const ccRw      = bodyEl.querySelector('#vs-cc-rw');
+        const ccFf      = bodyEl.querySelector('#vs-cc-ff');
+        const pbPlay    = bodyEl.querySelector('#vs-pb-play');
+        const fsBtn     = bodyEl.querySelector('#vs-fs-btn');
+        const closeBtn  = bodyEl.querySelector('#vs-player-close');
 
-        // Ensure video controls are visible
-        if (video) {
-            video.controls = true;
-            // Explicitly ensure controls are visible in case of browser quirks
-            video.style.setProperty('visibility', 'visible', 'important');
+        function _activateCustomControls() {
+            video.controls = false;
+            if (center) center.style.display = 'flex';
+            if (bottom) bottom.style.display = 'flex';
+            const dur = _knownDuration || video.duration || 0;
+            if (pbDur && dur) pbDur.textContent = formatDuration(dur);
+        }
+
+        _activateCustomControls();
+
+        // Ensure video is visible
+        video.style.setProperty('visibility', 'visible', 'important');
+
+        // Update duration label once metadata is known (for direct streams video.duration loads async)
+        video.addEventListener('loadedmetadata', () => {
+            const dur = _knownDuration || video.duration || 0;
+            if (pbDur && dur) pbDur.textContent = formatDuration(dur);
+        }, sig);
+
+        // Custom seek bar: update on timeupdate
+        const nfThumb = bodyEl.querySelector('#vs-nf-thumb');
+        video.addEventListener('timeupdate', () => {
+            const dur = _knownDuration || video.duration || 0;
+            if (!dur) return;
+            const realPos = _transcoding ? (_startOffset + (video.currentTime || 0)) : (video.currentTime || 0);
+            const pct = Math.min(100, (realPos / dur) * 100);
+            if (seekFill) seekFill.style.width = pct + '%';
+            if (nfThumb)  nfThumb.style.left = pct + '%';
+            if (seekInput) seekInput.value = String(pct);
+            if (pbCur) pbCur.textContent = formatDuration(realPos);
+            if (seekBuf && video.buffered.length) {
+                const bufEnd = _transcoding
+                    ? _startOffset + video.buffered.end(video.buffered.length - 1)
+                    : video.buffered.end(video.buffered.length - 1);
+                seekBuf.style.width = Math.min(100, (bufEnd / dur) * 100) + '%';
+            }
+        }, sig);
+
+        // Custom seek via range drag
+        if (seekInput) {
+            seekInput.addEventListener('input', () => {
+                const dur = _knownDuration || video.duration || 0;
+                if (!dur) return;
+                const targetSec = (parseFloat(seekInput.value) / 100) * dur;
+                if (pbCur) pbCur.textContent = formatDuration(targetSec);
+            }, sig);
+            seekInput.addEventListener('change', () => {
+                const dur = _knownDuration || video.duration || 0;
+                if (!dur) return;
+                const targetSec = (parseFloat(seekInput.value) / 100) * dur;
+                if (_transcoding) {
+                    _startHls(_currentVid, targetSec, _currentAudioIdx);
+                } else {
+                    video.currentTime = targetSec;
+                }
+            }, sig);
+        }
+
+        if (ccRw) ccRw.addEventListener('click', () => seekPlayer(video, -10), sig);
+        if (ccFf) ccFf.addEventListener('click', () => seekPlayer(video, +10), sig);
+
+        // Play/pause button
+        if (pbPlay) {
+            const _syncPbPlayBtn = () => {
+                pbPlay.innerHTML = video.paused ? '<i class="fas fa-play"></i>' : '<i class="fas fa-pause"></i>';
+            };
+            video.addEventListener('play',  _syncPbPlayBtn, sig);
+            video.addEventListener('pause', _syncPbPlayBtn, sig);
+            pbPlay.addEventListener('click', () => { video.paused ? video.play() : video.pause(); }, sig);
+        }
+
+        // Center area click toggles play/pause + brief Netflix-style animation
+        if (center) {
+            center.style.pointerEvents = 'all';
+            const animEl = center.querySelector('#vs-nf-anim');
+            center.addEventListener('click', () => {
+                // Show icon representing what we're about to do (before toggling)
+                if (animEl) {
+                    animEl.innerHTML = video.paused ? '<i class="fas fa-play"></i>' : '<i class="fas fa-pause"></i>';
+                    animEl.classList.remove('vs-nf-anim-pop');
+                    void animEl.offsetWidth;
+                    animEl.classList.add('vs-nf-anim-pop');
+                }
+                video.paused ? video.play() : video.pause();
+            }, sig);
+        }
+
+        // Mute button wiring
+        const muteBtn = bodyEl.querySelector('#vs-mute-btn');
+        if (muteBtn) {
+            const _syncMute = () => {
+                const icon = muteBtn.querySelector('i');
+                if (!icon) return;
+                if (video.muted || video.volume === 0) {
+                    icon.className = 'fas fa-volume-mute';
+                } else if (video.volume < 0.5) {
+                    icon.className = 'fas fa-volume-down';
+                } else {
+                    icon.className = 'fas fa-volume-up';
+                }
+            };
+            muteBtn.addEventListener('click', () => { video.muted = !video.muted; _syncMute(); }, sig);
+            video.addEventListener('volumechange', _syncMute, sig);
+        }
+
+        // Volume slider
+        const volRange = bodyEl.querySelector('#vs-vol-range');
+        if (volRange) {
+            volRange.value = video.muted ? 0 : video.volume;
+            volRange.addEventListener('input', () => {
+                video.volume = parseFloat(volRange.value);
+                video.muted = video.volume === 0;
+            }, sig);
+            video.addEventListener('volumechange', () => {
+                volRange.value = video.muted ? 0 : video.volume;
+            }, sig);
         }
 
         // Auto-hide top bar after 3s
@@ -2242,6 +2490,12 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             video.playbackRate = 1;
             speedSel.onchange = () => { video.playbackRate = parseFloat(speedSel.value); };
         }
+
+        // Prevent auto-hide while any select dropdown is open
+        [speedSel, audioSel, subSel].filter(Boolean).forEach(sel => {
+            sel.addEventListener('focus', () => clearTimeout(_ctrlHideTimer), sig);
+            sel.addEventListener('blur',  () => _resetHideTimer(), sig);
+        });
 
         // Audio track selector \u2014 show whenever multiple tracks exist
         const tracks = info.audio_tracks || [];
@@ -2366,6 +2620,7 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
                 });
                 _transcoding = true;
                 badge.style.display = '';
+                _activateCustomControls();
                 _startHls(vid, 0, null);
             } else if (_transcoding) {
                 // HLS transcode also failed — show error overlay with retry button
@@ -2501,7 +2756,6 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
         }
 
         // Fullscreen button
-        const fsBtn = bodyEl.querySelector('#vs-fs-btn');
         if (fsBtn) {
             fsBtn.onclick = () => toggleFullscreen(overlay);
         }
@@ -2515,7 +2769,7 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             }
         }, sig);
 
-        bodyEl.querySelector('#vs-player-close').onclick = () => closePlayer();
+        if (closeBtn) closeBtn.onclick = () => closePlayer();
     }
 
     function _showPlayerError(vid, video) {
@@ -2615,8 +2869,6 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
             maxBufferLength: 60,
             maxMaxBufferLength: 120,
             startPosition: -1,
-            liveSyncDurationCount: 3,
-            liveMaxLatencyDurationCount: 6,
             fragLoadingTimeOut: 30000,
             fragLoadingMaxRetry: 3,
             fragLoadingRetryDelay: 1000,
@@ -3024,22 +3276,83 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 '.vs-tmdb-check input{margin:0;cursor:pointer}',
 '.vs-tmdb-check .fa-magic{font-size:11px;color:#fbbf24}',
 
-/* player overlay */
-'.vs-player-overlay{position:fixed;top:0;left:0;width:100vw;height:100vh;background:#000;z-index:10000;display:flex;flex-direction:column;overflow:hidden}',
-'.vs-player-overlay:fullscreen{width:100%;height:100%}',
-'.vs-player-overlay.vs-player-has-backdrop::before{content:"";position:absolute;inset:0;background:inherit;filter:blur(60px) brightness(0.25);transform:scale(1.1);z-index:0}',
-'#vs-player-video{position:relative;z-index:1;width:100%;height:100%;outline:none;object-fit:contain}',
-'.vs-player-top{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;z-index:10;background:linear-gradient(to bottom,rgba(0,0,0,.85),transparent);position:absolute;top:0;left:0;right:0}',
-'.vs-player-title{color:#fff;font-size:14px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}',
-'.vs-player-close{background:none;border:none;color:#fff;font-size:20px;cursor:pointer;padding:4px 8px;opacity:.7;transition:opacity .15s}',
-'.vs-player-close:hover{opacity:1}',
-'.vs-player-badge{display:inline-flex;align-items:center;gap:5px;background:rgba(255,165,0,.85);color:#000;font-size:11px;font-weight:600;padding:3px 10px;border-radius:12px;white-space:nowrap}',
-'.vs-audio-select{background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:4px;padding:2px 6px;font-size:12px;max-width:220px;cursor:pointer}',
-'.vs-audio-select option{background:#222;color:#fff}',
-'.vs-sub-select{background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:4px;padding:2px 6px;font-size:12px;max-width:220px;cursor:pointer}',
-'.vs-sub-select option{background:#222;color:#fff}',
-'.vs-speed-select{background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.3);border-radius:4px;padding:2px 6px;font-size:12px;cursor:pointer}',
-'.vs-speed-select option{background:#222;color:#fff}',
+/* ── PLAYER OVERLAY ─────────────────────────────── */
+'.vs-player-overlay{position:fixed;inset:0;background:#000;z-index:10000;overflow:hidden;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}',
+'.vs-player-overlay:fullscreen,.vs-player-overlay:-webkit-full-screen{width:100%;height:100%}',
+'.vs-player-overlay.vs-player-has-backdrop::before{content:"";position:absolute;inset:0;background:inherit;filter:blur(60px) brightness(.22);transform:scale(1.1);z-index:0}',
+'#vs-player-video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;z-index:1;outline:none}',
+
+/* ── TOP BAR ─────────────────────────────────────── */
+'.vs-nf-top{position:absolute;top:0;left:0;right:0;z-index:15;display:flex;align-items:center;gap:12px;padding:18px 24px 40px;background:linear-gradient(to bottom,rgba(0,0,0,.8) 0%,transparent 100%);transition:opacity .35s,transform .35s}',
+'.vs-ctrl-hidden .vs-nf-top{opacity:0;pointer-events:none;transform:translateY(-8px)}',
+'.vs-nf-title{color:#fff;font-size:15px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;text-shadow:0 1px 4px rgba(0,0,0,.6);letter-spacing:.01em}',
+'.vs-player-badge{display:inline-flex;align-items:center;gap:5px;background:rgba(255,165,0,.9);color:#000;font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;white-space:nowrap;flex-shrink:0}',
+
+/* ── CENTER CLICK AREA ───────────────────────────── */
+'.vs-player-center{position:absolute;inset:0;z-index:10;display:none;align-items:center;justify-content:center;pointer-events:all;cursor:pointer}',
+'.vs-ctrl-hidden .vs-player-center{opacity:1}',
+
+/* center click animation */
+'.vs-nf-anim{pointer-events:none;display:flex;align-items:center;justify-content:center;width:72px;height:72px;border-radius:50%;background:rgba(255,255,255,.15);backdrop-filter:blur(4px);font-size:28px;color:#fff;opacity:0;transform:scale(.7);transition:none}',
+'.vs-nf-anim.vs-nf-anim-pop{animation:nfAnimPop .6s ease-out forwards}',
+'@keyframes nfAnimPop{0%{opacity:.9;transform:scale(.7)}40%{opacity:.9;transform:scale(1.1)}100%{opacity:0;transform:scale(1.3)}}',
+
+/* ── BOTTOM CONTROLS ─────────────────────────────── */
+'.vs-nf-bottom{position:absolute;bottom:0;left:0;right:0;z-index:15;display:none;flex-direction:column;padding:0 0 14px;background:linear-gradient(to top,rgba(0,0,0,.95) 0%,rgba(0,0,0,.8) 45%,rgba(0,0,0,.35) 75%,transparent 100%);transition:opacity .35s,transform .35s}',
+'.vs-ctrl-hidden .vs-nf-bottom{opacity:0;pointer-events:none;transform:translateY(6px)}',
+
+/* ── SCRUBBER / SEEK BAR ─────────────────────────── */
+'.vs-nf-scrubber{position:relative;padding:0 24px;height:44px;display:flex;align-items:flex-end;cursor:pointer}',
+'.vs-nf-bar{position:absolute;left:24px;right:24px;bottom:9px;height:4px;border-radius:2px;background:rgba(255,255,255,.25);transition:height .15s,bottom .15s;overflow:visible}',
+'.vs-nf-scrubber:hover .vs-nf-bar{height:6px;bottom:8px}',
+'.vs-nf-bar-buf{position:absolute;left:0;top:0;bottom:0;background:rgba(255,255,255,.35);border-radius:2px;width:0;pointer-events:none}',
+'.vs-nf-bar-fill{position:absolute;left:0;top:0;bottom:0;background:#e50914;border-radius:2px;width:0;pointer-events:none}',
+'.vs-nf-bar-dot{position:absolute;top:50%;left:0;transform:translate(-50%,-50%) scale(0);width:16px;height:16px;border-radius:50%;background:#fff;pointer-events:none;box-shadow:0 1px 8px rgba(0,0,0,.7);transition:transform .15s}',
+'.vs-nf-scrubber:hover .vs-nf-bar-dot{transform:translate(-50%,-50%) scale(1)}',
+'.vs-nf-range{position:absolute;left:24px;right:24px;top:0;bottom:0;width:calc(100% - 48px);opacity:0;cursor:pointer;margin:0;padding:0;-webkit-appearance:none;appearance:none;background:transparent;z-index:5;height:100%}',
+
+/* ── THUMBSTRIP PREVIEW ──────────────────────────── */
+'.vs-nf-preview{position:absolute;bottom:48px;display:flex;flex-direction:column;align-items:center;pointer-events:none;border-radius:6px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.8);border:1px solid rgba(255,255,255,.1)}',
+'.vs-nf-preview canvas{display:block}',
+'.vs-nf-preview-time{background:rgba(0,0,0,.85);color:#fff;font-size:12px;font-weight:600;padding:4px 8px;text-align:center;width:100%;box-sizing:border-box;letter-spacing:.03em}',
+
+/* ── CONTROLS ROW ────────────────────────────────── */
+'.vs-nf-controls{display:flex;align-items:center;justify-content:space-between;padding:4px 20px 2px}',
+'.vs-nf-ctrls-left{display:flex;align-items:center;gap:2px}',
+'.vs-nf-ctrls-right{display:flex;align-items:center;gap:2px}',
+
+/* buttons */
+'.vs-nf-btn{background:none;border:none;color:rgba(255,255,255,.9);cursor:pointer;padding:8px;border-radius:4px;transition:color .12s,transform .12s;flex-shrink:0;line-height:1;font-size:20px;display:flex;align-items:center;justify-content:center;min-width:40px;min-height:40px}',
+'.vs-nf-btn:hover{color:#fff;transform:scale(1.12)}',
+'.vs-nf-btn:active{transform:scale(.9)}',
+'.vs-nf-btn-play{font-size:26px;min-width:48px;min-height:48px;padding:6px;color:#fff}',
+'.vs-nf-btn-fs{font-size:18px}',
+'.vs-nf-btn-close{color:rgba(255,255,255,.55);font-size:16px;margin-left:6px}',
+'.vs-nf-btn-close:hover{color:#ff5555!important;transform:scale(1.12)}',
+
+/* skip buttons — icon + number overlay */
+'.vs-nf-btn-skip{font-size:22px;padding:8px;min-width:42px;min-height:40px}',
+'.vs-nf-skip-wrap{position:relative;display:flex;align-items:center;justify-content:center;width:1em;height:1em}',
+'.vs-nf-skip-n{position:absolute;font-size:8px;font-weight:900;color:#fff;pointer-events:none;top:57%;left:50%;transform:translate(-50%,-50%);letter-spacing:-.3px;line-height:1}',
+
+/* volume group — mute btn + slider that slides in on hover */
+'.vs-nf-vol-grp{display:flex;align-items:center;gap:0}',
+'.vs-nf-vol-slider-wrap{width:0;overflow:hidden;transition:width .25s ease,opacity .25s ease;opacity:0;display:flex;align-items:center}',
+'.vs-nf-vol-grp:hover .vs-nf-vol-slider-wrap,.vs-nf-vol-grp:focus-within .vs-nf-vol-slider-wrap{width:84px;opacity:1}',
+'.vs-nf-vol-range{-webkit-appearance:none;appearance:none;width:72px;height:3px;border-radius:2px;background:rgba(255,255,255,.3);cursor:pointer;outline:none;margin:0 6px;flex-shrink:0}',
+'.vs-nf-vol-range::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:#fff;cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.5)}',
+'.vs-nf-vol-range::-moz-range-thumb{width:13px;height:13px;border-radius:50%;background:#fff;cursor:pointer;border:none;box-shadow:0 1px 4px rgba(0,0,0,.5)}',
+
+/* time display */
+'.vs-nf-time-wrap{color:rgba(255,255,255,.9);font-size:14px;font-weight:400;margin:0 4px 0 10px;white-space:nowrap;font-variant-numeric:tabular-nums;letter-spacing:.01em;display:flex;align-items:center;gap:0}',
+'.vs-nf-time-cur{color:#fff;font-weight:600}',
+'.vs-nf-time-sep{color:rgba(255,255,255,.35);margin:0 5px;font-size:13px}',
+'.vs-nf-time-dur{color:rgba(255,255,255,.55)}',
+
+/* selects */
+'.vs-nf-select{background:rgba(0,0,0,.4);color:rgba(255,255,255,.9);border:1px solid rgba(255,255,255,.25);border-radius:4px;padding:5px 10px;font-size:12px;font-weight:600;cursor:pointer;max-width:110px;transition:border-color .15s,color .15s,background .15s;-webkit-appearance:none;appearance:none;text-align:center;margin:0 2px;letter-spacing:.02em}',
+'.vs-nf-select:hover{border-color:rgba(255,255,255,.7);color:#fff;background:rgba(0,0,0,.6)}',
+'.vs-nf-select option{background:#141414;color:#fff}',
 '.vs-player-error{position:absolute;inset:0;z-index:20;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.8);backdrop-filter:blur(8px)}',
 '.vs-player-error-box{text-align:center;color:#fff;max-width:380px;padding:32px}',
 '.vs-player-error-box i{font-size:48px;color:#ff9800;margin-bottom:16px}',
@@ -3052,19 +3365,6 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 '.vs-ctx-item i{width:16px;text-align:center;opacity:.7}',
 '.vs-ctx-danger{color:var(--danger,#f87171)}',
 '.vs-ctx-danger:hover{background:rgba(248,113,113,.12)}',
-
-/* PiP, fullscreen & cast buttons */
-'.vs-pip-btn{background:none;border:none;color:#fff;font-size:15px;cursor:pointer;padding:4px 8px;opacity:.7;transition:opacity .15s}',
-'.vs-pip-btn:hover{opacity:1}',
-'.vs-fs-btn{background:none;border:none;color:#fff;font-size:15px;cursor:pointer;padding:4px 8px;opacity:.7;transition:opacity .15s}',
-'.vs-fs-btn:hover{opacity:1}',
-'.vs-cast-btn{background:none;border:none;color:#fff;font-size:15px;cursor:pointer;padding:4px 8px;opacity:.7;transition:opacity .15s}',
-'.vs-cast-btn:hover{opacity:1;color:#1db954}',
-
-/* Thumbstrip seek preview */
-'.vs-thumbstrip-preview{position:absolute;display:flex;flex-direction:column;align-items:center;gap:4px;pointer-events:none;z-index:15;bottom:70px}',
-'.vs-thumbstrip-preview canvas{border-radius:4px;border:2px solid rgba(255,255,255,.3);box-shadow:0 4px 16px rgba(0,0,0,.8)}',
-'.vs-thumbstrip-time{color:#fff;font-size:11px;font-weight:600;background:rgba(0,0,0,.7);padding:2px 8px;border-radius:4px;font-variant-numeric:tabular-nums}',
 
 /* Resume dialog */
 '.vs-resume-dialog{position:absolute;inset:0;background:rgba(0,0,0,.75);display:flex;align-items:center;justify-content:center;z-index:20}',
@@ -3133,5 +3433,27 @@ AppRegistry['video-station'] = function (appDef, launchOpts) {
 '.vs-modal-overlay{position:absolute;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:90}',
 '.vs-modal-box{background:var(--bg-primary);border:1px solid var(--border);border-radius:var(--r-lg);padding:24px;width:340px;max-width:90%}',
 '.vs-modal-box h3{margin:0 0 8px;font-size:15px;color:var(--text-primary)}',
+
+/* tmdb search dialog */
+'.vs-tmdb-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:99999}',
+'.vs-tmdb-dialog{background:var(--bg-primary);border:1px solid var(--border);border-radius:var(--r-lg);padding:20px;width:520px;max-width:94vw;max-height:88vh;display:flex;flex-direction:column;gap:12px}',
+'.vs-tmdb-header{display:flex;align-items:center;justify-content:space-between;font-size:14px;font-weight:600;color:var(--text-primary)}',
+'.vs-tmdb-header button{background:none;border:none;color:var(--text-muted);font-size:18px;cursor:pointer;line-height:1;padding:0 2px}',
+'.vs-tmdb-header button:hover{color:var(--text-primary)}',
+'.vs-tmdb-search-row{display:flex;gap:8px;align-items:center}',
+'.vs-tmdb-search-input{flex:1;padding:7px 10px;border:1px solid var(--border);border-radius:var(--r-sm);background:var(--bg-secondary);color:var(--text-primary);font-size:13px;outline:none}',
+'.vs-tmdb-search-input:focus{border-color:var(--accent)}',
+'.vs-tmdb-year-input{width:64px;padding:7px 8px;border:1px solid var(--border);border-radius:var(--r-sm);background:var(--bg-secondary);color:var(--text-primary);font-size:13px;outline:none;flex-shrink:0}',
+'.vs-tmdb-year-input:focus{border-color:var(--accent)}',
+'.vs-tmdb-search-btn{white-space:nowrap;flex-shrink:0}',
+'.vs-tmdb-results{overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:8px;min-height:60px}',
+'.vs-tmdb-hint{color:var(--text-muted);font-size:13px;text-align:center;padding:20px 0;margin:0}',
+'.vs-tmdb-result{display:flex;gap:10px;padding:10px;border-radius:var(--r-md);border:1px solid var(--border);cursor:pointer;transition:background .15s}',
+'.vs-tmdb-result:hover{background:var(--bg-hover)}',
+'.vs-tmdb-result-poster{width:44px;height:66px;object-fit:cover;border-radius:4px;flex-shrink:0;background:var(--bg-secondary)}',
+'.vs-tmdb-result-info{display:flex;flex-direction:column;gap:3px;overflow:hidden}',
+'.vs-tmdb-result-title{font-size:13px;font-weight:600;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+'.vs-tmdb-result-year{font-size:12px;color:var(--text-muted)}',
+'.vs-tmdb-result-overview{font-size:12px;color:var(--text-secondary);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}',
     ].join('\n'); }
 };

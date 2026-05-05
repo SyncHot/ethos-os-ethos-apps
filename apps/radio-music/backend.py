@@ -478,6 +478,47 @@ def music_liked_edit():
     return jsonify({'ok': True, 'items': liked})
 
 
+@radio_music_bp.route('/ai-dj/preferences', methods=['GET'])
+def ai_dj_preferences_get():
+    prefs = _load_json(_user_file('ai_dj_prefs.json'), {'liked_urls': [], 'disliked_urls': [], 'disliked_artists': []})
+    return jsonify(prefs)
+
+
+@radio_music_bp.route('/ai-dj/preferences', methods=['POST'])
+def ai_dj_preferences_edit():
+    data = request.get_json(silent=True) or {}
+    action = data.get('action', '')
+    url = data.get('url', '').strip()
+    artist = (data.get('artist') or data.get('name') or '').strip().lower()
+
+    prefs = _load_json(_user_file('ai_dj_prefs.json'), {'liked_urls': [], 'disliked_urls': [], 'disliked_artists': []})
+
+    if action == 'like_url' and url:
+        if url not in prefs['liked_urls']:
+            prefs['liked_urls'].insert(0, url)
+        prefs['disliked_urls'] = [u for u in prefs['disliked_urls'] if u != url]
+    elif action == 'unlike_url' and url:
+        prefs['liked_urls'] = [u for u in prefs['liked_urls'] if u != url]
+    elif action == 'dislike_url' and url:
+        if url not in prefs['disliked_urls']:
+            prefs['disliked_urls'].append(url)
+        prefs['liked_urls'] = [u for u in prefs['liked_urls'] if u != url]
+    elif action == 'undislike_url' and url:
+        prefs['disliked_urls'] = [u for u in prefs['disliked_urls'] if u != url]
+    elif action == 'dislike_artist' and artist:
+        if artist not in prefs['disliked_artists']:
+            prefs['disliked_artists'].append(artist)
+    elif action == 'undislike_artist' and artist:
+        prefs['disliked_artists'] = [a for a in prefs['disliked_artists'] if a != artist]
+    elif action == 'clear_all':
+        prefs = {'liked_urls': [], 'disliked_urls': [], 'disliked_artists': []}
+    else:
+        return jsonify({'error': 'Unknown action'}), 400
+
+    _save_json(_user_file('ai_dj_prefs.json'), prefs)
+    return jsonify({'ok': True, 'prefs': prefs})
+
+
 # ── Radio: stream URL resolver ───────────────────────────────
 
 @radio_music_bp.route('/radio/stream-url', methods=['GET'])
@@ -900,6 +941,18 @@ def _deezer_get(path, params=None):
         return {}
 
 
+def _get_deezer_similar_artists(art_name, limit=4):
+    """Return list of similar artists [{name, picture}] for art_name via Deezer."""
+    search = _deezer_get('/search/artist', {'q': art_name, 'limit': 1})
+    results = search.get('data', [])
+    if not results:
+        return []
+    aid = results[0].get('id')
+    related = _deezer_get(f'/artist/{aid}/related', {'limit': limit})
+    return [{'name': a.get('name', ''), 'picture': a.get('picture_medium', '')}
+            for a in related.get('data', [])]
+
+
 @radio_music_bp.route('/similar-artists', methods=['GET'])
 def similar_artists():
     """Find similar artists via Deezer API (free, no key).
@@ -992,16 +1045,10 @@ def recommendations():
     if top_artists:
         # Pick top 2 artists, find similar via Deezer
         for art_name in top_artists[:2]:
-            search = _deezer_get('/search/artist', {'q': art_name, 'limit': 1})
-            results = search.get('data', [])
-            if not results:
-                continue
-            artist_id = results[0].get('id')
-            related = _deezer_get(f'/artist/{artist_id}/related', {'limit': 4})
-            for a in related.get('data', []):
+            for a in _get_deezer_similar_artists(art_name, limit=4):
                 artist_recs.append({
-                    'name': a.get('name', ''),
-                    'picture': a.get('picture_medium', ''),
+                    'name': a['name'],
+                    'picture': a['picture'],
                     'because': art_name,
                 })
 
@@ -2028,6 +2075,12 @@ def ai_dj_next():
     artist = request.args.get('artist', '').strip()
     exclude_raw = request.args.get('exclude', '')
     exclude_set = set(u for u in exclude_raw.split(',') if u)
+    disliked_raw = request.args.get('disliked_artists', '')
+    disliked_artists = set(a.strip().lower() for a in disliked_raw.split(',') if a.strip())
+    # Also merge with stored per-user preferences
+    prefs = _load_json(_user_file('ai_dj_prefs.json'), {'liked_urls': [], 'disliked_urls': [], 'disliked_artists': []})
+    disliked_artists.update(prefs.get('disliked_artists', []))
+    disliked_urls_stored = set(prefs.get('disliked_urls', []))
 
     hfile = _user_file('history.json')
     hist = _load_json(hfile, [])
@@ -2048,22 +2101,12 @@ def ai_dj_next():
         if a not in search_artists:
             search_artists.append(a)
 
-    # Get similar artists via Deezer (reuse _deezer_get)
-    def _get_deezer_similar(art_name, limit=3):
-        search = _deezer_get('/search/artist', {'q': art_name, 'limit': 1})
-        results = search.get('data', [])
-        if not results:
-            return []
-        aid = results[0].get('id')
-        related = _deezer_get(f'/artist/{aid}/related', {'limit': limit})
-        return [a.get('name', '') for a in related.get('data', [])]
-
     # Build YouTube search queries from similar artists — parallel per artist
     queries = []
     seen_artists = set()
 
     def _fetch_similar(art):
-        return art, _get_deezer_similar(art, 3)
+        return art, [a['name'] for a in _get_deezer_similar_artists(art, limit=3)]
 
     d_threads = [gevent.spawn(_fetch_similar, art) for art in search_artists[:3]]
     gevent.joinall(d_threads, timeout=10)
@@ -2072,7 +2115,7 @@ def ai_dj_next():
         if t.value:
             art, similar = t.value
             for s in similar:
-                if s not in seen_artists:
+                if s not in seen_artists and s.lower() not in disliked_artists:
                     seen_artists.add(s)
                     queries.append(f'{s} music')
 
@@ -2140,7 +2183,7 @@ def ai_dj_next():
     for t in threads:
         if t.value:
             for it in t.value:
-                if it['url'] not in seen_urls:
+                if it['url'] not in seen_urls and it['url'] not in disliked_urls_stored and (it.get('channel', '') or '').lower() not in disliked_artists:
                     seen_urls.add(it['url'])
                     items.append(it)
 
