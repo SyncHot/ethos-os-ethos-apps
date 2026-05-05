@@ -71,7 +71,7 @@
         {
             "id": "gallery",
             "name": "Gallery",
-            "version": "1.0.4",
+            "version": "1.0.5",
             "icon": "fa-images",
             "color": "#ec4899",
             "category": "Media",
@@ -86,7 +86,7 @@
         {
             "id": "download-manager",
             "name": "Download Manager",
-            "version": "1.0.3",
+            "version": "1.0.4",
             "icon": "fa-cloud-download-alt",
             "color": "#10b981",
             "category": "Tools",
@@ -135,7 +135,7 @@
         {
             "id": "vm-manager",
             "name": "VM Manager",
-            "version": "1.0.11",
+            "version": "1.0.12",
             "icon": "fa-desktop",
             "color": "#8b5cf6",
             "category": "System",
@@ -215,7 +215,7 @@
         {
             "id": "builder",
             "name": "Builder",
-            "version": "1.0.21",
+            "version": "1.0.22",
             "icon": "fa-hammer",
             "color": "#f97316",
             "category": "System",
@@ -234,7 +234,7 @@
         {
             "id": "disk-repair",
             "name": "Disk Repair",
-            "version": "1.0.20",
+            "version": "1.0.21",
             "icon": "fa-wrench",
             "color": "#ef4444",
             "category": "Storage",
@@ -268,7 +268,7 @@
         {
             "id": "sharing-samba",
             "name": "File Sharing (Samba)",
-            "version": "1.0.21",
+            "version": "1.0.22",
             "icon": "fa-windows",
             "color": "#6366f1",
             "category": "Network",
@@ -286,7 +286,7 @@
         {
             "id": "sharing-nfs",
             "name": "NFS",
-            "version": "1.0.20",
+            "version": "1.0.21",
             "icon": "fa-network-wired",
             "color": "#6366f1",
             "category": "Network",
@@ -304,7 +304,7 @@
         {
             "id": "sharing-dlna",
             "name": "DLNA (MiniDLNA)",
-            "version": "1.0.21",
+            "version": "1.0.22",
             "icon": "fa-photo-video",
             "color": "#6366f1",
             "category": "Media",
@@ -322,7 +322,7 @@
         {
             "id": "sharing-webdav",
             "name": "WebDAV",
-            "version": "1.0.20",
+            "version": "1.0.21",
             "icon": "fa-globe",
             "color": "#6366f1",
             "category": "Network",
@@ -340,7 +340,7 @@
         {
             "id": "sharing-sftp",
             "name": "SFTP",
-            "version": "1.0.20",
+            "version": "1.0.21",
             "icon": "fa-lock",
             "color": "#6366f1",
             "category": "Network",
@@ -358,7 +358,7 @@
         {
             "id": "sharing-ftp",
             "name": "FTP",
-            "version": "1.0.20",
+            "version": "1.0.21",
             "icon": "fa-upload",
             "color": "#6366f1",
             "category": "Network",
@@ -423,7 +423,7 @@
         {
             "id": "raid-lvm",
             "name": "RAID / LVM",
-            "version": "1.0.20",
+            "version": "1.0.21",
             "icon": "fa-layer-group",
             "color": "#f59e0b",
             "category": "Storage",
@@ -572,7 +572,7 @@
         {
             "id": "tickets",
             "name": "Tickets",
-            "version": "1.0.2",
+            "version": "1.0.3",
             "icon": "fa-tasks",
             "color": "#06b6d4",
             "category": "Tools",
@@ -613,7 +613,7 @@
         {
             "id": "photos-ai",
             "name": "Photos AI",
-            "version": "0.0.9",
+            "version": "0.0.10",
             "icon": "fa-brain",
             "color": "#8b5cf6",
             "category": "Media",
@@ -651,7 +651,7 @@
         {
             "id": "video-station",
             "name": "Video Station",
-            "version": "0.0.12",
+            "version": "0.0.13",
             "icon": "fa-film",
             "color": "#7c3aed",
             "category": "Media",
@@ -668,7 +668,7 @@
         {
             "id": "radio-music",
             "name": "Radio & Music",
-            "version": "0.0.9",
+            "version": "0.0.10",
             "icon": "fa-broadcast-tower",
             "color": "#10b981",
             "category": "Media",

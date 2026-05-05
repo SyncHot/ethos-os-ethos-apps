@@ -238,8 +238,7 @@ def _compute_optional_js():
         am = importlib.import_module('blueprints.app_manager')
         core_js = set()
         for aid in am.CORE_APPS:
-            fn = am._get_frontend_filename(aid)
-            if fn:
+            for fn in am._get_frontend_filenames(aid):
                 core_js.add(fn + '.js')
         # Only strip apps that are published to GitHub (downloadable after install)
         published = _get_published_app_ids()
@@ -252,9 +251,9 @@ def _compute_optional_js():
                 continue
             if aid not in published:
                 continue  # keep bundled — not yet published for download
-            fn = am._get_frontend_filename(aid)
-            if fn and fn + '.js' not in core_js:
-                optional.add(fn + '.js')
+            for fn in am._get_frontend_filenames(aid):
+                if fn + '.js' not in core_js:
+                    optional.add(fn + '.js')
         return sorted(optional)
     except Exception:
         return []
@@ -3329,23 +3328,28 @@ def _bump_version(ver):
 
 
 def _get_app_files(app_id):
-    """Get local file paths for an optional app. Returns dict with 'backend' and 'frontend' paths."""
+    """Get local file paths for an optional app. Returns dict with 'backend' (list) and 'frontend' (list) paths."""
     import importlib
     am = importlib.import_module('blueprints.app_manager')
 
     files = {}
     bp_info = am._OPTIONAL_BLUEPRINTS.get(app_id)
     if bp_info:
-        module_name = bp_info[0]
-        bp_path = os.path.join(app_path(), 'backend', 'blueprints', module_name + '.py')
-        if os.path.isfile(bp_path):
-            files['backend'] = bp_path
+        backend_paths = []
+        for module_name in am._get_backend_filenames(app_id):
+            bp_path = os.path.join(app_path(), 'backend', 'blueprints', module_name + '.py')
+            if os.path.isfile(bp_path):
+                backend_paths.append(bp_path)
+        if backend_paths:
+            files['backend'] = backend_paths
 
-    fn = am._get_frontend_filename(app_id)
-    if fn:
+    frontend_paths = []
+    for fn in am._get_frontend_filenames(app_id):
         js_path = os.path.join(app_path(), 'frontend', 'js', 'apps', fn + '.js')
         if os.path.isfile(js_path):
-            files['frontend'] = js_path
+            frontend_paths.append(js_path)
+    if frontend_paths:
+        files['frontend'] = frontend_paths
 
     return files
 
@@ -3594,20 +3598,26 @@ def publish_diff():
         local_ver = app_entry.get('version', '1.0.0')
 
         changes = []
-        for ftype, local_path in local_files.items():
-            remote_key = f'apps/{app_id}/{"backend.py" if ftype == "backend" else "frontend.js"}'
-            remote_sha = remote_tree.get(remote_key)
+        for ftype, local_val in local_files.items():
+            paths = local_val if isinstance(local_val, list) else [local_val]
+            for file_idx, local_path in enumerate(paths):
+                if ftype == 'backend':
+                    fname = 'backend.py' if file_idx == 0 else f'backend_{file_idx + 1}.py'
+                    remote_key = f'apps/{app_id}/{fname}'
+                else:
+                    remote_key = f'apps/{app_id}/frontend.js' if file_idx == 0 else f'apps/{app_id}/frontend_{file_idx + 1}.js'
+                remote_sha = remote_tree.get(remote_key)
 
-            # Compute git blob SHA for local file
-            with open(local_path, 'rb') as f:
-                content = f.read()
-            blob_header = f'blob {len(content)}\0'.encode()
-            local_sha = hashlib.sha1(blob_header + content).hexdigest()
+                # Compute git blob SHA for local file
+                with open(local_path, 'rb') as f:
+                    content = f.read()
+                blob_header = f'blob {len(content)}\0'.encode()
+                local_sha = hashlib.sha1(blob_header + content).hexdigest()
 
-            if remote_sha is None:
-                changes.append({'file': ftype, 'status': 'new'})
-            elif local_sha != remote_sha:
-                changes.append({'file': ftype, 'status': 'modified'})
+                if remote_sha is None:
+                    changes.append({'file': remote_key.split('/')[-1], 'status': 'new'})
+                elif local_sha != remote_sha:
+                    changes.append({'file': remote_key.split('/')[-1], 'status': 'modified'})
 
         results.append({
             'id': app_id,
@@ -3706,40 +3716,45 @@ def publish_apps():
                     continue
 
                 app_changed = False
-                for ftype, local_path in local_files.items():
-                    fname = 'backend.py' if ftype == 'backend' else 'frontend.js'
-                    remote_key = f'apps/{app_id}/{fname}'
+                for ftype, local_val in local_files.items():
+                    paths = local_val if isinstance(local_val, list) else [local_val]
+                    for file_idx, local_path in enumerate(paths):
+                        if ftype == 'backend':
+                            fname = 'backend.py' if file_idx == 0 else f'backend_{file_idx + 1}.py'
+                        else:
+                            fname = 'frontend.js' if file_idx == 0 else f'frontend_{file_idx + 1}.js'
+                        remote_key = f'apps/{app_id}/{fname}'
 
-                    with open(local_path, 'rb') as f:
-                        content = f.read()
+                        with open(local_path, 'rb') as f:
+                            content = f.read()
 
-                    # Compute git blob SHA
-                    blob_header = f'blob {len(content)}\0'.encode()
-                    local_sha = hashlib.sha1(blob_header + content).hexdigest()
+                        # Compute git blob SHA
+                        blob_header = f'blob {len(content)}\0'.encode()
+                        local_sha = hashlib.sha1(blob_header + content).hexdigest()
 
-                    if remote_tree.get(remote_key) == local_sha:
-                        continue  # unchanged
+                        if remote_tree.get(remote_key) == local_sha:
+                            continue  # unchanged
 
-                    app_changed = True
-                    yield _sse({'type': 'log', 'message': f'📦 {app_id}/{fname} ({len(content)} bytes)'})
+                        app_changed = True
+                        yield _sse({'type': 'log', 'message': f'📦 {app_id}/{fname} ({len(content)} bytes)'})
 
-                    # Create blob
-                    b64_content = base64.b64encode(content).decode('ascii')
-                    code, blob_data = _github_api('POST', f'/repos/{repo}/git/blobs', token, {
-                        'content': b64_content,
-                        'encoding': 'base64',
-                    })
-                    if code != 201:
-                        yield _sse({'type': 'done', 'success': False,
-                                    'message': f'Błąd tworzenia blob {app_id}/{fname}: {blob_data.get("message", code)}'})
-                        return
+                        # Create blob
+                        b64_content = base64.b64encode(content).decode('ascii')
+                        code, blob_data = _github_api('POST', f'/repos/{repo}/git/blobs', token, {
+                            'content': b64_content,
+                            'encoding': 'base64',
+                        })
+                        if code != 201:
+                            yield _sse({'type': 'done', 'success': False,
+                                        'message': f'Błąd tworzenia blob {app_id}/{fname}: {blob_data.get("message", code)}'})
+                            return
 
-                    tree_items.append({
-                        'path': remote_key,
-                        'mode': '100644',
-                        'type': 'blob',
-                        'sha': blob_data['sha'],
-                    })
+                        tree_items.append({
+                            'path': remote_key,
+                            'mode': '100644',
+                            'type': 'blob',
+                            'sha': blob_data['sha'],
+                        })
 
                 if app_changed:
                     changed_apps.append(app_id)

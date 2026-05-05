@@ -2181,7 +2181,9 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             return;
         }
 
-        toolbar.innerHTML = `<input class="rm-search" id="rm-music-search" placeholder="${t('Szukaj muzyki na YouTube...')}" autofocus>`;
+        toolbar.innerHTML = `<span style="color:var(--rm-text-muted);font-size:13px;flex:1">${t('Wybierz gatunek lub')}</span>`
+            + `<button class="rm-chip" id="rm-music-go-search"><i class="fas fa-search"></i> ${t('Szukaj wszędzie')}</button>`;
+        toolbar.querySelector('#rm-music-go-search').onclick = () => _navTo('search');
 
         // Genre chips
         content.innerHTML = '<div class="rm-chips" id="rm-music-genres"></div><div id="rm-music-results"></div>';
@@ -2197,19 +2199,6 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             };
             chipsEl.appendChild(chip);
         });
-
-        const searchInput = bodyEl.querySelector('#rm-music-search');
-        let debounce;
-        searchInput.onkeyup = () => {
-            clearTimeout(debounce);
-            debounce = setTimeout(() => {
-                const q = searchInput.value.trim();
-                if (q) {
-                    chipsEl.querySelectorAll('.rm-chip').forEach(c => c.classList.remove('active'));
-                    searchMusic(q, content.querySelector('#rm-music-results'));
-                }
-            }, 500);
-        };
 
         // Show "Hity" by default
         const firstChip = chipsEl.querySelector('.rm-chip');
@@ -3406,43 +3395,14 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     }
 
     async function loadAiDj(toolbar, content) {
-        _aiDjActive = true;
+        _aiDjActive = false; // not yet — activates when user clicks play
         _aiDjSeenUrls = new Set();
-        _aiDjBaseArtist = _playing ? (_playing.meta || _playing.channel || '') : '';
-        // Bug #1: clear existing queue so AI DJ starts fresh (not mixed with old music queue)
         _musicQueue = [];
         _musicQueueIdx = -1;
 
         toolbar.innerHTML = ''
-            + '<div style="display:flex;align-items:center;gap:8px;padding:0 16px;flex-wrap:wrap">'
-            + '<span style="font-size:16px;font-weight:700"><i class="fas fa-robot" style="color:var(--rm-accent)"></i> ' + t('Rekomendowane dla Ciebie') + '</span>'
-            + '<button class="rm-chip" id="rm-ai-dj-clear-prefs" style="margin-left:auto" title="' + t('Wyczyść preferencje (polubienia i niepolubienia)') + '"><i class="fas fa-sliders"></i> ' + t('Preferencje') + '</button>'
-            + '<button class="rm-chip" id="rm-ai-dj-stop" style="color:var(--rm-error);border-color:rgba(239,68,68,.3)"><i class="fas fa-stop"></i> ' + t('Zatrzymaj') + '</button>'
-            + '</div>';
-
-        content.innerHTML = ''
-            + '<div class="rm-ai-dj-hero" style="padding-bottom:12px">'
-            + '<i class="fas fa-robot" style="font-size:52px;color:var(--rm-accent);margin-bottom:16px;display:block"></i>'
-            + '<h2 style="margin:0 0 8px;font-size:22px">' + t('Rekomendowane dla Ciebie') + '</h2>'
-            + '<p style="margin:0 0 8px;font-size:14px;color:var(--rm-text-secondary)">' + t('Nieskończona playlista dopasowana do Ciebie') + '</p>'
-            + '<div id="rm-ai-dj-status" style="font-size:12px;color:var(--rm-text-muted);margin-top:12px">' + t('Szukam utworów…') + '</div>'
-            + '</div>'
-            + '<div id="rm-ai-dj-queue" style="margin-top:8px"></div>';
-
-        toolbar.querySelector('#rm-ai-dj-stop').onclick = () => {
-            _aiDjActive = false;
-            _aiDjSeenUrls = new Set();
-            _aiDjBaseArtist = '';
-            _musicQueue = [];
-            _musicQueueIdx = -1;
-            if (_audio) { _audio.pause(); _audio.src = ''; }
-            _playing = null;
-            bodyEl.querySelector('#rm-player').style.display = 'none';
-            _clearSeek();
-            bodyEl.querySelector('#rm-play-pause').innerHTML = '<i class="fas fa-play"></i>';
-            toast(t('Zatrzymano Rekomendowane dla Ciebie'), 'info');
-            loadSection('most-played');
-        };
+            + '<span style="font-size:16px;font-weight:700;flex:1"><i class="fas fa-wand-magic-sparkles" style="color:var(--rm-accent)"></i> ' + t('Rekomendowane dla Ciebie') + '</span>'
+            + '<button class="rm-chip" id="rm-ai-dj-clear-prefs" title="' + t('Wyczyść preferencje (polubienia i niepolubienia)') + '"><i class="fas fa-sliders"></i> ' + t('Preferencje') + '</button>';
 
         toolbar.querySelector('#rm-ai-dj-clear-prefs').onclick = () => {
             if (!confirm(t('Wyczyścić wszystkie preferencje (polubienia i niepolubienia)?'))) return;
@@ -3451,16 +3411,108 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 _dislikedUrls = new Set();
                 _likedUrls = new Set();
                 toast(t('Preferencje wyczyszczone'), 'info');
+                loadAiDj(toolbar, content);
             });
         };
 
-        // Fetch initial batch
-        await _fetchAiDjMore();
-        if (_musicQueue.length > 0) {
-            _musicQueueIdx = 0;
-            playAudio(_musicQueue[0]);
+        content.innerHTML = '<div style="padding:40px;text-align:center;color:rgba(255,255,255,.4)"><i class="fas fa-spinner fa-spin"></i></div>';
+
+        const seedsData = await api('/radio-music/ai-dj/seeds?count=10');
+        if (!content.isConnected) return;
+        const artists = seedsData.artists || [];
+
+        if (!artists.length) {
+            content.innerHTML = '<div class="rm-empty"><i class="fas fa-music"></i><p>'
+                + t('Posłuchaj trochę muzyki, a my przygotujemy rekomendacje dla Ciebie!') + '</p>'
+                + '<button class="rm-chip" id="rm-reco-go-music"><i class="fas fa-search"></i> ' + t('Szukaj muzyki') + '</button></div>';
+            content.querySelector('#rm-reco-go-music')?.addEventListener('click', () => _navTo('search'));
+            return;
         }
-        _renderAiDjQueue(content);
+
+        content.innerHTML = '';
+
+        // Helper: render one recommendation card (track)
+        function _aiCard(tr) {
+            const card = document.createElement('div');
+            card.className = 'rm-disc-card';
+            const art = tr.image
+                ? `<img src="${escH(tr.image)}" loading="lazy" onerror="this.outerHTML='<i class=\\'fas fa-music\\'></i>'">`
+                : '<i class="fas fa-music"></i>';
+            card.innerHTML = `<div class="rm-disc-card-art">${art}<div class="rm-disc-play-overlay"><i class="fas fa-play"></i></div>`
+                + `<span class="rm-disc-badge rm-disc-badge-music">♪</span></div>`
+                + `<div class="rm-disc-card-body"><div class="rm-disc-card-title">${escH(tr.name || '')}</div>`
+                + `<div class="rm-disc-card-meta">${escH(tr.meta || '')}</div></div>`;
+            return card;
+        }
+
+        // Render skeleton section while loading
+        function _aiSkeleton() {
+            const wrap = document.createElement('div');
+            wrap.className = 'rm-disc-carousel';
+            wrap.innerHTML = Array(5).fill(0).map(() =>
+                '<div class="rm-disc-card" style="pointer-events:none">'
+                + '<div class="rm-disc-card-art" style="background:rgba(255,255,255,.06);border-radius:8px"></div>'
+                + '<div class="rm-disc-card-body">'
+                + '<div style="height:10px;background:rgba(255,255,255,.06);border-radius:4px;width:80%;margin-bottom:6px"></div>'
+                + '<div style="height:8px;background:rgba(255,255,255,.04);border-radius:4px;width:55%"></div>'
+                + '</div></div>'
+            ).join('');
+            return wrap;
+        }
+
+        // Build a section per artist, load tracks lazily in parallel
+        artists.forEach(artist => {
+            const sec = document.createElement('div');
+            sec.className = 'rm-disc-section';
+            const safeId = 'rm-ai-sec-' + artist.replace(/[^a-zA-Z0-9]/g, '-');
+            sec.innerHTML = `<div class="rm-disc-title">`
+                + `<i class="fas fa-wand-magic-sparkles" style="color:var(--rm-accent)"></i> `
+                + `${t('Dla')} ${escH(artist)}`
+                + `<button class="rm-ai-sec-play rm-chip" style="margin-left:auto;font-size:11px;opacity:.4;pointer-events:none" data-artist="${escH(artist)}">`
+                + `<i class="fas fa-play"></i> ${t('Odtwórz wszystko')}</button></div>`;
+            const carousel = _aiSkeleton();
+            carousel.id = safeId;
+            sec.appendChild(carousel);
+            content.appendChild(sec);
+
+            // Fetch tracks for this section
+            api('/radio-music/ai-dj/next?artist=' + encodeURIComponent(artist) + '&count=8').then(data => {
+                if (!sec.isConnected) return;
+                const rawItems = data.items || [];
+                if (!rawItems.length) { sec.remove(); return; }
+                const items = rawItems.map(tr => ({
+                    id: tr.id, name: tr.title, url: tr.url, type: 'music',
+                    meta: tr.channel, image: tr.thumbnail, duration: tr.duration || 0,
+                    source: tr.source || 'youtube',
+                }));
+                carousel.innerHTML = '';
+                items.forEach((tr, idx) => {
+                    const card = _aiCard(tr);
+                    card.onclick = () => {
+                        _aiDjActive = true;
+                        _aiDjBaseArtist = artist;
+                        _aiDjSeenUrls = new Set(items.map(t => t.url));
+                        _musicQueue = items.slice();
+                        _musicQueueIdx = idx;
+                        playAudio(items[idx]);
+                    };
+                    carousel.appendChild(card);
+                });
+                // Enable play-all button
+                const playBtn = sec.querySelector('.rm-ai-sec-play');
+                playBtn.style.opacity = '';
+                playBtn.style.pointerEvents = '';
+                playBtn.onclick = () => {
+                    _aiDjActive = true;
+                    _aiDjBaseArtist = artist;
+                    _aiDjSeenUrls = new Set(items.map(t => t.url));
+                    _musicQueue = items.slice();
+                    _musicQueueIdx = 0;
+                    playAudio(items[0]);
+                    toast(t('Rekomendowane dla') + ' ' + artist, 'success');
+                };
+            }).catch(() => sec.remove());
+        });
     }
 
     async function _fetchAiDjMore() {
@@ -3734,12 +3786,12 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
         const chipSources = (reco.top_tags || []).length
             ? (reco.top_tags || []).slice(0, 6).map(tag => ({ label: tag.charAt(0).toUpperCase() + tag.slice(1), q: tag, icon: 'fa-heart', isTag: true }))
             : [
-                { label: 'Pop', q: 'pop hits ' + (new Date().getFullYear()), icon: 'fa-star' },
-                { label: 'Rock', q: 'rock classics best', icon: 'fa-guitar' },
-                { label: 'Chill', q: 'lofi chill beats relax', icon: 'fa-cloud-moon' },
-                { label: 'Hip-Hop', q: 'hip hop rap new', icon: 'fa-microphone-alt' },
-                { label: 'Electronic', q: 'electronic dance EDM', icon: 'fa-bolt' },
-                { label: 'Jazz', q: 'jazz smooth saxophone', icon: 'fa-wine-glass-alt' },
+                { label: 'Pop', q: 'pop', icon: 'fa-star', isTag: true },
+                { label: 'Rock', q: 'rock', icon: 'fa-guitar', isTag: true },
+                { label: 'Chill', q: 'chill', icon: 'fa-cloud-moon', isTag: true },
+                { label: 'Hip-Hop', q: 'hip-hop', icon: 'fa-microphone-alt', isTag: true },
+                { label: 'Electronic', q: 'electronic', icon: 'fa-bolt', isTag: true },
+                { label: 'Jazz', q: 'jazz', icon: 'fa-wine-glass-alt', isTag: true },
             ];
         chipSources.forEach(g => {
             const chip = document.createElement('span');
@@ -3942,38 +3994,6 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
             sec.querySelector('#rm-disc-pod-all')?.addEventListener('click', () => _navTo('podcasts'));
         }
 
-        // 6. Trending Music (lazy)
-        const countryGenreMap = { PL:'polish music polskie', DE:'german music deutsch', FR:'french music chanson', ES:'spanish music pop espanol', IT:'italian music', BR:'brazilian music MPB', JP:'japanese pop music J-pop', SE:'swedish pop', NL:'dutch music', CZ:'czech music', UA:'ukrainian music', AU:'australian music', CA:'canadian indie' };
-        const musicQ = countryGenreMap[country] || 'top hits ' + (new Date().getFullYear());
-
-        const musicSec = document.createElement('div');
-        musicSec.className = 'rm-disc-section';
-        musicSec.innerHTML = `<div class="rm-disc-title"><i class="fas fa-fire"></i> ${t('Trending Music')}<span class="rm-disc-seeall" id="rm-disc-music-all">${t('Szukaj muzyki')} →</span></div>`
-            + `<div class="rm-disc-carousel" id="rm-disc-music-carousel"><div class="rm-disc-empty"><i class="fas fa-spinner fa-spin"></i></div></div>`;
-        content.appendChild(musicSec);
-        musicSec.querySelector('#rm-disc-music-all')?.addEventListener('click', () => _navTo('music'));
-
-        api('/radio-music/music/search?q=' + encodeURIComponent(musicQ) + '&limit=10').then(d => {
-            const carousel = musicSec.querySelector('#rm-disc-music-carousel');
-            if (!carousel?.isConnected) return;
-            const tracks = (d.items || []).slice(0, 8);
-            if (!tracks.length) { carousel.innerHTML = '<div class="rm-disc-empty">' + t('Brak wyników') + '</div>'; return; }
-            carousel.innerHTML = '';
-            tracks.forEach(tr => {
-                carousel.appendChild(_discCard({
-                    artSrc: tr.image || tr.thumbnail,
-                    fallbackIcon: 'fa-music',
-                    badge: '♪', badgeClass: 'rm-disc-badge-music',
-                    title: tr.name || tr.title || '',
-                    meta: tr.artist || tr.meta || '',
-                    onclick: () => playAudio(tr)
-                }));
-            });
-        }).catch(() => {
-            const carousel = musicSec.querySelector('#rm-disc-music-carousel');
-            if (carousel?.isConnected) carousel.innerHTML = '<div class="rm-disc-empty"><i class="fas fa-exclamation-circle"></i> ' + t('yt-dlp nie jest zainstalowane lub wystąpił błąd sieci') + '</div>';
-        });
-
         if (!stations.length && !pods.length && !hasPersonal) {
             content.innerHTML += '<div class="rm-disc-empty" style="padding:60px 20px"><i class="fas fa-compass" style="font-size:40px;margin-bottom:16px;display:block"></i>'
                 + t('Brak danych dla wybranego kraju.') + '<br><br>'
@@ -4111,8 +4131,8 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
     /* ── Unified Search ────────────────────────────── */
 
     async function loadUnifiedSearch(toolbar, content) {
-        toolbar.innerHTML = `<input class="rm-search" id="rm-usearch" placeholder="${t('Szukaj wszędzie...')}" autofocus>`;
-        content.innerHTML = '<div class="rm-empty"><i class="fas fa-search"></i><p>' + t('Wpisz, aby szukać w radiu, podcastach i lokalnej muzyce') + '</p></div>';
+        toolbar.innerHTML = `<input class="rm-search" id="rm-usearch" placeholder="${t('Szukaj w radiu, YouTube, podcastach i muzyce lokalnej...')}" autofocus>`;
+        content.innerHTML = '<div class="rm-empty"><i class="fas fa-search"></i><p>' + t('Wpisz, aby szukać w radiu, YouTube, podcastach i lokalnej muzyce') + '</p></div>';
         const inp = toolbar.querySelector('#rm-usearch');
         let debounce;
         inp.onkeyup = () => {
@@ -4171,6 +4191,20 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                 </div>`;
             });
         }
+        // Music (YouTube via yt-dlp) results
+        if (data.music && data.music.length) {
+            html += '<div class="rm-section-title"><i class="fab fa-youtube"></i> ' + t('Muzyka') + ' — YouTube (' + data.music.length + ')</div>';
+            html += '<div style="display:flex;flex-direction:column;gap:6px" id="rm-usearch-music">';
+            data.music.forEach((tr, idx) => {
+                html += `<div class="rm-track rm-usearch-item" data-type="music" data-idx="${idx}">
+                    <img class="rm-track-thumb" src="${escH(tr.thumbnail)}" loading="lazy" onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 48 48%22><rect fill=%22%231a1a2e%22 width=%2248%22 height=%2248%22/><text x=%2224%22 y=%2230%22 fill=%22%23666%22 text-anchor=%22middle%22 font-size=%2220%22>♪</text></svg>'">
+                    <div class="rm-track-info"><div class="rm-track-title">${escH(tr.title)}</div>
+                    <div class="rm-track-meta">${escH(tr.channel)}</div></div>
+                    <span class="rm-track-dur">${escH(tr.duration_fmt)}</span>
+                </div>`;
+            });
+            html += '</div>';
+        }
         if (!html) {
             html = '<div class="rm-empty"><i class="fas fa-search"></i><p>' + t('Brak wyników') + '</p></div>';
         }
@@ -4200,6 +4234,11 @@ AppRegistry['radio-music'] = function(appDef, launchOpts) {
                     el.onclick = () => playAudio(item);
                     const playBtn = el.querySelector('.rm-track-play');
                     if (playBtn) playBtn.onclick = (e) => { e.stopPropagation(); playAudio(item); };
+                }
+            } else if (type === 'music') {
+                const idx = parseInt(el.dataset.idx);
+                if (!isNaN(idx) && data.music[idx]) {
+                    el.onclick = () => playContext(data.music, idx);
                 }
             }
         });
